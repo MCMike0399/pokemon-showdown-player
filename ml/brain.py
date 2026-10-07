@@ -81,6 +81,10 @@ class Brain:
             if restored is None and any(row["status"] == "complete" for row in self.store.room_episodes(ctx["room"], side)):
                 raise ValueError("this room already has a completed recording")
         model = self.model(fmt)
+        collecting = self.pending.get((ctx['room'], ctx['request'].get('side', {}).get('id', 'p1')))
+        if collecting and collecting.get('feature_profile', 'legacy') != model.feature_profile:
+            raise ValueError('cannot change feature profile during an episode')
+        ctx = {**ctx, 'feature_profile': model.feature_profile}
         # Research affects bounded species-frequency features, never raw text.
         from ml.research import species_prior
         knowledge = species_prior(self.store, fmt)
@@ -114,6 +118,7 @@ class Brain:
                            "source": ctx.get("source", "ladder"), "revision": model.revision,
                            "schema": SCHEMA, "created": now(), "status": "pending", "steps": [],
                            "side": key[1],
+                           "feature_profile": model.feature_profile,
                            "recorder_version": 2,
                            "on_policy": demonstration is None, "demonstration": demonstration is not None}
                 self.pending[key] = episode

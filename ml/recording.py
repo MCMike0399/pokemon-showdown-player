@@ -113,6 +113,7 @@ def snapshot(episode: dict, ctx: dict, prediction: dict, knowledge: dict, scout:
             'request': copy.deepcopy(ctx['request']), 'observation': copy.deepcopy(ctx['state']),
             'legal_choices': alternatives, 'selected_index': prediction['index'],
             'sampling_temperature': temperature, 'knowledge': copy.deepcopy(knowledge),
+            'feature_profile': ctx.get('feature_profile', 'legacy'),
             'opponent_predictions': copy.deepcopy(scout),
             'public_log': record_log(episode, ctx.get('public_log', []))}
 

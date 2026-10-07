@@ -13,7 +13,7 @@ from torch import nn
 from torch.distributions import Categorical
 
 from battle_state import to_id
-from ml.features import ACTION_DIM, SCHEMA, STATE_DIM
+from ml.features import ACTION_DIM, SCHEMA, STATE_DIM, FEATURE_PROFILES
 
 # Small CPU batches are faster without a large BLAS worker pool, particularly on
 # Apple silicon. The small model also works on Linux without accelerator setup.
@@ -54,6 +54,7 @@ class Model:
         self.updates = 0
         self.policy_temperature = 1.0
         self.preview_temperature = None
+        self.feature_profile = 'legacy'
         if self.path.exists():
             checkpoint = torch.load(self.path, map_location="cpu", weights_only=True)
             if checkpoint["schema"] != SCHEMA or checkpoint["format"] != fmt:
@@ -68,6 +69,9 @@ class Model:
             self.preview_temperature = checkpoint.get('preview_temperature')
             if self.preview_temperature is not None and not .25 <= self.preview_temperature <= 2:
                 raise ValueError('checkpoint preview temperature must be .25..2')
+            self.feature_profile = checkpoint.get('feature_profile', 'legacy')
+            if self.feature_profile not in FEATURE_PROFILES:
+                raise ValueError('unsupported checkpoint feature profile')
         else:
             self.save()
         self.loaded_mtime = self.path.stat().st_mtime_ns
@@ -81,6 +85,7 @@ class Model:
                         "updates": self.updates, "model": self.net.state_dict(),
                         "policy_temperature": self.policy_temperature,
                         "preview_temperature": self.preview_temperature,
+                        "feature_profile": self.feature_profile,
                         "optimizer": self.optimizer.state_dict()}, tmp)
             tmp.replace(self.path)
             self.loaded_mtime = self.path.stat().st_mtime_ns
@@ -141,6 +146,8 @@ class Model:
             if episode["format"] != self.fmt or episode.get("status") != "complete":
                 continue
             if not imitation and (episode["revision"] != self.revision or not episode.get("on_policy")):
+                continue
+            if episode.get('feature_profile', 'legacy') != self.feature_profile:
                 continue
             if imitation and not episode.get("demonstration"):
                 continue

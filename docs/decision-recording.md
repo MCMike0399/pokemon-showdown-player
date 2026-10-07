@@ -55,3 +55,19 @@ Changing either temperature creates a different collecting policy: use a new
 revision, isolate the candidate, declare development/final cases before evaluation,
 and require the existing clean paired promotion gate. Do not adjust the active
 policy during a recorded game or interpret a calibrated policy as new trained weights.
+
+## Checkpoint feature profiles
+
+`feature_profile` versions the meaning of encoded inputs independently of their
+fixed dimensions. Missing metadata means `legacy`, which preserves the existing
+encoding exactly. The experimental `weather-v1` profile uses observed weather
+for Weather Ball's type/power and Hurricane/Thunder accuracy, with known weather
+suppression and Utility Umbrella checks. It remains a partial tactical heuristic,
+not a complete damage or weather-effect simulator.
+
+A profile change is a new collecting policy: assign a new checkpoint revision and
+validate an isolated candidate before promotion. The profile is captured in the
+episode and each readable snapshot. PPO excludes recordings from another profile,
+and both direct recording and live recovery refuse a change within a trajectory.
+Re-encoding old readable observations is useful for diagnosis; those new vectors
+must not be paired with old collecting log probabilities as fresh PPO data.

@@ -87,6 +87,8 @@ class LiveSession:
                 raise ValueError("cannot change format or team while resuming an episode")
             if self.brain.model(fmt).revision != episode["revision"]:
                 raise ValueError("collecting checkpoint revision changed; cannot resume this PPO recording")
+            if self.brain.model(fmt).feature_profile != episode.get('feature_profile', 'legacy'):
+                raise ValueError('collecting feature profile changed; cannot resume this recording')
         if episode and (episode["demonstration"] != (demonstration is not None) or
                         (episode["on_policy"] and not explore and demonstration is None)):
             raise ValueError("keep one learning mode for the whole recorded game")

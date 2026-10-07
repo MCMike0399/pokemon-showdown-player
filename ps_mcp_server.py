@@ -266,6 +266,7 @@ async def ps_ml_status(format: str = "") -> str:
             info["model"] = {"format": format, "revision": model.revision, "updates": model.updates,
                              "policy_temperature": model.policy_temperature,
                              "preview_temperature": model.preview_temperature,
+                             "feature_profile": model.feature_profile,
                              "checkpoint": str(model.path), "algorithm": "action-conditioned PPO actor-critic",
                              "strength": "unmeasured; zero updates uses a tactical initialization"}
             ready = brain.store.root / 'ready' / (format + '.json')

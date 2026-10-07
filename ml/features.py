@@ -13,6 +13,7 @@ from battle_state import hp_fraction, to_id
 SCHEMA = 1
 STATE_DIM = 384
 ACTION_DIM = 192
+FEATURE_PROFILES = {'legacy', 'weather-v1'}
 
 
 class Features:
@@ -35,6 +36,36 @@ class Features:
 
     def species(self, name: str) -> dict:
         return self.dex.get("pokedex", {}).get(to_id(name), {})
+
+    def move_data(self, ctx: dict, name: str, data: dict, actor: dict | None = None, targets: list | None = None) -> dict:
+        """Optional weather-aware encoding; old checkpoints keep exact legacy inputs."""
+        profile = ctx.get('feature_profile', 'legacy')
+        if profile not in FEATURE_PROFILES:
+            raise ValueError('unsupported feature profile')
+        if profile == 'legacy':
+            return data
+        state = ctx['state']
+        active = state.get('my_actives', []) + state.get('opp_actives', [])
+        suppressed = any(hp_fraction(mon.get('condition')) > 0 and
+                         to_id(mon.get('ability') or mon.get('baseAbility') or '') in ('cloudnine', 'airlock')
+                         for mon in active)
+        weather = '' if suppressed else to_id(state.get('weather') or '')
+        affected = actor or (state.get('my_actives') or [{}])[0]
+        if name in ('hurricane', 'thunder') and targets and len(targets) == 1:
+            affected = targets[0]
+        if to_id(affected.get('item') or '') == 'utilityumbrella' and weather in ('raindance', 'primordialsea', 'sunnyday', 'desolateland'):
+            weather = ''
+        result = dict(data)
+        types = {'raindance': 'Water', 'primordialsea': 'Water', 'sunnyday': 'Fire',
+                 'desolateland': 'Fire', 'sandstorm': 'Rock', 'hail': 'Ice', 'snowscape': 'Ice'}
+        if name == 'weatherball' and weather in types:
+            result.update(type=types[weather], basePower=data.get('basePower', 50) * 2)
+        elif name in ('hurricane', 'thunder'):
+            if weather in ('raindance', 'primordialsea'):
+                result['accuracy'] = True
+            elif weather in ('sunnyday', 'desolateland'):
+                result['accuracy'] = 50
+        return result
 
     def effectiveness(self, attack: str, mon: dict) -> float:
         types = [mon["teraType"]] if mon.get("teraType") else self.species(mon.get("species", "")).get("types", [])
@@ -116,20 +147,20 @@ class Features:
                     me = state.get("my_actives", [])[i]
                     move = me.get("moves", [])[int(parts[1]) - 1]
                     name = to_id(move.get("id", move.get("move", "")))
-                    data = self.dex.get("moves", {}).get(name, {})
-                    for key in ("type", "category", "target"):
-                        self.add(vector, f"move/{i}/{key}/{data.get(key, move.get(key, ''))}")
-                    self.add(vector, f"move/{i}/{name}")
                     target = next((int(p) for p in parts[2:] if p.lstrip("-+").isdigit()), 0)
-                    self.add(vector, f"target/{i}/{target}")
-                    for event in ("mega", "megax", "megay", "terastallize"):
-                        if event in parts:
-                            self.add(vector, f"event/{i}/{event}")
                     targets = state.get("opp_actives", [])
                     if target > 0:
                         targets = [m for m in targets if m.get("slot", "").endswith(chr(96 + target))]
                     elif target < 0:
                         targets = state.get("my_actives", [])[-target - 1:-target]
+                    data = self.move_data(ctx, name, self.dex.get("moves", {}).get(name, {}), me, targets)
+                    for key in ("type", "category", "target"):
+                        self.add(vector, f"move/{i}/{key}/{data.get(key, move.get(key, ''))}")
+                    self.add(vector, f"move/{i}/{name}")
+                    self.add(vector, f"target/{i}/{target}")
+                    for event in ("mega", "megax", "megay", "terastallize"):
+                        if event in parts:
+                            self.add(vector, f"event/{i}/{event}")
                     power = data.get("basePower", 0) / 100
                     accuracy = data.get("accuracy", 100)
                     accuracy = 1.0 if accuracy is True else float(accuracy or 100) / 100
