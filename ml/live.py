@@ -145,7 +145,7 @@ class LiveSession:
         # Some ladder rooms anonymize names. The private request establishes our
         # side; its public battle name identifies the winner in this room.
         own_name = self.player.c.battle_summary(room).get("players", {}).get(side) or self.player.c.user or ""
-        record = self.brain.finish(room, result, own_name, side)
+        record = self.brain.finish(room, result, own_name, side, public_log=log)
         learning = None
         if not result.get("ongoing") and room not in self.finished_rooms:
             self.finished_rooms.add(room)

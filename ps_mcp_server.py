@@ -265,6 +265,7 @@ async def ps_ml_status(format: str = "") -> str:
             model = brain.model(format)
             info["model"] = {"format": format, "revision": model.revision, "updates": model.updates,
                              "policy_temperature": model.policy_temperature,
+                             "preview_temperature": model.preview_temperature,
                              "checkpoint": str(model.path), "algorithm": "action-conditioned PPO actor-critic",
                              "strength": "unmeasured; zero updates uses a tactical initialization"}
             ready = brain.store.root / 'ready' / (format + '.json')
@@ -273,6 +274,19 @@ async def ps_ml_status(format: str = "") -> str:
                                          'staged_at': staged['staged_at'], 'evaluation': staged['evaluation']}
                                         if staged else None)
         return json.dumps(info, indent=2)
+
+
+@mcp.tool()
+async def ps_ml_recording(room: str, start: int = 0, limit: int = 3, alternatives: bool = False) -> str:
+    """Inspect saved decision-time requests, observations and named choices.
+    Read-only; no login, action submission or training. Legacy missing snapshots
+    stay unknown. Default returns selected/top-five choices; alternatives=True
+    includes the whole saved mask. Does not include future battle-log events."""
+    async with _ml_lock:
+        from ml.recording import read_archive
+        from ml.storage import DEFAULT_ROOT
+        root = _brain.store.root if _brain is not None else DEFAULT_ROOT
+        return json.dumps(read_archive(root, room, start, limit, alternatives), indent=2)
 
 
 @mcp.tool()

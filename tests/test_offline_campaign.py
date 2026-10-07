@@ -118,3 +118,44 @@ def test_source_reload_happens_before_search_at_empty_boundary(campaign, monkeyp
     assert controller.state['active_room'] is None
     assert controller.state['phase'] == 'source_reload_requested'
     controller.db.close()
+
+
+def test_matchmaking_promotion_updates_reported_collecting_revision(campaign, monkeypatch):
+    from contextlib import asynccontextmanager
+    directory, _ = campaign
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    manifest['deadline_at'] = '2099-01-01T00:00:00Z'
+    (directory / 'manifest.json').write_text(json.dumps(manifest))
+    (directory / 'status.json').write_text(json.dumps({'active_room': None}))
+    (directory / 'control.json').write_text(json.dumps({'target_ladder': 1}))
+    controller = runner.Campaign(directory)
+    monkeypatch.setattr(runner, 'source_generation', lambda: 'same')
+    @asynccontextmanager
+    async def stdio(parameters):
+        yield None, None
+    class Session:
+        def __init__(self, *args, **kwargs):
+            pass
+        async def __aenter__(self):
+            return self
+        async def __aexit__(self, *args):
+            pass
+        async def initialize(self):
+            pass
+    monkeypatch.setattr(runner, 'stdio_client', stdio)
+    monkeypatch.setattr(runner, 'ClientSession', Session)
+    async def call(session, tool, args, room=None):
+        if tool == 'ps_ml_status':
+            return {'model': {'revision': 'old'}}
+        if tool == 'ps_ml_ladder':
+            return {'promotion': {'promoted': True, 'revision': 'promoted'}}
+        if tool == 'ps_ml_wait':
+            return {'room': ROOM, 'team': 'Exact'}
+        return {'loggedIn': True, 'user': 'Configured', 'configuredUser': 'Configured'}
+    async def play(session, room, team):
+        assert controller.state['actor_revision'] == 'promoted'
+        controller.seen.add(ROOM)
+    controller.call = call
+    controller.play = play
+    asyncio.run(controller.run())
+    controller.db.close()

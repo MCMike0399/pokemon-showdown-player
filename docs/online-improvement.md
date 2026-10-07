@@ -10,6 +10,10 @@ or training quality.
 .venv/bin/python scripts/analyze_decisions.py --campaign data/ml/campaigns/<campaign-id>
 ```
 
+Readable private snapshots and inspection: [decision recording](decision-recording.md).
+The detailed read-only pattern audit is `scripts/audit_campaign.py`; older missing
+private context stays unknown.
+
 Decision diagnostics report the verified score, last ten results, fragmented
 recordings excluded from policy analysis, collecting likelihood consistency,
 and action-probability and tactical-prior distributions. Low probability does

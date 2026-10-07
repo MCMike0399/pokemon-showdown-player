@@ -56,7 +56,7 @@ def analyze(campaign: Path, root: Path) -> dict:
                     with torch.no_grad():
                         states, encoded, mask, indices = model.batch([step])
                         logits, _ = model.net(states, encoded, mask)
-                        logprob = torch.distributions.Categorical(logits=logits / model.policy_temperature).log_prob(indices)
+                        logprob = torch.distributions.Categorical(logits=model.training_logits(logits, [step])).log_prob(indices)
                         errors.append(abs(float(logprob[0]) - step['logprob']))
         trained, single, live_blocked = 0, 0, 0
         for row in db.execute('SELECT result FROM jobs WHERE format=? AND result IS NOT NULL', (fmt,)):

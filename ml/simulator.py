@@ -124,7 +124,7 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                 choice = rng.choice(choices)
             elif opponent == "self":
                 s, a = brain.features.encode(ctx)
-                choice = choices[(opponent_model or model).predict(s, a, explore=training)["index"]]
+                choice = choices[(opponent_model or model).predict(s, a, explore=training, preview=bool(request.get('teamPreview')))["index"]]
             else:
                 # A separate frozen scripted opponent; never updated by training.
                 choice = max(choices, key=lambda c: brain.features.action(ctx, c)[-1])

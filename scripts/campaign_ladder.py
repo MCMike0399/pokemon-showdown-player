@@ -208,7 +208,10 @@ class Campaign:
                     for attempt in range(3):
                         if time.time() >= deadline:
                             break
-                        await self.call(session, "ps_ml_ladder", {"format": self.format, "team": self.base, "explore_team": len(self.seen) >= 50})
+                        search = await self.call(session, "ps_ml_ladder", {"format": self.format, "team": self.base, "explore_team": len(self.seen) >= 50})
+                        promotion = search.get('promotion') or {}
+                        if promotion.get('promoted'):
+                            self.state['actor_revision'] = promotion['revision']
                         waiting = await self.call(session, "ps_ml_wait", {"timeout": 120})
                         if waiting.get("room"):
                             room = waiting["room"]; team = waiting["team"]; break

@@ -98,7 +98,8 @@ class Brain:
             for opponent in scout_predictions:
                 for move in opponent["moves"]:
                     features.add(state, "scout/" + opponent["slot"][-1] + "/" + move["move"], move["probability"])
-        prediction = model.predict(state, actions, explore)
+        preview = bool(ctx['request'].get('teamPreview'))
+        prediction = model.predict(state, actions, explore, preview=preview)
         if demonstration is not None:
             if demonstration not in ctx["choices"]:
                 raise ValueError("demonstrated action is not in the legal mask")
@@ -125,6 +126,8 @@ class Brain:
             request_id = ctx["request"].get("rqid", fingerprint(ctx["request"]))
             step = {"request_id": request_id, "state": state.tolist(), "actions": actions.tolist(),
                     "index": prediction["index"], "choice": choice, "logprob": prediction["logprob"], "value": prediction["value"]}
+            from ml.recording import snapshot
+            step['snapshot'] = snapshot(episode, ctx, prediction, knowledge, scout_predictions, model.temperature(preview))
             if ctx.get("source") == "ladder":
                 step["submitted"] = False
             if episode["steps"] and episode["steps"][-1]["request_id"] == request_id:
@@ -139,13 +142,14 @@ class Brain:
                 "opponent_predictions": scout_predictions,
                 "top_choices": [{"choice": c, "probability": p} for c, p in ranked[:5]]}
 
-    def reject(self, room: str, side: str = "p1"):
+    def reject(self, room: str, side: str = "p1", reason: str = 'rejected-or-interrupted-proposal'):
         episode = self.pending.get((room, side))
         if episode and episode["steps"]:
-            episode["steps"].pop()
+            removed = episode["steps"].pop()
+            episode.setdefault('discarded_proposals', []).append({'reason': reason, 'discarded_at': now(), 'step': removed})
             self.store.save_episode(episode)
 
-    def finish(self, room: str, result: dict, user: str, side: str = "p1") -> dict:
+    def finish(self, room: str, result: dict, user: str, side: str = "p1", public_log: list[str] | None = None) -> dict:
         key = (room, side)
         episode = self.pending.get(key)
         if result.get("ongoing") or result.get("unfinished") or result.get("stalled") or (not result.get("tie") and not result.get("winner")):
@@ -163,6 +167,9 @@ class Brain:
             raise ValueError("player identity is required to attribute the outcome")
         episode["outcome"] = 0.0 if result.get("tie") else 1.0 if result["winner"].lower().replace(" ", "") == user.lower().replace(" ", "") else -1.0
         episode["status"] = "complete"
+        if public_log is not None:
+            from ml.recording import record_log
+            episode['terminal_log'] = record_log(episode, public_log)
         self.store.save_episode(episode)
         del self.pending[key]
         return {"recorded": True, "id": episode["id"], "format": episode["format"], "steps": len(episode["steps"]), "outcome": episode["outcome"]}

@@ -53,6 +53,7 @@ class Model:
         self.revision = uuid.uuid4().hex
         self.updates = 0
         self.policy_temperature = 1.0
+        self.preview_temperature = None
         if self.path.exists():
             checkpoint = torch.load(self.path, map_location="cpu", weights_only=True)
             if checkpoint["schema"] != SCHEMA or checkpoint["format"] != fmt:
@@ -64,6 +65,9 @@ class Model:
             self.policy_temperature = float(checkpoint.get('policy_temperature', 1.0))
             if not .25 <= self.policy_temperature <= 2:
                 raise ValueError('checkpoint policy temperature must be .25..2')
+            self.preview_temperature = checkpoint.get('preview_temperature')
+            if self.preview_temperature is not None and not .25 <= self.preview_temperature <= 2:
+                raise ValueError('checkpoint preview temperature must be .25..2')
         else:
             self.save()
         self.loaded_mtime = self.path.stat().st_mtime_ns
@@ -76,6 +80,7 @@ class Model:
             torch.save({"schema": SCHEMA, "format": self.fmt, "revision": self.revision,
                         "updates": self.updates, "model": self.net.state_dict(),
                         "policy_temperature": self.policy_temperature,
+                        "preview_temperature": self.preview_temperature,
                         "optimizer": self.optimizer.state_dict()}, tmp)
             tmp.replace(self.path)
             self.loaded_mtime = self.path.stat().st_mtime_ns
@@ -92,11 +97,19 @@ class Model:
                     state[key] = value.to(device)
         return self
 
-    def predict(self, state, actions, explore: bool = False):
+    def temperature(self, preview: bool = False) -> float:
+        return self.preview_temperature if preview and self.preview_temperature is not None else self.policy_temperature
+
+    def training_logits(self, logits, samples):
+        temperatures = torch.tensor([self.temperature(s.get('choice', '').startswith('team ')) for s in samples],
+                                    device=logits.device, dtype=logits.dtype)
+        return logits / temperatures[:, None]
+
+    def predict(self, state, actions, explore: bool = False, preview: bool = False):
         device = next(self.net.parameters()).device
         with torch.no_grad():
             logits, value = self.net(torch.as_tensor(state, device=device)[None], torch.as_tensor(actions, device=device)[None])
-            logits = logits / self.policy_temperature
+            logits = logits / self.temperature(preview)
             dist = Categorical(logits=logits[0])
             index = int(dist.sample()) if explore else int(logits[0].argmax())
             return {"index": index, "logprob": float(dist.log_prob(torch.tensor(index, device=device))),
@@ -170,7 +183,7 @@ class Model:
                 states, actions, mask, indices = self.batch(batch)
                 states, actions, mask, indices = (t.to(device) for t in (states, actions, mask, indices))
                 logits, values = self.net(states, actions, mask)
-                logits = logits / self.policy_temperature
+                logits = self.training_logits(logits, batch)
                 dist = Categorical(logits=logits)
                 logprobs = dist.log_prob(indices)
                 if imitation:
@@ -201,7 +214,7 @@ class Model:
                         batch = samples[start:start + 32]
                         states, actions, mask, indices = (t.to(device) for t in self.batch(batch))
                         logits, _ = self.net(states, actions, mask)
-                        logits = logits / self.policy_temperature
+                        logits = self.training_logits(logits, batch)
                         old = torch.tensor([s['logprob'] for s in batch], device=device)
                         change = Categorical(logits=logits).log_prob(indices) - old
                         ratio = change.exp()
