@@ -16,29 +16,48 @@ function resizeBattle() {
 }
 new ResizeObserver(resizeBattle).observe($id('arena-wrap'));
 
-function newBattle(room) {
-  if (battle) battle.destroy();
+function newBattle(room, side) {
+  if (battle) { battle.pause(); battle.destroy(); }
   jQuery('#battle,#battle-log').empty();
-  battle = new Battle({id: room, $frame: jQuery('#battle'), $logFrame: jQuery('#battle-log'), paused: false});
+  battle = new Battle({id: room, $frame: jQuery('#battle'), $logFrame: jQuery('#battle-log'), paused: true});
   battle.roomid = room;
   battle.joinButtons = false;
+  if (side) battle.setViewpoint(side);
   manualView = false;
   resizeBattle();
 }
 
 let relayCount=0, relayRoom=null, relayLast=null;
 function joinCurrent(){ relayCount=0;relayRoom=null; }
+
+function rendererLog(lines) {
+  // Older filtered relays omit the argument-free |start event. Showdown needs
+  // it to clear team-preview sprites before displaying the active battlers.
+  let started = false;
+  return lines.flatMap(line => {
+    if (line === '|start' || line.startsWith('|start|')) started = true;
+    if (!started && /^\|(switch|drag|replace)\|/.test(line)) {
+      started = true;
+      return ['|start', line];
+    }
+    return [line];
+  });
+}
+
 async function connect(){
  try{
   const response=await fetch('/api/battle'+(shown?'?room='+encodeURIComponent(shown):''),{cache:'no-store'});
   if(!response.ok)throw Error('relay unavailable');
   const data=await response.json();
   if(data.room&&data.log?.length){
-   const reset=relayRoom!==data.room||data.log.length<relayCount;
-   if(reset){newBattle(data.room);relayCount=0;relayRoom=data.room;}
-   battle.addBatch(data.log.slice(relayCount));relayCount=data.log.length;
-   if(reset){if(data.live)battle.seekTurn(Infinity);if(data.side)battle.setViewpoint(data.side);}
-   battle.play();relayLast=data;
+   const log=rendererLog(data.log);
+   const reset=relayRoom!==data.room||log.length<relayCount;
+   if(reset){newBattle(data.room,data.side);relayCount=0;relayRoom=data.room;}
+   battle.addBatch(log.slice(relayCount));relayCount=log.length;
+   // addBatch resumes an unpaused renderer when new events arrive. Calling
+   // play on every poll starts another animation loop while one is running.
+   if(reset){if(data.live)battle.seekTurn(Infinity);battle.play();}
+   relayLast=data;
    $id('viewer-status').textContent=data.live?'Live player relay':'Recorded game replay';
   }else{$id('viewer-status').textContent='Waiting for the player relay. Recorded games remain available below.';}
  }catch(error){$id('viewer-status').textContent='Player relay reconnecting…';console.error('Player relay:',error);}
@@ -54,7 +73,6 @@ function show(room, game) {
   $id('watching').textContent = 'Watching game ' + game;
   $id('empty').classList.add('hidden');
   $id('inline-player').classList.remove('hidden');
-  newBattle(room);
   joinCurrent();
 }
 
