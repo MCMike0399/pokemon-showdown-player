@@ -98,6 +98,8 @@ class BattleObserver:
         while True:
             await asyncio.sleep(1)
             async with self.lock:
+                if self.session.watch_room:
+                    self.session.publish_watch(self.session.watch_room)
                 rooms = {room for room, _ in self.session.brain.pending}
                 from battle_state import to_id
                 user = to_id(self.session.player.c.user or "")

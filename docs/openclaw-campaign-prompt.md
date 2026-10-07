@@ -48,7 +48,8 @@ starting: an existing unfinished
 game belongs to its current operator and is a reason to defer this campaign.
 Use one retained MCP runtime for each complete game. Log in once per MCP process
 with `ps_login`; reuse that connection. A detached OpenClaw run closing its MCP
-child mid-game loses in-memory recording state. Reopen only between games.
+child mid-game interrupts recording. Prefer reopening between games; an accidental
+restart requires verified same-room recording recovery before any new search.
 Runtime reference: https://docs.openclaw.ai/cli/mcp/registry.
 
 Create a unique `data/ml/campaigns/<UTC-timestamp>/` directory. Write
@@ -192,8 +193,11 @@ practice jobs are unnecessary for this campaign.
   retrying. A per-room player lock error is a reason to wait, not spawn another
   connection. Transport failure, repeated rejected choices or a lost MCP process
   means save a blocker with active room and pending episode, then stop this lane.
-  Disk evidence survives but this version cannot restore an interrupted recording
-  session after process death. Never fabricate recovery or an outcome.
+  Disk evidence survives. Rejoin the exact room with the configured account and
+  restore only a single pending episode whose format/team/schema/mode/checkpoint
+  still match. The recorder refuses ambiguous fragments and incompatible weights.
+  Verify the original episode ID and preserved step prefix, not just a running
+  process or a ps_ml_play start event. Never fabricate recovery or an outcome.
 - Stop for inconsistent reward/episode attribution or duplicate terminal credit.
   Preserve the minimal evidence and concrete failing call rather than proceeding
   with contaminated measurements. Do not forfeit games just to satisfy the count.

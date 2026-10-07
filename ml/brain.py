@@ -18,6 +18,34 @@ class Brain:
         self.pending = {}
         self.scouts = {}
 
+    def resume(self, room: str, side: str):
+        """Restore one durable recording; ambiguous fragments require reconciliation."""
+        key = (room, side)
+        if key in self.pending:
+            return self.pending[key]
+        rows = self.store.room_episodes(room, side)
+        if any(row["status"] == "complete" for row in rows):
+            return None
+        pending = [row for row in rows if row["status"] == "pending"]
+        if len(pending) > 1:
+            raise ValueError("multiple pending episode segments; reconcile this room before resuming")
+        if not pending:
+            return None
+        episode = pending[0]
+        if episode.get("schema") != SCHEMA:
+            raise ValueError("pending episode schema does not match this recorder")
+        episode["recoveries"] = episode.get("recoveries", 0) + 1
+        self.pending[key] = episode
+        return episode
+
+    def room_side(self, room: str):
+        sides = {side for (recorded_room, side) in self.pending if recorded_room == room}
+        sides.update(row.get("side") for row in self.store.room_episodes(room))
+        sides.discard(None)
+        if len(sides) > 1:
+            raise ValueError("ambiguous recording perspective for this room")
+        return next(iter(sides), "p1")
+
     def model(self, fmt):
         # Daily workers can promote a checkpoint while this MCP process stays
         # alive. Reload only between recorded games; active games keep their brain.
@@ -41,6 +69,11 @@ class Brain:
             raise ValueError("explicit battle format is required")
         if record and not explore and demonstration is None:
             raise ValueError("PPO recording requires sampled actions (explore=True)")
+        if record or demonstration is not None:
+            side = (ctx["request"].get("side") or {}).get("id", "p1")
+            restored = self.resume(ctx["room"], side)
+            if restored is None and any(row["status"] == "complete" for row in self.store.room_episodes(ctx["room"], side)):
+                raise ValueError("this room already has a completed recording")
         model = self.model(fmt)
         # Research affects bounded species-frequency features, never raw text.
         from ml.research import species_prior
@@ -74,6 +107,7 @@ class Brain:
                            "source": ctx.get("source", "ladder"), "revision": model.revision,
                            "schema": SCHEMA, "created": now(), "status": "pending", "steps": [],
                            "side": key[1],
+                           "recorder_version": 2,
                            "on_policy": demonstration is None, "demonstration": demonstration is not None}
                 self.pending[key] = episode
             if episode["revision"] != model.revision or episode["format"] != fmt or episode["team"] != ctx.get("team_id", ""):
@@ -85,6 +119,8 @@ class Brain:
             request_id = ctx["request"].get("rqid", fingerprint(ctx["request"]))
             step = {"request_id": request_id, "state": state.tolist(), "actions": actions.tolist(),
                     "index": prediction["index"], "choice": choice, "logprob": prediction["logprob"], "value": prediction["value"]}
+            if ctx.get("source") == "ladder":
+                step["submitted"] = False
             if episode["steps"] and episode["steps"][-1]["request_id"] == request_id:
                 episode["steps"][-1] = step
             else:
@@ -106,10 +142,17 @@ class Brain:
     def finish(self, room: str, result: dict, user: str, side: str = "p1") -> dict:
         key = (room, side)
         episode = self.pending.get(key)
-        if not episode:
-            return {"recorded": False, "reason": "no pending episode"}
         if result.get("ongoing") or result.get("unfinished") or result.get("stalled") or (not result.get("tie") and not result.get("winner")):
             return {"recorded": False, "reason": "battle is not terminal; no reward assigned"}
+        if not episode:
+            completed = [row for row in self.store.room_episodes(room, side) if row["status"] == "complete"]
+            if completed:
+                row = completed[-1]
+                return {"recorded": False, "already_recorded": True, "id": row["id"], "format": row["format"],
+                        "steps": len(row["steps"]), "outcome": row["outcome"]}
+            episode = self.resume(room, side)
+        if not episode:
+            return {"recorded": False, "reason": "no pending episode"}
         if not user:
             raise ValueError("player identity is required to attribute the outcome")
         episode["outcome"] = 0.0 if result.get("tie") else 1.0 if result["winner"].lower().replace(" ", "") == user.lower().replace(" ", "") else -1.0

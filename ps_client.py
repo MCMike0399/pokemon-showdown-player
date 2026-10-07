@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import os
 import time
 from collections import deque
@@ -52,6 +53,7 @@ class PSClient:
         self.connected = False
         self.last_error: Optional[str] = None
         self._ready = asyncio.Event()
+        self._identity_ready = asyncio.Event()
 
     # ---------------- connection ----------------
     async def connect(self, timeout: float = 15.0) -> str:
@@ -73,6 +75,7 @@ class PSClient:
         room = ""
         try:
             async for raw in self.ws:  # type: ignore[union-attr]
+                room = ""
                 for line in str(raw).split("\n"):
                     if line.startswith(">"):
                         room = line[1:].strip()
@@ -102,9 +105,10 @@ class PSClient:
             parts = line.split("|")
             # |updateuser|name|named|avatar|settings
             name = parts[2] if len(parts) > 2 else ""
-            if name and not name.startswith("Guest"):
-                self.user = name.strip()
-                self.logged_in = True
+            self.user = name.strip() or None
+            self.logged_in = bool(self.user and not self.user.startswith("Guest") and
+                                  len(parts) > 3 and parts[3] == "1")
+            self._identity_ready.set()
         elif line.startswith("|init|battle") and room:
             self.battles.setdefault(room, {})["started"] = True
         elif line.startswith("|title|") and room:
@@ -132,12 +136,15 @@ class PSClient:
         assertion = json.loads(body[1:]).get("assertion")
         if not assertion:
             raise RuntimeError(f"no assertion in login response: {body[:200]}")
+        self._identity_ready.clear()
+        self.user, self.logged_in = None, False
         await self.send(f"|/trn {username},0,{assertion}")
-        for _ in range(80):
-            if self.user and not self.user.startswith("Guest"):
-                break
-            await asyncio.sleep(0.25)
-        ok = bool(self.user and not self.user.startswith("Guest"))
+        try:
+            await asyncio.wait_for(self._identity_ready.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            pass
+        normalize = lambda value: re.sub(r"[^a-z0-9]", "", value.lower())
+        ok = bool(self.logged_in and normalize(self.user or "") == normalize(username))
         self.logged_in = ok
         return {"loggedIn": ok, "user": self.user, "challstr": bool(self.challstr)}
 

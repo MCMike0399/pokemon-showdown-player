@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import time
+import math
+import json
 from contextlib import nullcontext
 
 from ml.storage import fingerprint
@@ -30,13 +32,61 @@ class LiveSession:
         self.submitted = {}
         self.finished_rooms = set()
         self.finished_outputs = {}
+        self.watch_room = None
+        self.watch_digest = None
+
+    def publish_watch(self, room: str):
+        """Mirror only battle protocol, using the existing player's connection."""
+        if not room.startswith("battle-") or any(char not in "abcdefghijklmnopqrstuvwxyz0123456789-" for char in room):
+            return
+        from ml.scout import PUBLIC_KINDS
+        from ml.storage import now
+        raw = self.player.c.battles.get(room, {}).get("log", [])
+        req = self.player._request(room) or {}
+        side = req.get("side", {}).get("id") or self.brain.room_side(room)
+        summary = self.player.c.battle_summary(room)
+        names = {key: "Your agent" if key == side else "Opponent" for key in ("p1", "p2")}
+        visible = PUBLIC_KINDS | {"teampreview", "teamsize", "upkeep", "inactive", "inactiveoff", "cant", "swap"}
+        log = []
+        for line in raw:
+            parts = line.split("|")
+            if len(parts) < 3 or not (parts[1] in visible or parts[1].startswith("-")):
+                continue
+            if parts[1] == "player":
+                avatar = parts[4] if len(parts) > 4 and parts[4].isdigit() else "1"
+                line = f"|player|{parts[2]}|{names.get(parts[2], 'Player')}|{avatar}"
+            elif parts[1] == "win":
+                winner_side = next((key for key, value in summary.get("players", {}).items() if value == parts[2]), None)
+                line = "|win|" + names.get(winner_side, "Winner")
+            log.append(line)
+        data = {"room": room, "side": side, "turn": summary.get("turn"), "log": log,
+                "live": not self.player.finished(room), "source": "player-relay"}
+        digest = fingerprint(data)
+        if digest == self.watch_digest:
+            return
+        data["captured_at"] = now()
+        folder = self.brain.store.root / "live-watch"
+        folder.mkdir(exist_ok=True)
+        text = json.dumps(data)
+        for target in (folder / (room + ".json"), folder / "current.json"):
+            temporary = target.with_suffix(".tmp")
+            temporary.write_text(text)
+            temporary.replace(target)
+        self.watch_digest = digest
 
     async def choose(self, room: str, fmt: str, team: str = "", explore: bool = True, demonstration: str | None = None):
         if not self.player.c.logged_in:
             raise ValueError("call ps_login once before playing")
         ctx = context(self.player, room, fmt, team)
+        self.watch_room = room
         req = ctx["request"]
-        episode = self.brain.pending.get((room, req.get("side", {}).get("id", "p1")))
+        side = req.get("side", {}).get("id", "p1")
+        episode = self.brain.resume(room, side)
+        if episode:
+            if episode["format"] != fmt or episode["team"] != ctx["team_id"]:
+                raise ValueError("cannot change format or team while resuming an episode")
+            if self.brain.model(fmt).revision != episode["revision"]:
+                raise ValueError("collecting checkpoint revision changed; cannot resume this PPO recording")
         if episode and (episode["demonstration"] != (demonstration is not None) or
                         (episode["on_policy"] and not explore and demonstration is None)):
             raise ValueError("keep one learning mode for the whole recorded game")
@@ -51,13 +101,27 @@ class LiveSession:
         submitted = self.submitted.get(key)
         if submitted:
             return {**submitted["decision"], "already_submitted": True}
-        decision = self.brain.decide(ctx, explore=explore, record=explore and demonstration is None, demonstration=demonstration)
+        saved = episode["steps"][-1] if episode and episode["steps"] else None
+        if saved and saved["request_id"] == key[1]:
+            # A crash may follow socket submission but precede the next request.
+            # Resubmit the exact sampled action, preserving its collecting logprob.
+            if saved["choice"] not in ctx["choices"]:
+                raise ValueError("recovered choice is no longer legal; reconcile the pending recording")
+            decision = {"choice": saved["choice"], "probability": math.exp(saved["logprob"]),
+                        "value": saved["value"], "revision": episode["revision"],
+                        "sampled": episode["on_policy"], "recorded": True, "recovered": True}
+        else:
+            decision = self.brain.decide(ctx, explore=explore, record=explore and demonstration is None, demonstration=demonstration)
         log_index = len(log)
         try:
             await self.player.choose(room, decision["choice"])
         except Exception:
             self.brain.reject(room, req.get("side", {}).get("id", "p1"))
             raise
+        if decision.get("recorded"):
+            episode = self.brain.pending[(room, side)]
+            episode["steps"][-1]["submitted"] = True
+            self.brain.store.save_episode(episode)
         self.submitted[key] = {"log_index": log_index, "decision": decision}
         return decision
 
@@ -65,13 +129,23 @@ class LiveSession:
         if room in self.finished_outputs:
             return self.finished_outputs[room]
         req = self.player._request(room) or {}
+        side = req.get("side", {}).get("id") or self.brain.room_side(room)
         result = self.player.result(room)
+        if not result.get("ongoing"):
+            restored = self.brain.resume(room, side)
+            if restored and restored["steps"] and restored["steps"][-1].get("submitted") is False:
+                # Conservatively exclude a proposal whose socket submission was
+                # interrupted. It cannot be given credit for a terminal result.
+                self.brain.reject(room, side)
         latest = max((v for key,v in self.submitted.items() if key[0] == room),
                      key=lambda v: v["log_index"], default=None)
         log = self.player.c.battles.get(room, {}).get("log", [])
         if latest and latest["decision"].get("recorded") and any(line.startswith("|error|") for line in log[latest["log_index"]:]):
-            self.brain.reject(room, req.get("side", {}).get("id", "p1"))
-        record = self.brain.finish(room, result, self.player.c.user or "", req.get("side", {}).get("id", "p1"))
+            self.brain.reject(room, side)
+        # Some ladder rooms anonymize names. The private request establishes our
+        # side; its public battle name identifies the winner in this room.
+        own_name = self.player.c.battle_summary(room).get("players", {}).get(side) or self.player.c.user or ""
+        record = self.brain.finish(room, result, own_name, side)
         learning = None
         if not result.get("ongoing") and room not in self.finished_rooms:
             self.finished_rooms.add(room)
@@ -90,12 +164,21 @@ class LiveSession:
         output = {"result": result, "experience": record, "background_learning": learning}
         if not result.get("ongoing"):
             self.finished_outputs[room] = output
+        self.publish_watch(room)
         return output
 
     async def play(self, room: str, fmt: str, team: str = "", learn: bool = True, timeout: float = 120,
                    decision_lock=None):
         if not 5 <= timeout <= 600:
             raise ValueError("stall timeout must be 5..600 seconds")
+        if not self.player.c.logged_in:
+            raise ValueError("call ps_login once before playing")
+        if room not in self.player.c.battles:
+            await self.player.c.join(room)
+        self.watch_room = room
+        req = self.player._request(room) or {}
+        side = req.get("side", {}).get("id") or self.brain.room_side(room)
+        self.brain.resume(room, side)
         await self.player.c.send(room + "|/timer on")
         last_progress = time.monotonic()
         last_key = None

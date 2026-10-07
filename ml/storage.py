@@ -36,6 +36,8 @@ class Store:
                 outcome REAL, status TEXT NOT NULL DEFAULT 'pending', trained INTEGER DEFAULT 0,
                 data TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS episodes_room_side ON episodes
+                (json_extract(data,'$.room'), json_extract(data,'$.side'));
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY, url TEXT NOT NULL, format TEXT NOT NULL,
                 title TEXT NOT NULL, fetched TEXT NOT NULL, published TEXT,
@@ -110,6 +112,15 @@ class Store:
             query += " AND revision=?"
             args.append(revision)
         return [json.loads(r[0]) for r in self.db.execute(query + " ORDER BY created", args)]
+
+    def room_episodes(self, room: str, side: str | None = None) -> list[dict]:
+        """Recorded sessions for an exact room/perspective, including terminal ones."""
+        query = "SELECT data FROM episodes WHERE json_extract(data,'$.room')=?"
+        args = [room]
+        if side is not None:
+            query += " AND json_extract(data,'$.side')=?"
+            args.append(side)
+        return [json.loads(row[0]) for row in self.db.execute(query + " ORDER BY created", args)]
 
     def mark_trained(self, ids: list[str]):
         with self.db:

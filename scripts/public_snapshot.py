@@ -16,7 +16,9 @@ HERE = Path(__file__).resolve().parents[1]
 FILES = [".env.example", ".gitignore", "README.md", "LICENSE", "requirements.txt", "requirements-ml.txt",
          "package.json", "package-lock.json", "pytest.ini", "battle_state.py", "harness.py", "policy.py",
          "ps_client.py", "ps_mcp_server.py", "simulator.cjs", "selftest.py", "mcp_selftest.py"]
-GLOBS = ["ml/*.py", "docs/*.md", "examples/*.json", "scripts/*.py", "tests/test_offline_*.py",
+GLOBS = ["ml/*.py", "docs/*.md", "docs/paper/*.tex", "docs/paper/*.bib", "docs/paper/*.md",
+         "web/live-watch/*.html", "web/live-watch/*.js",
+         "docs/paper/*.pdf", "docs/paper/.gitignore", "examples/*.json", "scripts/*.py", "tests/test_offline_*.py",
          "tests/conftest.py", "tests/test_teams.py", ".github/workflows/*.yml"]
 PUBLIC_AGENTS = """# Agent instructions
 
