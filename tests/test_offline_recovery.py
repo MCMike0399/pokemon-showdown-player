@@ -164,3 +164,25 @@ def test_watch_relay_excludes_requests_chat_and_auth(session):
     assert "|player|p1|Your agent|1" in data["log"]
     assert "|turn|1" in data["log"]
     assert not any(line.startswith(("|request|", "|challstr|", "|c|")) for line in data["log"])
+
+
+def test_play_reports_no_job_when_learning_disabled(session):
+    from ml.continuous import LearningConfig
+    make, player, sent = session
+    brain = make()
+    LearningConfig(enabled=False).save(brain.store.root)
+    live = LiveSession(brain, player)
+    async def run():
+        async def send(message):
+            pass
+        player.c.send = send
+        async def choose(room, choice):
+            player.c.battles[ROOM]['log'].append('|win|Player')
+        player.choose = choose
+        return await live.play(ROOM, FMT)
+    output = asyncio.run(run())
+    assert output['experience']['recorded']
+    assert output['background_learning']['job'] is None
+    assert output['training']['queued'] is False
+    assert output['training']['job'] is None
+    assert brain.store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 0

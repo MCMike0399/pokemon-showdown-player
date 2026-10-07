@@ -46,11 +46,13 @@ class Model:
             raise ValueError("format must be a Showdown format id")
         self.path = Path(root) / "models" / (fmt + ".pt")
         self.fmt = fmt
-        torch.manual_seed(seed)
-        self.net = ActorCritic()
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(seed)
+            self.net = ActorCritic()
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=3e-4)
         self.revision = uuid.uuid4().hex
         self.updates = 0
+        self.policy_temperature = 1.0
         if self.path.exists():
             checkpoint = torch.load(self.path, map_location="cpu", weights_only=True)
             if checkpoint["schema"] != SCHEMA or checkpoint["format"] != fmt:
@@ -59,6 +61,9 @@ class Model:
             self.optimizer.load_state_dict(checkpoint["optimizer"])
             self.revision = checkpoint["revision"]
             self.updates = checkpoint["updates"]
+            self.policy_temperature = float(checkpoint.get('policy_temperature', 1.0))
+            if not .25 <= self.policy_temperature <= 2:
+                raise ValueError('checkpoint policy temperature must be .25..2')
         else:
             self.save()
         self.loaded_mtime = self.path.stat().st_mtime_ns
@@ -70,6 +75,7 @@ class Model:
         try:
             torch.save({"schema": SCHEMA, "format": self.fmt, "revision": self.revision,
                         "updates": self.updates, "model": self.net.state_dict(),
+                        "policy_temperature": self.policy_temperature,
                         "optimizer": self.optimizer.state_dict()}, tmp)
             tmp.replace(self.path)
             self.loaded_mtime = self.path.stat().st_mtime_ns
@@ -90,6 +96,7 @@ class Model:
         device = next(self.net.parameters()).device
         with torch.no_grad():
             logits, value = self.net(torch.as_tensor(state, device=device)[None], torch.as_tensor(actions, device=device)[None])
+            logits = logits / self.policy_temperature
             dist = Categorical(logits=logits[0])
             index = int(dist.sample()) if explore else int(logits[0].argmax())
             return {"index": index, "logprob": float(dist.log_prob(torch.tensor(index, device=device))),
@@ -109,9 +116,12 @@ class Model:
         return states, actions, mask, indices
 
     def train(self, episodes: list[dict], epochs: int = 4, imitation: bool = False,
-              duty_fraction: float = 1.0, deadline: float | None = None) -> dict:
+              duty_fraction: float = 1.0, deadline: float | None = None,
+              target_kl: float = 0.03) -> dict:
         if not 1 <= epochs <= 30:
             raise ValueError("epochs must be between 1 and 30")
+        if not 0 < target_kl <= 1:
+            raise ValueError("target KL must be positive and at most 1")
         samples = []
         ids = []
         for episode in episodes:
@@ -146,6 +156,8 @@ class Model:
             sample["advantage"] = float(advantage)
         rng = np.random.default_rng(0)
         losses = []
+        kl_history = []
+        clip_fractions = []
         self.net.train()
         device = next(self.net.parameters()).device
         for _ in range(epochs):
@@ -158,6 +170,7 @@ class Model:
                 states, actions, mask, indices = self.batch(batch)
                 states, actions, mask, indices = (t.to(device) for t in (states, actions, mask, indices))
                 logits, values = self.net(states, actions, mask)
+                logits = logits / self.policy_temperature
                 dist = Categorical(logits=logits)
                 logprobs = dist.log_prob(indices)
                 if imitation:
@@ -179,10 +192,33 @@ class Model:
                 if device.type == "mps" and duty_fraction < 1:
                     torch.mps.synchronize()
                     time.sleep(min(0.1, (time.monotonic() - started) * (1 / duty_fraction - 1)))
+            if not imitation:
+                # Assess the whole variable-action batch, rather than letting a
+                # noisy minibatch drive the stopping decision.
+                divergences, clipped = [], []
+                with torch.no_grad():
+                    for start in range(0, len(samples), 32):
+                        batch = samples[start:start + 32]
+                        states, actions, mask, indices = (t.to(device) for t in self.batch(batch))
+                        logits, _ = self.net(states, actions, mask)
+                        logits = logits / self.policy_temperature
+                        old = torch.tensor([s['logprob'] for s in batch], device=device)
+                        change = Categorical(logits=logits).log_prob(indices) - old
+                        ratio = change.exp()
+                        divergences.extend(((ratio - 1) - change).tolist())
+                        clipped.extend(((ratio - 1).abs() > .2).float().tolist())
+                kl_history.append(sum(divergences) / len(divergences))
+                clip_fractions.append(sum(clipped) / len(clipped))
+                if kl_history[-1] > target_kl:
+                    break
         old_revision = self.revision
         self.revision = uuid.uuid4().hex
         self.updates += 1
         self.save()
         return {"trained": True, "algorithm": "behavior-cloning" if imitation else "PPO", "episodes": len(ids),
                 "steps": len(samples), "loss": sum(losses) / len(losses),
+                "epochs_completed": len(kl_history) if not imitation else epochs,
+                "target_kl": target_kl, "kl_history": kl_history,
+                "clip_fraction_history": clip_fractions,
+                "early_stopped": not imitation and len(kl_history) < epochs,
                 "previous_revision": old_revision, "revision": self.revision, "consumed": ids}

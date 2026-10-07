@@ -57,8 +57,14 @@ class Brain:
                 if disk["revision"] != model.revision:
                     self.models[fmt] = Model(self.store.root, fmt)
         if fmt not in self.models:
-            with self.store.writer():
+            path = self.store.root / 'models' / (fmt + '.pt')
+            if path.exists():
+                # Checkpoints are atomically replaced. Loading an existing one
+                # is a reader operation and must not contend with learning.
                 self.models[fmt] = Model(self.store.root, fmt)
+            else:
+                with self.store.writer():
+                    self.models[fmt] = Model(self.store.root, fmt)
         return self.models[fmt]
 
     def decide(self, ctx: dict, explore: bool = False, record: bool = False, demonstration: str | None = None) -> dict:

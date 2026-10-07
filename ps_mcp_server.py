@@ -264,8 +264,14 @@ async def ps_ml_status(format: str = "") -> str:
         if format:
             model = brain.model(format)
             info["model"] = {"format": format, "revision": model.revision, "updates": model.updates,
+                             "policy_temperature": model.policy_temperature,
                              "checkpoint": str(model.path), "algorithm": "action-conditioned PPO actor-critic",
                              "strength": "unmeasured; zero updates uses a tactical initialization"}
+            ready = brain.store.root / 'ready' / (format + '.json')
+            staged = json.loads(ready.read_text()) if ready.exists() else None
+            info['staged_candidate'] = ({'parent_revision': staged['parent_revision'],
+                                         'staged_at': staged['staged_at'], 'evaluation': staged['evaluation']}
+                                        if staged else None)
         return json.dumps(info, indent=2)
 
 
@@ -309,7 +315,8 @@ async def ps_ml_finish(room: str, train: bool = True) -> str:
         output = _ml_session.finish(room)
         experience = output["experience"]
         if train and experience.get("recorded"):
-            output["training"] = {"queued": True, "job": (output.get("background_learning") or {}).get("job")}
+            from ml.continuous import learning_report
+            output["training"] = learning_report(output)
         return json.dumps(output, indent=2)
 
 
@@ -364,14 +371,20 @@ async def ps_ml_ladder(format: str, team: str = "", explore_team: bool = False) 
     from ml.teams import TeamPlanner
     from ml.storage import fingerprint
     async with _ml_lock:
-        plan = await TeamPlanner(_ml().store, teams).plan(format, team, explore_team)
+        brain = _ml()
+        if any(not player.finished(room) for room in player.battles()):
+            raise ValueError("finish the existing battle before another matchmaking operation")
+        from ml.promotion import promote_ready
+        promotion = promote_ready(brain.store, format)
+        plan = await TeamPlanner(brain.store, teams).plan(format, team, explore_team)
         selected = plan["selected"]
         name = "ML-"+selected["id"]
         if name not in teams.list():
             teams.create(name, selected["sets"], format)
         _match_context[format] = {"team": name, "sets": selected["sets"]}
         status = await player.ladder(format, selected["packed"])
-    return json.dumps({"status": status, "team": name, "selection": {k:v for k,v in selected.items() if k not in ("packed", "sets")}}, indent=2)
+    return json.dumps({"status": status, "team": name, "promotion": promotion,
+                       "selection": {k:v for k,v in selected.items() if k not in ("packed", "sets")}}, indent=2)
 
 
 @mcp.tool()

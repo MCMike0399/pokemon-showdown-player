@@ -12,6 +12,10 @@ from pathlib import Path
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "data" / "ml"
 
 
+class WriterBusy(ValueError):
+    """Temporary contention, distinguishable from invalid training state."""
+
+
 def now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -84,7 +88,7 @@ class Store:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise ValueError("another learning process is writing this data root; use a separate --root") from None
+                raise WriterBusy("another learning process is writing this data root; use a separate --root") from None
             try:
                 yield
             finally:

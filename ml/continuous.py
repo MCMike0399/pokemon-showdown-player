@@ -21,6 +21,7 @@ class LearningConfig:
     feed_daily: bool = True
     simulation_games: int = 24
     evaluation_games: int = 20
+    min_training_steps: int = 64
     promotion_margin: float = 0.10
     max_seconds: int = 360
     max_replays: int = 24
@@ -39,6 +40,8 @@ class LearningConfig:
         if not 0 <= self.max_replays <= 100 or not 1 <= self.max_tournament_teams <= 30:
             raise ValueError("replays 0..100 and tournament teams 1..30")
         ResourcePolicy(**self.resource)
+        if not 1 <= self.min_training_steps <= 4096:
+            raise ValueError("minimum training steps must be 1..4096")
         from ml.feeds import ARCHIVES
         if any(name not in ARCHIVES for name in self.archives):
             raise ValueError("archive must be an approved pinned source")
@@ -59,6 +62,13 @@ def enqueue_battle(store: Store, fmt: str, episode_id: str):
     if LearningConfig.load(store.root).enabled:
         return store.enqueue("battle-"+episode_id, "learn", fmt, {"trigger": "completed-battle"})
     return None
+
+
+def learning_report(output: dict) -> dict:
+    """Report the durable handoff, never infer a queued job from a recording."""
+    job = (output.get("background_learning") or {}).get("job")
+    return {"queued": job is not None, "job": job,
+            "promotion": "requires candidate evaluation; live inference stays on incumbent"}
 
 
 def queue_daily(store: Store, config: LearningConfig):

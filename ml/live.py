@@ -208,5 +208,6 @@ class LiveSession:
         async with decision_lock or nullcontext():
             output = self.finish(room)
         if learn and output["experience"].get("recorded"):
-            output["training"] = {"queued": True, "promotion": "requires candidate evaluation; live inference stays on incumbent"}
+            from ml.continuous import learning_report
+            output["training"] = learning_report(output)
         return output

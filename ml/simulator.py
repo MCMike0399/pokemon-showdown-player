@@ -48,7 +48,8 @@ async def load_dex(fmt: str) -> Features:
 
 async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: str = "heuristic",
                      seed: int = 0, training: bool = True, max_decisions: int = 1000,
-                     teacher: bool = False, opponent_model=None, learner_side: str = "p1") -> dict:
+                     teacher: bool = False, opponent_model=None, learner_side: str = "p1",
+                     sample_actions: bool = False) -> dict:
     if opponent not in ("heuristic", "random", "self"):
         raise ValueError("opponent must be heuristic, random or self")
     if learner_side not in ("p1", "p2"):
@@ -61,6 +62,8 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
     result = {"room": room, "ongoing": True}
     decisions = 0
     rejected = 0
+    unavailable = 0
+    consecutive_unavailable = 0
     model = brain.model(fmt)
 
     async def send(payload):
@@ -81,10 +84,21 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                 raise ValueError(event["error"])
             side = event["side"]
             logs[side].extend(event.get("lines", []))
+            errors = [line for line in event.get('lines', []) if line.startswith('|error|')]
+            if not errors:
+                consecutive_unavailable = 0
             for public in event.get("lines", []):
                 if public.startswith("|error|"):
-                    rejected += 1
                     brain.reject(room, side)
+                    # Hidden trapping/disabling is disclosed by the server's
+                    # corrected request. Remove the unexecuted proposal and
+                    # retry that observable mask, just as the live player does.
+                    if (public.startswith('|error|[Unavailable choice]') and
+                            legal_choices(event.get('request')) and consecutive_unavailable < 5):
+                        unavailable += 1
+                        consecutive_unavailable += 1
+                        continue
+                    rejected += 1
                     raise ValueError("simulator rejected generated action: " + public)
                 if public.startswith("|win|"):
                     result = {"room": room, "winner": public.split("|", 2)[2]}
@@ -105,7 +119,7 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                 choice = max(choices, key=lambda c: brain.features.action(ctx, c)[-1])
                 brain.decide(ctx, demonstration=choice)
             elif side == learner_side:
-                choice = brain.decide(ctx, explore=training, record=training)["choice"]
+                choice = brain.decide(ctx, explore=training or sample_actions, record=training)["choice"]
             elif opponent == "random":
                 choice = rng.choice(choices)
             elif opponent == "self":
@@ -126,6 +140,8 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                                                             features=brain.features)
         result.update({"decisions": decisions, "rejected_actions": rejected, "seed": seed,
                        "opponent": opponent, "learner_side": learner_side, "revision": model.revision})
+        result["policy_mode"] = "sampled" if training or sample_actions else "greedy"
+        result["unavailable_choices"] = unavailable
         return result
     finally:
         # Truncations/errors remain pending in SQLite with no reward. They must

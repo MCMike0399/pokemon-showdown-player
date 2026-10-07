@@ -107,8 +107,9 @@ class Scout:
         self.path = store.root / "scouts" / (fmt + ".pt")
         self.moves = sorted(features.dex.get("moves", {}))
         self.index = {move: i for i, move in enumerate(self.moves)}
-        torch.manual_seed(17)
-        self.net = nn.Sequential(nn.Linear(STATE_DIM, 96), nn.Tanh(), nn.Linear(96, max(1, len(self.moves))))
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(17)
+            self.net = nn.Sequential(nn.Linear(STATE_DIM, 96), nn.Tanh(), nn.Linear(96, max(1, len(self.moves))))
         self.trained_samples = 0
         self.loaded_mtime = None
         self.transfer_source = None

@@ -76,7 +76,8 @@ sides and a mixture of random/tactical opponents. Each collecting revision stays
 frozen. Candidates train only from compatible complete unused rollouts. Paired
 evaluations compare the incumbent and candidate on identical seeds, sides and
 teams. The active checkpoint changes only when the candidate beats the configured
-margin, evaluations finish cleanly and no recent live episode is pending.
+margin and paired confidence gate, evaluations finish cleanly, and no live episode
+is pending at the explicit matchmaking boundary.
 
 The gate prevents observed regressions in that finite suite; it does not prove
 general tournament strength. Jobs, checkpoints, reports and datasets stay local
@@ -98,3 +99,39 @@ worker processing while retaining data. No additional public Showdown accounts
 or automatic public-ladder traffic are created by the scheduled worker.
 
 Research, provenance and licenses: [continuous-learning research](continuous-learning-research.md).
+
+## Online improvement boundaries
+
+Per-battle jobs now accumulate at least `min_training_steps` (default 64) compatible
+unused steps before PPO. Small batches remain unconsumed for a later job. PPO
+reports approximate KL and clipping after each epoch and stops additional epochs
+when KL exceeds its configured budget (default 0.03).
+
+Worker evaluations sample actions, matching `ps_ml_play(learn=True)`, and keep
+starting research, scout weights and scout move support fixed for both policies.
+They require complete paired games, the configured win margin, and a one-sided
+exact paired sign-test p-value at most 0.05. These are finite scripted comparisons;
+repeated candidate testing does not provide a campaign-wide false-positive guarantee.
+
+Incomplete evaluations retain their candidate, declared cases, frozen inputs and
+completed results. A later worker resumes only the remaining cases without
+retraining. Sample consumption is tied to the durable candidate.
+
+A passing candidate is staged under `data/ml/ready/`; it is not immediately installed
+by a background worker. `ps_ml_ladder` checks it before another search, refuses to
+replace a collecting checkpoint while any ladder recording is pending, verifies
+the parent revision and candidate checksum, and promotes atomically. Write-lock
+contention defers promotion while allowing matchmaking to continue. Status and
+training reports distinguish a real queued job, a staged candidate and a promotion.
+A manual `ps_ladder` call does not apply this ML promotion boundary.
+
+Hidden trapping or disabling can make a previously legal-looking choice unavailable.
+Offline simulation retries up to five consecutive disclosures only when Showdown
+provides an actionable corrected request. Rejected proposals receive no credit.
+These recoveries are reported as `unavailable_choices`; unexpected invalid choices
+still fail the evaluation gate.
+
+Checkpoint `policy_temperature` defaults to 1.0 for older models. Sampling and
+PPO likelihoods use the same temperature. A temperature change is a new policy:
+assign a new revision and evaluate it on development and untouched final cases
+before considering promotion. It is not a free runtime exploration knob.

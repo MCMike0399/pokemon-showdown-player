@@ -15,7 +15,7 @@ from pathlib import Path
 
 from ml.continuous import LearningConfig, queue_daily
 from ml.resources import ResourcePolicy, backend_for
-from ml.storage import Store, DEFAULT_ROOT, fingerprint, now
+from ml.storage import Store, WriterBusy, DEFAULT_ROOT, fingerprint, now
 
 
 def rollout(task: dict):
@@ -29,7 +29,7 @@ def rollout(task: dict):
     from ml.features import Features
     from ml.simulator import play_local
     torch.set_num_threads(1)
-    store = Store(Path(task["root"]))
+    store = Store(Path(task.get("inference_root", task["root"])))
     brain = Brain(store, Features.cached(task["format"]))
     model = Model(Path(task["checkpoint_root"]), task["format"])
     brain.models[task["format"]] = model
@@ -37,7 +37,8 @@ def rollout(task: dict):
     try:
         return asyncio.run(play_local(brain, task["format"], task["team1"], task["team2"],
                                      opponent=task.get("opponent", "heuristic"), seed=task["seed"],
-                                     training=task["training"], learner_side=task["side"]))
+                                     training=task["training"], learner_side=task["side"],
+                                     sample_actions=task.get("sample_actions", False)))
     finally:
         store.close()
 
@@ -81,6 +82,26 @@ def snapshot(source: Path, target_root: Path, fmt: str):
     return target
 
 
+def freeze_inputs(store: Store, destination: Path, fmt: str):
+    """Both evaluations see the same research/scout, isolated from live feeds."""
+    frozen = Store(destination)
+    try:
+        with frozen.db:
+            for table in ('research_teams', 'documents', 'scout_samples'):
+                rows = store.db.execute(f"SELECT * FROM {table} WHERE format=?", (fmt,)).fetchall()
+                frozen.db.execute(f"DELETE FROM {table}")
+                if rows:
+                    placeholders = ','.join('?' for _ in rows[0])
+                    frozen.db.executemany(f"INSERT INTO {table} VALUES ({placeholders})", [tuple(row) for row in rows])
+        source = store.root / 'scouts' / (fmt + '.pt')
+        if source.exists():
+            target = destination / 'scouts' / source.name
+            target.parent.mkdir(exist_ok=True)
+            shutil.copy2(source, target)
+    finally:
+        frozen.close()
+
+
 def candidate_teams(store: Store, fmt: str):
     from harness import TeamStore
     from ml.teams import generated_spreads, team_id
@@ -101,12 +122,73 @@ def candidate_teams(store: Store, fmt: str):
     return list(dedup.values())[:8]
 
 
+def atomic_json(path: Path, value: dict):
+    temporary = path.with_suffix('.tmp')
+    temporary.write_text(json.dumps(value, indent=2))
+    temporary.replace(path)
+
+
+async def evaluate_saved(store, job, config, policy, deadline, work):
+    """Resume one durable candidate and declared cases; never retrain on retry."""
+    from ml.model import Model
+    from ml.promotion import paired_gate, stage
+    from ml.scout import Scout
+    from ml.features import Features
+    import hashlib
+    state = json.loads((work / 'training-state.json').read_text())
+    fmt = job['format']
+    current = Model(store.root, fmt)
+    if current.revision != state['training']['previous_revision']:
+        return {'trained': False, 'reason': 'candidate parent advanced; retained for audit'}
+    candidate = Model(work / 'candidate', fmt)
+    if hashlib.sha256(candidate.path.read_bytes()).hexdigest() != state['candidate_sha256']:
+        raise ValueError('saved candidate changed; refusing evaluation resume')
+    # Idempotent even if a process died immediately after the candidate save.
+    with store.writer():
+        store.mark_trained(state['training'].get('consumed', []))
+    plan = json.loads((work / 'evaluation-plan.json').read_text())
+    results = {}
+    for label in ('incumbent', 'candidate'):
+        path = work / (label + '-evaluation.json')
+        prior = json.loads(path.read_text()) if path.exists() else {'games': []}
+        games = prior['games']
+        tasks = plan[label]
+        if len(games) < len(tasks) and time.monotonic() < deadline:
+            output = await parallel_games(tasks[len(games):], policy, deadline)
+            games.extend(output['games'])
+            prior.update(games=games, deferred=output.get('deferred', False), resources=output.get('resources'))
+            atomic_json(path, prior)
+        results[label] = games
+    training = {k: v for k, v in state['training'].items() if k != 'consumed'}
+    if any(len(results[label]) != len(plan[label]) for label in results):
+        report = {'deferred': True, 'reason': 'candidate evaluation paused; checkpoint and cases retained',
+                  'training': training, 'evaluation_progress': {label: len(rows) for label, rows in results.items()},
+                  'games_per_policy': plan['games'], 'candidate_checkpoint': str(candidate.path)}
+        atomic_json(work / 'report.json', report)
+        return report
+    evaluation = paired_gate(results['incumbent'], results['candidate'], plan['games'], plan['margin'])
+    evaluation.update(games_per_policy=plan['games'], policy_mode='sampled',
+                      same_starting_scout_research=True, team_pool_size=plan['team_pool_size'])
+    with store.writer():
+        current = Model(store.root, fmt)
+        staged = current.revision == state['training']['previous_revision'] and stage(store, fmt, current.revision, candidate.path, evaluation)
+    backend = state['backend']
+    scout = Scout(store, fmt, Features.cached(fmt))
+    scout_report = scout.train(device=backend, duty_fraction=policy.gpu_duty_fraction if backend == 'mps' else 1) if time.monotonic() < deadline else {'deferred': True}
+    report = {'format': fmt, 'job': job['id'], 'training': training, 'backend': backend,
+              'collection': state['collection'], 'evaluation': evaluation, 'promoted': False,
+              'staged_for_between_game_promotion': staged, 'candidate_checkpoint': str(candidate.path), 'scout': scout_report}
+    atomic_json(work / 'report.json', report)
+    return report
+
+
 async def learn(store: Store, job: dict, config: LearningConfig, policy: ResourcePolicy, deadline: float):
     from ml.features import Features
     from ml.model import Model
     from ml.simulator import load_dex, validate_team
-    from ml.scout import Scout
     fmt = job["format"]
+    if (store.root / 'ready' / (fmt + '.json')).exists():
+        return {"deferred": True, "reason": "evaluated candidate waiting for a matchmaking boundary; experience retained"}
     if not Features.cached(fmt).dex:
         await load_dex(fmt)
     # Load only after checking headroom. Foreground model keeps its own CPU lane.
@@ -114,6 +196,8 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
         incumbent = Model(store.root, fmt)
     work = store.root/"candidates"/fingerprint(job["id"])
     before_root, candidate_root = work/"incumbent", work/"candidate"
+    if (work / "training-state.json").exists():
+        return await evaluate_saved(store, job, config, policy, deadline, work)
     snapshot(incumbent.path, before_root, fmt)
     teams = []
     for sets in candidate_teams(store, fmt):
@@ -126,8 +210,8 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
     def tasks(checkpoint_root, games, training, seed_offset):
         return [{"root": str(store.root), "checkpoint_root": str(checkpoint_root), "format": fmt,
                  "team1": teams[i % len(teams)], "team2": teams[(i+1) % len(teams)],
-                 "seed": seed_base+seed_offset+i, "side": "p2" if i%2 else "p1", "training": training,
-                 "opponent": "random" if training and i%4 == 0 else "heuristic"}
+                 "seed": seed_base+seed_offset+i, "side": "p2" if (i+i//len(teams))%2 else "p1", "training": training,
+                 "opponent": "random" if i%4 == 0 else "heuristic"}
                 for i in range(games)]
     collected = None
     if job["kind"] == "practice" and config.simulation_games:
@@ -135,6 +219,10 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
     episodes = store.episodes(fmt, None if job["payload"].get("imitation") else incumbent.revision)
     if not episodes:
         return {"trained": False, "reason": "no compatible complete episodes", "collection": collected}
+    steps = sum(len(e.get('steps', [])) for e in episodes if e.get('on_policy') or job['payload'].get('imitation'))
+    if steps < config.min_training_steps:
+        return {"trained": False, "reason": "accumulating compatible experience", "steps": steps,
+                "required_steps": config.min_training_steps, "collection": collected}
     if time.monotonic() >= deadline or policy.sample()["deferred"]:
         return {"deferred": True, "reason": "resource/time budget reached; experience retained"}
     snapshot(incumbent.path, candidate_root, fmt)
@@ -152,7 +240,8 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
         # Restart from the same incumbent if a Metal kernel/budget is unavailable.
         snapshot(incumbent.path, candidate_root, fmt)
         candidate = Model(candidate_root, fmt)
-        training = candidate.train(episodes, deadline=deadline)
+        training = candidate.train(episodes, epochs=job['payload'].get('epochs', 4),
+                                   imitation=job['payload'].get('imitation', False), deadline=deadline)
         training["mps_fallback"] = str(error)[:200]
         backend = "cpu"
     if not training.get("trained"):
@@ -161,40 +250,16 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
     # Saved candidate uses CPU-compatible load; active checkpoint is untouched.
     eval_tasks = tasks(before_root, config.evaluation_games, False, 100000)
     candidate_tasks = tasks(candidate_root, config.evaluation_games, False, 100000)
-    base_eval = await parallel_games(eval_tasks, policy, deadline)
-    new_eval = await parallel_games(candidate_tasks, policy, deadline)
-    base_games, new_games = base_eval["games"], new_eval["games"]
-    complete = len(base_games) == len(new_games) == config.evaluation_games
-    clean = complete and all(not g.get("unfinished") and not g.get("rejected_actions") for g in base_games+new_games)
-    base_wins = sum(g.get("winner") == "LocalBrain" for g in base_games)
-    new_wins = sum(g.get("winner") == "LocalBrain" for g in new_games)
-    passed = clean and new_wins-base_wins >= max(1, int(config.evaluation_games*config.promotion_margin+0.999))
-    with store.writer():
-        current = Model(store.root, fmt)
-        active_live = store.db.execute("SELECT 1 FROM episodes WHERE format=? AND source='ladder' AND status='pending' AND created>? LIMIT 1",
-                                      (fmt, datetime_cutoff())).fetchone()
-        promoted = passed and current.revision == incumbent.revision and not active_live
-        if promoted:
-            temporary = current.path.with_suffix(".promote.tmp")
-            shutil.copy2(candidate.path, temporary)
-            temporary.replace(current.path)
-        # Consumption is tied to the durable candidate, even if it is rejected.
-        store.mark_trained(training.pop("consumed"))
-    scout = Scout(store, fmt, Features.cached(fmt))
-    scout_report = scout.train(device=backend, duty_fraction=policy.gpu_duty_fraction if backend == "mps" else 1) if time.monotonic() < deadline else {"deferred": True}
-    report = {"format": fmt, "job": job["id"], "training": training, "backend": backend,
-              "collection": collected, "evaluation": {"games_per_policy": config.evaluation_games,
-              "incumbent_wins": base_wins, "candidate_wins": new_wins, "complete": complete,
-              "clean": clean, "same_seeds_and_sides": True, "team_pool_size": len(teams)},
-              "promoted": promoted, "promotion_blocked_by_live_game": bool(active_live),
-              "candidate_checkpoint": str(candidate.path), "scout": scout_report}
-    (work/"report.json").write_text(json.dumps(report, indent=2))
-    return report
-
-
-def datetime_cutoff():
-    from datetime import datetime, timezone, timedelta
-    return (datetime.now(timezone.utc)-timedelta(minutes=30)).isoformat()
+    inputs = work / 'evaluation-inputs'
+    freeze_inputs(store, inputs, fmt)
+    for task in eval_tasks + candidate_tasks:
+        task.update(inference_root=str(inputs), sample_actions=True)
+    import hashlib
+    atomic_json(work / 'evaluation-plan.json', {'incumbent': eval_tasks, 'candidate': candidate_tasks,
+                'games': config.evaluation_games, 'margin': config.promotion_margin, 'team_pool_size': len(teams)})
+    atomic_json(work / 'training-state.json', {'training': training, 'backend': backend, 'collection': collected,
+                'candidate_sha256': hashlib.sha256(candidate.path.read_bytes()).hexdigest()})
+    return await evaluate_saved(store, job, config, policy, deadline, work)
 
 
 async def run(root: Path, once: bool = True, schedule: bool = False):
@@ -266,6 +331,11 @@ async def run(root: Path, once: bool = True, schedule: bool = False):
                 result = {"deferred": True, "reason": "bounded cycle time expired; work retained"}
                 store.complete_job(job["id"], result, retry=True)
                 reports.append({"id": job["id"], "result": result})
+                break
+            except WriterBusy:
+                result = {'deferred': True, 'reason': 'learning writer busy; job retained'}
+                store.complete_job(job['id'], result, retry=True)
+                reports.append({'id': job['id'], 'result': result})
                 break
             except Exception as error:
                 result = {"error": str(error)[:500], "type": type(error).__name__}
