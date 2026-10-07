@@ -16,7 +16,9 @@ Verified on 2026-10-07 on an M5 Mac with 10 CPU cores and 16 GB RAM.
 | Exact M-C daily feeds | 50-species monthly usage summary, 12 tournament team sheets, 23 public replay games and 407 executed-move samples retrieved |
 | Current-format scout | 529 samples, 110 held out; held-out cross-entropy decreased from 6.521 to 5.575 on MPS |
 | Always-on scheduler | Project launchd job installed; every 15 minutes with bounded practice and once-per-day feeds; CPU/memory pressure causes deferral |
+| Successful scheduled promotion | Eight-team pool, identical evaluation seeds/sides: candidate 13/20 wins versus incumbent 10/20; clean evaluation passed the margin and promoted checkpoint update 112 |
 | Other services | Existing OpenClaw and application service process IDs remained unchanged during verification |
+| Public Linux CI | GitHub Actions installed the pinned simulator and ran all offline checks successfully |
 
 Team sheets include actual player/event attribution but do not disclose stat
 spreads. The OpenClaw test used explicitly generated experimental spreads; these
