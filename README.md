@@ -11,6 +11,10 @@ recommendations. [Setup and OpenClaw workflow](docs/ml.md) ·
 [Model research and primary sources](docs/ml-research.md).
 See [validation and the initial learning experiment](docs/ml-validation.md).
 
+[Technical paper (PDF)](docs/paper/main.pdf) · [LaTeX source and build instructions](docs/paper/README.md):
+the MCP/OpenClaw architecture, exact decision models, mathematical derivations,
+proofs with explicit assumptions, and evaluation limits.
+
 Always-on use: [OpenClaw decision/team workflow](docs/agent-workflow.md) ·
 [Resource-aware CPU/MPS training and daily feeds](docs/continuous-learning.md) ·
 [Data sources and licenses](docs/continuous-learning-research.md).
