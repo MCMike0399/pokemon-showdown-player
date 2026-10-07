@@ -1,0 +1,129 @@
+"""Reuse the harness connection for live inference, submissions and full games."""
+from __future__ import annotations
+
+import asyncio
+import time
+from contextlib import nullcontext
+
+from ml.storage import fingerprint
+from ml.teams import team_id
+
+
+def context(player, room: str, fmt: str, team: str = "") -> dict:
+    request = player._request(room)
+    if player.finished(room) or not request or request.get("wait"):
+        raise ValueError("battle is finished or has no actionable request")
+    if room.startswith("battle-") and room.split("-")[1] != fmt:
+        raise ValueError("format does not match the battle room")
+    sets = player.teams.get(team)["sets"] if team else None
+    if team and player.teams.get(team)["format"] != fmt:
+        raise ValueError("stored team format does not match battle format")
+    return {"room": room, "format": fmt, "team_id": team_id(fmt, sets) if sets else "", "source": "ladder",
+            "turn": player.c.battle_summary(room).get("turn"), "request": request,
+            "choices": player.legal_choices(room), "state": player.state_summary(room),
+            "public_log": list(player.c.battles.get(room, {}).get("log", []))}
+
+
+class LiveSession:
+    def __init__(self, brain, player):
+        self.brain, self.player = brain, player
+        self.submitted = {}
+        self.finished_rooms = set()
+        self.finished_outputs = {}
+
+    async def choose(self, room: str, fmt: str, team: str = "", explore: bool = True, demonstration: str | None = None):
+        if not self.player.c.logged_in:
+            raise ValueError("call ps_login once before playing")
+        ctx = context(self.player, room, fmt, team)
+        req = ctx["request"]
+        episode = self.brain.pending.get((room, req.get("side", {}).get("id", "p1")))
+        if episode and (episode["demonstration"] != (demonstration is not None) or
+                        (episode["on_policy"] and not explore and demonstration is None)):
+            raise ValueError("keep one learning mode for the whole recorded game")
+        key = (room, req.get("rqid", fingerprint(req)))
+        log = self.player.c.battles[room].get("log", [])
+        latest = max(((k,v) for k,v in self.submitted.items() if k[0] == room),
+                     key=lambda pair: pair[1]["log_index"], default=None)
+        if latest and any(line.startswith("|error|") for line in log[latest[1]["log_index"]:]):
+            if latest[1]["decision"].get("recorded"):
+                self.brain.reject(room, req.get("side", {}).get("id", "p1"))
+            del self.submitted[latest[0]]
+        submitted = self.submitted.get(key)
+        if submitted:
+            return {**submitted["decision"], "already_submitted": True}
+        decision = self.brain.decide(ctx, explore=explore, record=explore and demonstration is None, demonstration=demonstration)
+        log_index = len(log)
+        try:
+            await self.player.choose(room, decision["choice"])
+        except Exception:
+            self.brain.reject(room, req.get("side", {}).get("id", "p1"))
+            raise
+        self.submitted[key] = {"log_index": log_index, "decision": decision}
+        return decision
+
+    def finish(self, room: str):
+        if room in self.finished_outputs:
+            return self.finished_outputs[room]
+        req = self.player._request(room) or {}
+        result = self.player.result(room)
+        latest = max((v for key,v in self.submitted.items() if key[0] == room),
+                     key=lambda v: v["log_index"], default=None)
+        log = self.player.c.battles.get(room, {}).get("log", [])
+        if latest and latest["decision"].get("recorded") and any(line.startswith("|error|") for line in log[latest["log_index"]:]):
+            self.brain.reject(room, req.get("side", {}).get("id", "p1"))
+        record = self.brain.finish(room, result, self.player.c.user or "", req.get("side", {}).get("id", "p1"))
+        learning = None
+        if not result.get("ongoing") and room not in self.finished_rooms:
+            self.finished_rooms.add(room)
+            from ml.scout import ingest_public
+            from ml.continuous import enqueue_battle, kick_worker
+            fmt = record.get("format") or (room.split("-")[1] if room.startswith("battle-") else None)
+            if fmt:
+                public = ingest_public(self.brain.store, fmt,
+                                       self.player.c.battles.get(room, {}).get("log", []), "own-live-game", "own-"+room)
+                learning = {"public_experience": public,
+                            "job": enqueue_battle(self.brain.store, fmt, record.get("id", room))}
+                if learning["job"]:
+                    kick_worker(self.brain.store.root)
+        if not result.get("ongoing"):
+            self.submitted = {key: value for key, value in self.submitted.items() if key[0] != room}
+        output = {"result": result, "experience": record, "background_learning": learning}
+        if not result.get("ongoing"):
+            self.finished_outputs[room] = output
+        return output
+
+    async def play(self, room: str, fmt: str, team: str = "", learn: bool = True, timeout: float = 120,
+                   decision_lock=None):
+        if not 5 <= timeout <= 600:
+            raise ValueError("stall timeout must be 5..600 seconds")
+        await self.player.c.send(room + "|/timer on")
+        last_progress = time.monotonic()
+        last_key = None
+        ots_accepted = False
+        retries = 0
+        while not self.player.finished(room):
+            req = self.player._request(room) or {}
+            log = self.player.c.battles.get(room, {}).get("log", [])
+            if not ots_accepted and any("/acceptopenteamsheets" in line for line in log):
+                await self.player.c.send(room + "|/acceptopenteamsheets")
+                ots_accepted = True
+            key = (req.get("rqid", fingerprint(req)), fingerprint(req))
+            if key != last_key:
+                last_progress = time.monotonic()
+                last_key = key
+                retries = 0
+            if req and not req.get("wait") and self.player.legal_choices(room):
+                async with decision_lock or nullcontext():
+                    decision = await self.choose(room, fmt, team, explore=learn)
+                if not decision.get("already_submitted"):
+                    retries += 1
+                    if retries > 5:
+                        return {"result": {"room": room, "unfinished": True, "error": "repeated rejected choices"}}
+            if time.monotonic() - last_progress > timeout:
+                return {"result": {"room": room, "unfinished": True, "stalled": True}, "experience": "pending; no reward assigned"}
+            await asyncio.sleep(0.4)
+        async with decision_lock or nullcontext():
+            output = self.finish(room)
+        if learn and output["experience"].get("recorded"):
+            output["training"] = {"queued": True, "promotion": "requires candidate evaluation; live inference stays on incumbent"}
+        return output

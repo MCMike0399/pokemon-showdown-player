@@ -1,0 +1,11 @@
+{
+  "mcp": {
+    "servers": {
+      "pokemonshowdown": {
+        "command": "/absolute/path/to/pokemon-showdown-player/.venv/bin/python",
+        "args": ["/absolute/path/to/pokemon-showdown-player/ps_mcp_server.py"],
+        "requestTimeoutMs": 1200000
+      }
+    }
+  }
+}

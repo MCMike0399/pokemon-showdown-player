@@ -1,0 +1,7 @@
+{
+  "name": "pokemon-showdown-player-simulator",
+  "private": true,
+  "description": "Official offline battle mechanics for ML training; no server accounts",
+  "scripts": { "simulator:build": "cd node_modules/pokemon-showdown && node build" },
+  "dependencies": { "pokemon-showdown": "https://codeload.github.com/smogon/pokemon-showdown/tar.gz/c046106cbe075931b1ff8d8b800ff5be47a85f96" }
+}

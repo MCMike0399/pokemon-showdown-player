@@ -1,0 +1,12 @@
+{
+  "description": "Self-built simulator fixture, not a credited tournament or recommended competitive team. Champions stat points, not Scarlet/Violet EVs.",
+  "format": "gen9championsvgc2026regmc",
+  "sets": [
+    {"species":"Pelipper","item":"Focus Sash","ability":"Drizzle","moves":["Weather Ball","Tailwind","Hurricane","Protect"],"nature":"Modest","evs":{"hp":32,"spa":32,"spe":2}},
+    {"species":"Archaludon","item":"Leftovers","ability":"Stamina","moves":["Electro Shot","Dragon Pulse","Flash Cannon","Protect"],"nature":"Modest","evs":{"hp":32,"spa":32,"spd":2}},
+    {"species":"Incineroar","item":"Sitrus Berry","ability":"Intimidate","moves":["Fake Out","Flare Blitz","Darkest Lariat","Parting Shot"],"nature":"Careful","evs":{"hp":32,"def":2,"spd":32}},
+    {"species":"Rillaboom","item":"Miracle Seed","ability":"Grassy Surge","moves":["Fake Out","Grassy Glide","Wood Hammer","Protect"],"nature":"Adamant","evs":{"hp":32,"atk":32,"spe":2}},
+    {"species":"Raichu","item":"Magnet","ability":"Lightning Rod","moves":["Thunderbolt","Fake Out","Nuzzle","Protect"],"nature":"Timid","evs":{"hp":2,"spa":32,"spe":32}},
+    {"species":"Swampert","item":"Swampertite","ability":"Damp","moves":["Waterfall","High Horsepower","Ice Punch","Protect"],"nature":"Adamant","evs":{"atk":32,"spe":32,"hp":2}}
+  ]
+}
