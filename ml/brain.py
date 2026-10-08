@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+import time
 
 from ml.features import Features, SCHEMA
 from ml.model import Model
@@ -9,8 +10,10 @@ from ml.storage import Store, fingerprint, now
 
 
 class Brain:
-    def __init__(self, store: Store | None = None, features: Features | None = None):
+    def __init__(self, store: Store | None = None, features: Features | None = None,
+                 inference_store: Store | None = None):
         self.store = store or Store()
+        self.inference_store = inference_store or self.store
         self.features = features or Features.cached()
         self.explicit_features = features is not None
         self.format_features = {}
@@ -68,6 +71,7 @@ class Brain:
         return self.models[fmt]
 
     def decide(self, ctx: dict, explore: bool = False, record: bool = False, demonstration: str | None = None) -> dict:
+        started = time.perf_counter()
         if not ctx.get("choices"):
             raise ValueError("no actionable request")
         fmt = ctx.get("format")
@@ -93,7 +97,7 @@ class Brain:
         ctx = {**ctx, 'feature_profile': model.feature_profile}
         # Research affects bounded species-frequency features, never raw text.
         from ml.research import species_prior
-        knowledge = species_prior(self.store, fmt)
+        knowledge = species_prior(self.inference_store, fmt)
         if fmt not in self.format_features:
             self.format_features[fmt] = self.features if self.explicit_features else Features.cached(fmt)
         features = self.format_features[fmt]
@@ -102,7 +106,7 @@ class Brain:
         if ctx.get("public_log"):
             from ml.scout import Scout
             if fmt not in self.scouts:
-                self.scouts[fmt] = Scout(self.store, fmt, features)
+                self.scouts[fmt] = Scout(self.inference_store, fmt, features)
             side = ctx["request"].get("side", {}).get("id", "p1")
             scout_predictions = self.scouts[fmt].predict(ctx["public_log"], side)
             for opponent in scout_predictions:
@@ -115,12 +119,14 @@ class Brain:
                 raise ValueError("demonstrated action is not in the legal mask")
             demonstrated_index = ctx["choices"].index(demonstration)
         prediction = model.predict(state, actions, explore, preview=preview, selected_index=demonstrated_index)
+        inference_ms = round((time.perf_counter() - started) * 1000, 3)
         choice = ctx["choices"][prediction["index"]]
         if record or demonstration is not None:
             room = ctx["room"]
             key = (room, (ctx["request"].get("side") or {}).get("id", "p1"))
             episode = self.pending.get(key)
             if episode is None:
+                from ml.reload import runtime_generation
                 episode = {"id": uuid.uuid4().hex, "room": room, "format": fmt, "team": ctx.get("team_id", ""),
                            "source": ctx.get("source", "ladder"), "revision": model.revision,
                            "schema": SCHEMA, "created": now(), "status": "pending", "steps": [],
@@ -128,6 +134,7 @@ class Brain:
                            "feature_profile": model.feature_profile,
                            "recorder_version": RECORDER_VERSION,
                            'collecting_policy': {'checkpoint_sha256': model.checkpoint_sha256,
+                               'source_generation': runtime_generation(),
                                'checkpoint_archive': self.store.retain_checkpoint(model),
                                'policy_temperature': model.policy_temperature,
                                'preview_temperature': model.preview_temperature,
@@ -144,7 +151,8 @@ class Brain:
             # unexecuted proposals credit for the eventual game outcome.
             request_id = ctx["request"].get("rqid", fingerprint(ctx["request"]))
             step = {"request_id": request_id, "state": encoded_input(state), "actions": encoded_input(actions),
-                    "index": prediction["index"], "choice": choice, "logprob": prediction["logprob"], "value": prediction["value"]}
+                    "index": prediction["index"], "choice": choice, "logprob": prediction["logprob"], "value": prediction["value"],
+                    'inference_ms': inference_ms}
             from ml.recording import snapshot
             step['snapshot'] = snapshot(episode, ctx, prediction, knowledge, scout_predictions, model.temperature(preview))
             if ctx.get("source") == "ladder":
@@ -158,6 +166,7 @@ class Brain:
         return {"choice": choice, "probability": prediction["probabilities"][prediction["index"]],
                 "value": prediction["value"], "revision": model.revision, "updates": model.updates,
                 "sampled": explore, "recorded": record or demonstration is not None,
+                'inference_ms': inference_ms,
                 "opponent_predictions": scout_predictions,
                 "top_choices": [{"choice": c, "probability": p} for c, p in ranked[:5]]}
 

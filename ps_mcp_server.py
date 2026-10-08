@@ -425,6 +425,7 @@ async def ps_learning_status() -> str:
     async with _ml_lock:
         from ml.continuous import LearningConfig
         from ml.resources import ResourcePolicy
+        from ml.pipeline import status as pipeline_status
         brain = _ml()
         config = LearningConfig.load(brain.store.root)
         benchmark_file = brain.store.root/"compute-benchmark.json"
@@ -432,6 +433,7 @@ async def ps_learning_status() -> str:
                            "queue": [dict(r) for r in brain.store.db.execute("SELECT id,kind,format,status,result FROM jobs ORDER BY created DESC LIMIT 10")],
                            "feeds": [dict(r) for r in brain.store.db.execute("SELECT * FROM feed_state")],
                            "compute": json.loads(benchmark_file.read_text()) if benchmark_file.exists() else "not benchmarked",
+                           'pipeline': pipeline_status(brain.store.root),
                            "experience": brain.store.stats()}, indent=2)
 
 
@@ -544,4 +546,6 @@ async def ps_team_variants(name: str) -> str:
         return json.dumps(suggest_variants(_ml().store, teams.get(name)), indent=2)
 
 if __name__ == "__main__":
+    from ml.reload import source_generation, pin_runtime
+    pin_runtime(os.environ.get('PS_SOURCE_GENERATION') or source_generation())
     mcp.run()

@@ -4,6 +4,11 @@ The foreground MCP process keeps latency-sensitive inference on CPU. A separate
 bounded worker combines CPU simulator processes with CPU or Metal/MPS batch
 training. The active player does not share the training process or GPU tensors.
 
+For retained simultaneous collection, GPU learning and independent CPU candidate
+evaluation, see [the play/training pipeline](play-training-pipeline.md). Install
+with `scripts/learning_service.py install --pipeline`; the phased worker below
+remains available for bounded standalone runs.
+
 ## Resource policy
 
 Defaults reserve three CPU cores and at least 2 GB of available host memory,

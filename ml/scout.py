@@ -171,7 +171,9 @@ class Scout:
         return results
 
     def train(self, epochs: int = 3, device: str = "cpu", max_samples: int = 20000,
-              duty_fraction: float = 1.0):
+              duty_fraction: float = 1.0, checkpoint=None):
+        if checkpoint:
+            checkpoint()
         orphaned = self.store.db.execute('''SELECT COUNT(*) FROM scout_samples s WHERE s.format=?
             AND NOT EXISTS (SELECT 1 FROM public_battles p WHERE p.format=s.format AND p.digest=s.battle)''', (self.fmt,)).fetchone()[0]
         rows = list(self.store.db.execute('''SELECT s.* FROM scout_samples s WHERE s.format=?
@@ -201,6 +203,8 @@ class Scout:
         before = validation_loss()
         for _ in range(epochs):
             for start in range(0, len(train), 128):
+                if checkpoint:
+                    checkpoint()
                 import time
                 started = time.monotonic()
                 x, y = tensors(train[start:start+128])
@@ -211,8 +215,10 @@ class Scout:
                 optimizer.step()
                 if device == "mps" and duty_fraction < 1:
                     torch.mps.synchronize()
-                    time.sleep(min(0.1, (time.monotonic()-started) * (1/duty_fraction - 1)))
+                    time.sleep((time.monotonic()-started) * (1/duty_fraction - 1))
         after = validation_loss()
+        if checkpoint:
+            checkpoint()
         self.net.cpu()
         promoted = len(heldout) >= 8 and after <= before
         result = {"trained": True, "samples": len(rows), "heldout": len(heldout),

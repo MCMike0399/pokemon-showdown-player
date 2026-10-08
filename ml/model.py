@@ -138,12 +138,15 @@ class Model:
 
     def train(self, episodes: list[dict], epochs: int = 4, imitation: bool = False,
               duty_fraction: float = 1.0, deadline: float | None = None,
-              target_kl: float = 0.03) -> dict:
+              target_kl: float = 0.03, checkpoint=None) -> dict:
         if not 1 <= epochs <= 30:
             raise ValueError("epochs must be between 1 and 30")
         if not 0 < target_kl <= 1:
             raise ValueError("target KL must be positive and at most 1")
+        training_started = time.perf_counter()
         samples = []
+        if checkpoint:
+            checkpoint()
         ids = []
         excluded = []
         from ml.data_quality import trajectory_issues
@@ -187,6 +190,8 @@ class Model:
             invalid = set()
             with torch.no_grad():
                 for start in range(0, len(samples), 32):
+                    if checkpoint:
+                        checkpoint()
                     if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError('training budget expired during rollout validation')
                     batch = samples[start:start + 32]
@@ -221,6 +226,8 @@ class Model:
         for _ in range(epochs):
             order = rng.permutation(len(samples))
             for start in range(0, len(samples), 32):
+                if checkpoint:
+                    checkpoint()
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("training budget expired before saving candidate")
                 started = time.monotonic()
@@ -248,13 +255,15 @@ class Model:
                 losses.append(float(loss.detach()))
                 if device.type == "mps" and duty_fraction < 1:
                     torch.mps.synchronize()
-                    time.sleep(min(0.1, (time.monotonic() - started) * (1 / duty_fraction - 1)))
+                    time.sleep((time.monotonic() - started) * (1 / duty_fraction - 1))
             if not imitation:
                 # Assess the whole variable-action batch, rather than letting a
                 # noisy minibatch drive the stopping decision.
                 divergences, clipped = [], []
                 with torch.no_grad():
                     for start in range(0, len(samples), 32):
+                        if checkpoint:
+                            checkpoint()
                         batch = samples[start:start + 32]
                         states, actions, mask, indices = batcher.batch(range(start, start + len(batch)))
                         logits, _ = self.net(states, actions, mask)
@@ -269,6 +278,8 @@ class Model:
                 if kl_history[-1] > target_kl:
                     break
         old_revision = self.revision
+        if checkpoint:
+            checkpoint()
         self.revision = uuid.uuid4().hex
         self.updates += 1
         self.save()
@@ -281,5 +292,7 @@ class Model:
                 "previous_revision": old_revision, "revision": self.revision, "consumed": ids,
                 'excluded_episodes': excluded, 'maximum_collecting_logprob_error': maximum_logprob_error,
                 'batch_cache': batcher.stats(),
+                'optimizer_steps': len(losses), 'training_seconds': round(time.perf_counter() - training_started, 3),
+                'device': device.type, 'duty_fraction': duty_fraction,
                 'source_steps': {source: sum(s['_source'] == source for s in samples)
                                  for source in sorted({s['_source'] for s in samples})}}

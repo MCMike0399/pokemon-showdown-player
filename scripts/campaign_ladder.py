@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Bounded campaign controller with verified outcomes and explicit recovery."""
 import asyncio
-import hashlib
+import fcntl
 import json
 import sqlite3
 import sys
@@ -16,6 +16,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from ml.recording import RECORDER_VERSION
+from ml.reload import source_generation
 
 
 def utc():
@@ -43,15 +44,6 @@ def append(path, obj):
 def terminal(result):
     return isinstance(result, dict) and bool(result.get("winner") or result.get("tie")) and not any(
         result.get(key) for key in ("ongoing", "unfinished", "unresolved", "stalled"))
-
-
-def source_generation():
-    paths = [REPO / name for name in ('ps_client.py', 'ps_mcp_server.py', 'harness.py', 'battle_state.py', 'scripts/campaign_ladder.py')]
-    paths.extend(sorted((REPO / 'ml').glob('*.py')))
-    digest = hashlib.sha256()
-    for path in paths:
-        digest.update(path.read_bytes())
-    return digest.hexdigest()
 
 
 class Blocked(Exception):
@@ -108,9 +100,24 @@ class Campaign:
         completion_only = control.get('completion_only', False)
         if type(completion_only) is not bool:
             raise Blocked('completion_only must be boolean')
-        if completion_only:
+        if completion_only or self.continuous():
             return float('inf')
         return datetime.fromisoformat(self.manifest['deadline_at'].replace('Z', '+00:00')).timestamp()
+
+    def continuous(self):
+        value = read(self.directory / 'control.json').get('continuous', False)
+        if type(value) is not bool:
+            raise Blocked('continuous must be boolean')
+        return value
+
+    def paused(self):
+        value = read(self.directory / 'control.json').get('pause_ladder', False)
+        if type(value) is not bool:
+            raise Blocked('pause_ladder must be boolean')
+        return value
+
+    def should_search(self):
+        return not self.paused() and (self.continuous() or len(self.seen) < self.target()) and time.time() < self.deadline()
 
     def search_options(self):
         """Apply team changes only at the next search; current rooms retain exact sets."""
@@ -131,7 +138,8 @@ class Campaign:
         self.state.update(updated_at=utc(), next_step=next_step, target_ladder=self.target())
         original = self.manifest['targets']['ladder_games']
         self.state.update(original_target_ladder=original, original_target_complete=len(self.seen) >= original)
-        self.state['stop_mode'] = 'target' if read(self.directory / 'control.json').get('completion_only', False) else 'deadline-or-target'
+        self.state['stop_mode'] = 'continuous' if self.continuous() else 'target' if read(self.directory / 'control.json').get('completion_only', False) else 'deadline-or-target'
+        self.state['pause_ladder'] = self.paused()
         finalized = read(self.directory / 'control.json').get('finalized_adjustment')
         if finalized:
             self.state['finalized_adjustment'] = finalized
@@ -216,7 +224,8 @@ class Campaign:
     async def run(self):
         generation = source_generation()
         self.state['source_generation'] = generation
-        parameters = StdioServerParameters(command=str(REPO / ".venv/bin/python"), args=[str(REPO / "ps_mcp_server.py")])
+        parameters = StdioServerParameters(command=str(REPO / ".venv/bin/python"),
+            args=[str(REPO / "ps_mcp_server.py")], env={'PS_SOURCE_GENERATION': generation})
         async with stdio_client(parameters) as (reader, writer):
             async with ClientSession(reader, writer, read_timeout_seconds=1200) as session:
                 await session.initialize()
@@ -230,8 +239,7 @@ class Campaign:
                     await self.call(session, "ps_join", {"room": pending}, pending)
                     await asyncio.sleep(1)
                     await self.play(session, pending, team, resumed=True)
-                deadline = self.deadline()
-                while len(self.seen) < self.target() and time.time() < deadline:
+                while self.should_search():
                     if source_generation() != generation:
                         self.state.update(phase='source_reload_requested', active_room=None, current_tool=None)
                         self.status('Source changed; close this connection and reload at the terminal boundary')
@@ -241,7 +249,7 @@ class Campaign:
                     self.state["actor_revision"] = model["model"]["revision"]
                     room = None
                     for attempt in range(3):
-                        if time.time() >= deadline:
+                        if not self.should_search():
                             break
                         options = self.search_options()
                         self.state['requested_team'] = options['team']
@@ -255,13 +263,13 @@ class Campaign:
                         await self.call(session, "ps_send", {"room": "", "message": "/cancelsearch"})
                         await asyncio.sleep((30, 60, 120)[attempt])
                     if not room:
-                        if time.time() >= deadline:
+                        if not self.should_search():
                             break
                         raise Blocked("three matchmaking attempts timed out")
                     await self.play(session, room, team)
                     await asyncio.sleep(2)
                 reached = len(self.seen) >= self.target()
-                self.state.update(phase="ladder_target_complete" if reached else "deadline_reached", active_room=None, current_tool=None)
+                self.state.update(phase="paused" if self.paused() else "ladder_target_complete" if reached else "deadline_reached", active_room=None, current_tool=None)
                 self.status("Configured ladder target complete" if reached else "Campaign deadline reached; terminal games preserved")
                 print("RUN_TARGET_COMPLETE", flush=True)
 
@@ -274,7 +282,13 @@ def describe_error(error):
 
 async def main(campaign_directory):
     campaign = None
+    owner = (REPO / 'data/ml/ladder-owner.lock').open('a')
     try:
+        try:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print('SKIPPED: another retained ladder controller owns this account', flush=True)
+            return 0
         campaign = Campaign(campaign_directory)
         return await campaign.run() or 0
     except Exception as error:
@@ -288,6 +302,7 @@ async def main(campaign_directory):
     finally:
         if campaign:
             campaign.db.close()
+        owner.close()
 
 
 if __name__ == "__main__":

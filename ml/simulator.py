@@ -79,7 +79,7 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
     model = brain.model(fmt)
     opponent_brain = None
     if opponent == 'self':
-        opponent_brain = Brain(brain.store, brain.features)
+        opponent_brain = Brain(brain.store, brain.features, inference_store=brain.inference_store)
         opponent_brain.models[fmt] = opponent_model or model
 
     async def send(payload):

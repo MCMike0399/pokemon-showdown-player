@@ -43,6 +43,8 @@ class Store:
             );
             CREATE INDEX IF NOT EXISTS episodes_room_side ON episodes
                 (json_extract(data,'$.room'), json_extract(data,'$.side'));
+            CREATE INDEX IF NOT EXISTS episodes_training ON episodes
+                (format,status,trained,revision,team);
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY, url TEXT NOT NULL, format TEXT NOT NULL,
                 title TEXT NOT NULL, fetched TEXT NOT NULL, published TEXT,
@@ -168,11 +170,14 @@ are reconstructed. Atomic creation also tolerates concurrent local collectors.
                             (key, kind, fmt, now(), now(), json.dumps(payload or {})))
         return key
 
-    def claim(self, lease_seconds: int = 3600):
+    def claim(self, lease_seconds: int = 3600, kinds: tuple[str, ...] | None = None):
         import time
+        if kinds is not None and not kinds:
+            return None
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            row = self.db.execute("SELECT * FROM jobs WHERE (status='queued' OR (status='running' AND lease_until<?)) AND attempts<3 ORDER BY created LIMIT 1", (time.time(),)).fetchone()
+            filter_sql = " AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else ""
+            row = self.db.execute("SELECT * FROM jobs WHERE (status='queued' OR (status='running' AND lease_until<?)) AND attempts<3" + filter_sql + " ORDER BY created LIMIT 1", (time.time(), *(kinds or ()))).fetchone()
             if row:
                 self.db.execute("UPDATE jobs SET status='running',attempts=attempts+1,updated=?,lease_until=? WHERE id=?",
                                 (now(), time.time() + lease_seconds, row["id"]))

@@ -56,6 +56,23 @@ def test_completion_only_resumes_past_deadline_without_changing_target(campaign)
     controller.db.close()
 
 
+def test_continuous_play_crosses_milestone_and_pause_stops_next_search(campaign):
+    directory, _ = campaign
+    (directory / 'control.json').write_text(json.dumps({'target_ladder': 1, 'continuous': True}))
+    controller = runner.Campaign(directory)
+    controller.seen = {'completed-milestone'}
+    assert controller.should_search()
+    controller.status('Next game')
+    assert json.loads((directory / 'status.json').read_text())['stop_mode'] == 'continuous'
+    (directory / 'control.json').write_text(json.dumps({'target_ladder': 1, 'continuous': True, 'pause_ladder': True}))
+    assert not controller.should_search()
+    assert controller.state['active_room'] == ROOM  # Control never clears a collecting room.
+    (directory / 'control.json').write_text(json.dumps({'continuous': 'yes'}))
+    with pytest.raises(runner.Blocked, match='continuous must be boolean'):
+        controller.should_search()
+    controller.db.close()
+
+
 def test_next_search_can_pin_corrected_team_without_changing_active_recovery(campaign):
     directory, _ = campaign
     controller = runner.Campaign(directory)
@@ -152,6 +169,7 @@ def test_source_reload_happens_before_search_at_empty_boundary(campaign, monkeyp
     monkeypatch.setattr(runner, 'source_generation', lambda: next(generations))
     @asynccontextmanager
     async def stdio(parameters):
+        assert parameters.env == {'PS_SOURCE_GENERATION': 'old'}
         yield None, None
     class Session:
         def __init__(self, *args, **kwargs):

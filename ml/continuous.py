@@ -31,6 +31,8 @@ class LearningConfig:
     training_teams: dict[str, str] = field(default_factory=dict)
     curriculum: str = 'ladder-v1'
     open_team_sheet_probability: float = .08
+    max_training_backlog_steps: int = 1024
+    max_inflight_candidates: int = 2
 
     def __post_init__(self):
         from battle_state import to_id
@@ -45,6 +47,10 @@ class LearningConfig:
         ResourcePolicy(**self.resource)
         if not 1 <= self.min_training_steps <= 4096:
             raise ValueError("minimum training steps must be 1..4096")
+        if not self.min_training_steps <= self.max_training_backlog_steps <= 16384:
+            raise ValueError('training backlog must be at least the minimum batch and at most 16384 steps')
+        if type(self.max_inflight_candidates) is not int or not 1 <= self.max_inflight_candidates <= 4:
+            raise ValueError('inflight candidates must be 1..4')
         from ml.feeds import ARCHIVES
         if any(name not in ARCHIVES for name in self.archives):
             raise ValueError("archive must be an approved pinned source")
@@ -83,21 +89,25 @@ def learning_report(output: dict) -> dict:
             "promotion": "requires candidate evaluation; live inference stays on incumbent"}
 
 
-def queue_daily(store: Store, config: LearningConfig):
+def queue_daily(store: Store, config: LearningConfig, practice: bool = True):
     day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if not config.enabled:
         return
     for fmt in config.formats:
         if config.feed_daily:
             store.enqueue(f"feed-{day}-{fmt}", "feed", fmt)
-        clock = datetime.now(timezone.utc)
-        store.enqueue(f"practice-{day}-{clock.hour}-{clock.minute//15}-{fmt}", "practice", fmt)
+        if practice:
+            clock = datetime.now(timezone.utc)
+            store.enqueue(f"practice-{day}-{clock.hour}-{clock.minute//15}-{fmt}", "practice", fmt)
 
 
 def kick_worker(root: Path):
     """Nonblocking, one bounded process; OS lock prevents duplicate workers."""
     if os.environ.get("PS_DISABLE_WORKER_KICK") == "1":
         return
+    from ml.pipeline import pipeline_running
+    if pipeline_running(root):
+        return  # The retained supervisor drains the same durable queue.
     log_dir = Path(root)/"logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     with (log_dir/"worker.log").open("a") as log:

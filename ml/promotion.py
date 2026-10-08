@@ -36,6 +36,8 @@ def stage(store: Store, fmt: str, parent_revision: str, checkpoint: Path, evalua
     """Caller holds writer lock; rejected candidates never enter the ready slot."""
     if not evaluation.get('passed'):
         return False
+    from ml.reload import source_generation
+    evaluation = {'source_generation': source_generation(), **evaluation}
     folder = store.root / 'ready'
     folder.mkdir(exist_ok=True)
     path = folder / (fmt + '.json')
@@ -66,6 +68,11 @@ def _promote_locked(store: Store, fmt: str, path: Path) -> dict:
     if not path.exists():
         return {'promoted': False, 'reason': 'no staged candidate'}
     data = json.loads(path.read_text())
+    from ml.reload import source_generation
+    evaluated_source = data['evaluation'].get('source_generation')
+    if evaluated_source != source_generation():
+        path.unlink()  # Checkpoint/report remain; only its obsolete ready slot expires.
+        return {'promoted': False, 'reason': 'source changed since evaluation; candidate retained for audit'}
     if store.db.execute("SELECT 1 FROM episodes WHERE format=? AND source='ladder' AND status='pending' LIMIT 1", (fmt,)).fetchone():
         return {'promoted': False, 'reason': 'pending ladder recording'}
     incumbent = Model(store.root, fmt)
