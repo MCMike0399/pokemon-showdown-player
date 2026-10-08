@@ -26,8 +26,13 @@ match position. Normal new events animate, with automatic catch-up if the render
 falls more than a turn behind or accumulates over 80 events. Sound stays muted by
 default. Select a recent game for playback; **Jump to live** returns to auto-follow.
 **Reconnect** replaces the viewer's stream, without touching the player connection.
-The progress target follows the campaign's current control file when its target
-changes.
+The sidebar shows an open-ended ladder record without a game cap or target bar.
+Overall and recent win rates count wins divided by all verified games in the
+corresponding window, including ties. Recent form reads oldest to newest; the
+current streak is a lower bound when it fills the available recent window.
+Policy updates and opponent samples come from the existing monitoring snapshot.
+The performance readout compares the recent window with the full-run average;
+it is descriptive and does not claim a model passed an evaluation or improved.
 
 On macOS, install the independent supervised viewer (after freeing its port):
 

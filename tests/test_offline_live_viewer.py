@@ -8,6 +8,53 @@ import pytest
 
 
 VIEWER = Path(__file__).resolve().parents[1] / "web/live-watch/viewer.js"
+
+
+@pytest.mark.parametrize("score,results,expected", [
+    ([0, 0, 0], [], [None, None, '—']),
+    ([202, 321, 0], ['Loss', 'Loss', 'Win', 'Loss', 'Loss', 'Loss', 'Loss', 'Win'],
+     [202 / 523 * 100, 25, '2 losses']),
+    ([1, 1, 2], ['Tie', 'Tie', 'Loss', 'Win'], [25, 25, '2 ties']),
+    ([12, 0, 0], ['Win'] * 8, [100, 100, '≥8 wins']),
+    ([8, 0, 0], ['Win'] * 8, [100, 100, '8 wins']),
+    ([1, 0, 0], ['Win'], [100, 100, '1 win']),
+])
+def test_performance_rates_and_streaks_use_verified_results(score, results, expected):
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('viewer checks require Node')
+    script = r"""
+const fs = require('node:fs'), vm = require('node:vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const nodes = new Map();
+const element = id => {
+  if (!nodes.has(id)) nodes.set(id, {classList:{add(){},remove(){},toggle(){}},
+    replaceChildren(){}, setAttribute(){}, append(){}});
+  return nodes.get(id);
+};
+const context = vm.createContext({
+  document: {getElementById:element, createElement:() => element(Symbol()), addEventListener(){}},
+  window: {addEventListener(){}}, ResizeObserver:class {observe(){}},
+  Dex: {getSpriteData(){}}, BattleSound: {setMute(){}},
+  EventSource:class {addEventListener(){} close(){}},
+});
+vm.runInContext(fs.readFileSync(input.viewer, 'utf8'), context);
+context.data = {score:input.score, completed:523, target:500, phase:'playing',
+  recent:input.results.map((result, i) => ({result, game:523-i, room:'invalid'}))};
+const stats = vm.runInContext('performanceSummary(data)', context);
+vm.runInContext('applyStatus(data)', context);
+process.stdout.write(JSON.stringify({stats, signal:element('signal').textContent,
+  completed:element('completed').textContent, note:element('note').textContent}));
+"""
+    response = subprocess.run([node, '-e', script], text=True, capture_output=True, check=True,
+                              input=json.dumps({'viewer': str(VIEWER), 'score': score, 'results': results}))
+    data = json.loads(response.stdout)
+    assert [data['stats'][key] for key in ('rate', 'recentRate', 'streakText')] == expected
+    assert data['signal'] == 'Between games'  # Passing the old cap never ends an open run.
+    assert ' of ' not in data['completed']
+    assert 'NaN' not in data['note']
+
+
 PREVIEW = [
     "|gametype|doubles", "|player|p1|One", "|player|p2|Two",
     "|poke|p1|Pikachu, L50", "|poke|p1|Eevee, L50",

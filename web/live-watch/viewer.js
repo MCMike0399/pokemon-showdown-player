@@ -132,7 +132,7 @@ function connect() {
   stream.onerror = () => {
     if (stream !== current) return;
     catchUpNext = true;
-    connectionInterrupted('Connection interrupted. Reconnecting to DiveMac…');
+    connectionInterrupted('Connection interrupted. Reconnecting to the live feed…');
     // EventSource retries dropped sockets itself, but an HTTP 503 can close it
     // permanently. Retry that case too (e.g. while launchd restarts the viewer).
     if (current.readyState === 2) {
@@ -145,7 +145,7 @@ function connectionInterrupted(message) {
   $id('signal').textContent = 'Reconnecting'; $id('dot').classList.add('wait');
   $id('viewer-status').textContent = message;
   $id('note').classList.add('error');
-  $id('note').textContent = 'The match keeps running on DiveMac. This viewer will catch up when connected.';
+  $id('note').textContent = 'The match keeps running. Live insights will refresh when the feed reconnects.';
 }
 
 function show(room, game) {
@@ -199,21 +199,63 @@ document.addEventListener('visibilitychange', () => {
   }
 });
 
+function performanceSummary(data) {
+  const [wins, losses, ties] = data.score;
+  const total = wins + losses + ties;
+  const rate = total ? wins / total * 100 : null;
+  const recent = (data.recent || []).filter(row => ['Win', 'Loss', 'Tie'].includes(row.result));
+  const recentWins = recent.filter(row => row.result === 'Win').length;
+  const recentRate = recent.length ? recentWins / recent.length * 100 : null;
+  const streak = recent.findIndex(row => row.result !== recent[0].result);
+  const streakLength = streak < 0 ? recent.length : streak;
+  const streakText = !recent.length ? '—' : (streak < 0 && total > recent.length ? '≥' : '') +
+    streakLength + ' ' + ({Win:'win', Loss:'loss', Tie:'tie'}[recent[0].result]) +
+    (streakLength === 1 ? '' : recent[0].result === 'Loss' ? 'es' : 's');
+  let insight = 'Insights appear as verified games finish.';
+  if (recent.length) {
+    const gap = recentRate - rate;
+    insight = recentWins + (recentWins === 1 ? ' win' : ' wins') + ' in the last ' + recent.length +
+      (recent.length === 1 ? ' game. ' : ' games. ');
+    insight += total === recent.length ? 'Building the first performance baseline.' :
+      Math.abs(gap) < 0.05 ? 'Recent win rate matches the full-run average.' :
+      'Recent win rate is ' + Math.abs(gap).toFixed(1) + ' percentage points ' +
+        (gap > 0 ? 'above' : 'below') + ' the full-run average.';
+  }
+  return {total, rate, recent, recentRate, streakText, insight};
+}
+
 function applyStatus(data) {
     latest = data;
+    const stats = performanceSummary(data);
     ['wins', 'losses', 'ties'].forEach((id, i) => { $id(id).textContent = data.score[i]; });
-    $id('progress').textContent = (data.completed || 0) + ' of ' + (data.target || 100) + ' games finished';
-    $id('bar').value = data.completed || 0; $id('bar').max = data.target || 100;
+    $id('completed').textContent = stats.total.toLocaleString() + (stats.total === 1 ? ' verified game' : ' verified games');
+    $id('win-rate').textContent = stats.rate === null ? '—' : stats.rate.toFixed(1) + '%';
+    $id('recent-label').textContent = stats.recent.length ? 'Win rate · last ' + stats.recent.length : 'Recent win rate';
+    $id('recent-rate').textContent = stats.recentRate === null ? '—' : stats.recentRate.toFixed(1) + '%';
+    $id('streak').textContent = stats.streakText;
     $id('updates').textContent = data.updates ?? '—'; $id('choices').textContent = data.choices ?? '—';
     $id('samples').textContent = data.scout_samples?.toLocaleString() ?? '—';
-    $id('signal').textContent = data.room ? 'Live game' : data.phase==='paused_for_adjustments' ? 'Adjustment checkpoint' : data.phase==='blocked' ? 'Campaign paused' : data.completed >= data.target ? 'Campaign finished' : 'Between games';
+    $id('signal').textContent = data.room ? 'Live game' : data.phase==='paused_for_adjustments' ? 'Adjustment checkpoint' :
+      ['blocked', 'paused'].includes(data.phase) ? 'Run paused' :
+      ['complete', 'ladder_target_complete', 'deadline_reached'].includes(data.phase) ? 'Run stopped' : 'Between games';
     $id('dot').classList.toggle('wait', !data.room);
     if (follow && data.room) show(data.room, data.game);
     if (!shown && data.recent?.length) show(data.recent[0].room, data.recent[0].game);
     const signature = JSON.stringify(data.recent || []);
     if (signature !== recentSignature) {
     recentSignature = signature;
+    const form = $id('form');
+    form.replaceChildren();
+    form.setAttribute('aria-label', stats.recent.length ? 'Recent results, oldest to newest: ' +
+      [...stats.recent].reverse().map(row => row.result).join(', ') : 'No recent results');
+    for (const row of [...stats.recent].reverse()) {
+      const marker = document.createElement('span');
+      marker.textContent = row.result[0]; marker.className = row.result.toLowerCase();
+      marker.title = 'Game ' + row.game + ': ' + row.result;
+      form.append(marker);
+    }
     $id('recent').replaceChildren();
+    if (!data.recent?.length) $id('recent').textContent = 'No completed games yet.';
     for (const row of data.recent || []) {
       const a = document.createElement('a'); a.href = battleURL(row.room);
       a.onclick = event => {
@@ -227,6 +269,6 @@ function applyStatus(data) {
     }
     }
     $id('note').classList.remove('error');
-    $id('note').textContent = 'DiveMac keeps the match state while you’re away. Scores use verified terminal recordings.';
+    $id('note').textContent = stats.insight;
 }
 connect();
