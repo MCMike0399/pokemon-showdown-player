@@ -1,6 +1,8 @@
 """Identity confirmation and packet routing without a network connection."""
 import asyncio
 from types import SimpleNamespace
+import pytest
+from websockets.exceptions import ConnectionClosedOK
 
 from ps_client import PSClient
 
@@ -49,3 +51,46 @@ def test_login_waits_for_fresh_server_confirmation(monkeypatch):
     result = asyncio.run(client.login())
     assert result["loggedIn"] is False
     assert result["user"] == "Guest 1234"
+
+
+def test_terminal_null_request_is_not_waiting():
+    client = PSClient(username='Player', password='unused')
+    client.battles['battle-test'] = {'log': ['|request|null']}
+    assert client.current_requests() == {}
+
+
+def test_reconnect_requires_a_fresh_challenge(monkeypatch):
+    client = PSClient(username='Player', password='unused')
+    client.challstr, client.user, client.logged_in = 'old', 'Player', True
+    class Socket:
+        def __aiter__(self):
+            async def frames():
+                yield '|challstr|new'
+                await asyncio.Event().wait()
+            return frames()
+        async def close(self):
+            pass
+    async def connect(*args, **kwargs):
+        return Socket()
+    monkeypatch.setattr('ps_client.websockets.connect', connect)
+    async def run():
+        assert await client.connect() == 'new'
+        assert client.user is None and not client.logged_in
+        reader = client.task
+        await client.close()
+        assert reader.done() and client.task is None
+    asyncio.run(run())
+
+
+def test_closed_action_socket_revokes_login_without_anonymous_reconnect():
+    client = PSClient(username='Player', password='unused')
+    client.connected = client.logged_in = True
+    class Socket:
+        async def send(self, message):
+            raise ConnectionClosedOK(None, None)
+    async def connect():
+        pytest.fail('action submission must not reconnect anonymously')
+    client.ws, client.connect = Socket(), connect
+    with pytest.raises(ConnectionError):
+        asyncio.run(client.choose('battle-test', 'move 1'))
+    assert not client.connected and not client.logged_in

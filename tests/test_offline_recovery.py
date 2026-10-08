@@ -31,7 +31,7 @@ def session(tmp_path):
         stores.append(store)
         return Brain(store, Features())
     client = PSClient(username="configured", password="unused")
-    client.logged_in, client.user = True, "Player"
+    client.connected, client.logged_in, client.user = True, True, "Player"
     client.battles[ROOM] = {"log": ["|request|" + json.dumps(request(1))]}
     player = Player(client, TeamStore(tmp_path / "teams.json"))
     sent = []
@@ -186,3 +186,86 @@ def test_play_reports_no_job_when_learning_disabled(session):
     assert output['training']['queued'] is False
     assert output['training']['job'] is None
     assert brain.store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 0
+
+
+def test_transport_reconnect_keeps_same_episode_and_saved_action(session):
+    import copy
+    make, player, sent = session
+    brain = make()
+    live = LiveSession(brain, player)
+    async def run():
+        player.c.connected = True
+        await live.choose(ROOM, FMT)
+        prefix = copy.deepcopy(brain.pending[(ROOM, 'p1')]['steps'])
+        episode_id = brain.pending[(ROOM, 'p1')]['id']
+        player.c.connected = player.c.logged_in = False
+        calls = []
+        async def close():
+            calls.append('close')
+        async def login():
+            calls.append('login')
+            player.c.connected = player.c.logged_in = True
+            player.c.user = player.c.username
+            return {'loggedIn': True, 'user': player.c.username}
+        async def join(room):
+            assert room == ROOM
+            calls.append('join')
+            player.c.battles[ROOM] = {'log': ['|player|p1|Player', '|request|' + json.dumps(request(1))]}
+        async def send(message):
+            pass
+        async def choose(room, choice):
+            assert choice == prefix[-1]['choice']
+            player.c.battles[ROOM]['log'].append('|win|Player')
+        player.c.close, player.c.login, player.c.join, player.c.send = close, login, join, send
+        player.choose = choose
+        output = await live.play(ROOM, FMT)
+        assert calls == ['close', 'login', 'join']
+        assert output['experience']['id'] == episode_id
+        episode = brain.store.episodes(FMT)[0]
+        assert episode['steps'] == prefix
+        assert episode['outcome'] == 1
+        assert output['transport_recoveries'] == 1
+    asyncio.run(run())
+
+
+def test_failed_same_account_reconnect_is_bounded_and_keeps_pending(session):
+    make, player, sent = session
+    brain = make()
+    live = LiveSession(brain, player)
+    async def run():
+        await live.choose(ROOM, FMT)
+        episode_id = brain.pending[(ROOM, 'p1')]['id']
+        player.c.connected = player.c.logged_in = False
+        logins = []
+        async def close():
+            player.c.connected = player.c.logged_in = False
+        async def login():
+            logins.append(True)
+            return {'loggedIn': False}
+        async def join(room):
+            pytest.fail('must not join under unconfirmed identity')
+        player.c.close, player.c.login, player.c.join = close, login, join
+        output = await live.play(ROOM, FMT)
+        assert len(logins) == 3
+        assert output['result']['unfinished'] and output['result']['connection_lost']
+        episode = brain.pending[(ROOM, 'p1')]
+        assert episode['id'] == episode_id and episode['status'] == 'pending'
+        assert len(episode['steps']) == 1 and episode.get('outcome') is None
+    asyncio.run(run())
+
+
+def test_failed_resubmission_retains_already_submitted_step(session):
+    import copy
+    make, player, sent = session
+    brain = make()
+    live = LiveSession(brain, player)
+    asyncio.run(live.choose(ROOM, FMT))
+    prefix = copy.deepcopy(brain.pending[(ROOM, 'p1')]['steps'])
+    live.submitted.clear()
+    async def failed_choose(room, choice):
+        raise ConnectionError('fixture socket closed')
+    player.choose = failed_choose
+    with pytest.raises(ConnectionError):
+        asyncio.run(live.choose(ROOM, FMT))
+    assert brain.pending[(ROOM, 'p1')]['steps'] == prefix
+    assert not brain.pending[(ROOM, 'p1')].get('discarded_proposals')

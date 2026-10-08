@@ -34,6 +34,30 @@ class LiveSession:
         self.finished_outputs = {}
         self.watch_room = None
         self.watch_digest = None
+        self.reconnect_counts = {}
+
+    async def recover_transport(self, room: str):
+        """Reauthenticate this same client/account and rejoin only the collecting room."""
+        client = self.player.c
+        self.watch_room = None
+        await client.close()
+        login = await client.login()
+        if not login.get('loggedIn'):
+            raise ValueError('configured account identity could not be restored')
+        normalize = lambda value: ''.join(c for c in (value or '').lower() if c.isalnum())
+        if normalize(client.user) != normalize(client.username):
+            raise ValueError('recovery identity does not match configured account')
+        client.battles.pop(room, None)
+        client.rooms.pop(room, None)
+        self.submitted = {key: value for key, value in self.submitted.items() if key[0] != room}
+        await client.join(room)
+        stop = time.monotonic() + 20
+        while time.monotonic() < stop:
+            if self.player.finished(room) or self.player._request(room):
+                self.watch_room = room
+                return
+            await asyncio.sleep(.2)
+        raise TimeoutError('same-room rejoin did not produce a request or terminal result')
 
     def publish_watch(self, room: str):
         """Mirror only battle protocol, using the existing player's connection."""
@@ -118,7 +142,8 @@ class LiveSession:
         try:
             await self.player.choose(room, decision["choice"])
         except Exception:
-            self.brain.reject(room, req.get("side", {}).get("id", "p1"))
+            if not (decision.get('recovered') and saved and saved.get('submitted') is True):
+                self.brain.reject(room, req.get("side", {}).get("id", "p1"), reason='socket-submission-failed')
             raise
         if decision.get("recorded"):
             episode = self.brain.pending[(room, side)]
@@ -173,24 +198,51 @@ class LiveSession:
                    decision_lock=None):
         if not 5 <= timeout <= 600:
             raise ValueError("stall timeout must be 5..600 seconds")
-        if not self.player.c.logged_in:
-            raise ValueError("call ps_login once before playing")
-        if room not in self.player.c.battles:
-            await self.player.c.join(room)
         self.watch_room = room
         req = self.player._request(room) or {}
         side = req.get("side", {}).get("id") or self.brain.room_side(room)
-        self.brain.resume(room, side)
-        await self.player.c.send(room + "|/timer on")
+        episode = self.brain.resume(room, side)
+        if not self.player.c.logged_in and not episode:
+            raise ValueError("call ps_login once before playing")
+        if self.player.c.logged_in:
+            if room not in self.player.c.battles:
+                await self.player.c.join(room)
+            try:
+                await self.player.c.send(room + "|/timer on")
+            except ConnectionError:
+                if self.player.c.connected and self.player.c.logged_in:
+                    raise
         last_progress = time.monotonic()
         last_key = None
         ots_accepted = False
         retries = 0
         while not self.player.finished(room):
+            if not self.player.c.connected or not self.player.c.logged_in:
+                attempts = self.reconnect_counts.get(room, 0)
+                if attempts >= 3:
+                    return {'result': {'room': room, 'unfinished': True, 'connection_lost': True},
+                            'experience': 'pending; no reward assigned', 'transport_recoveries': attempts}
+                self.reconnect_counts[room] = attempts + 1
+                try:
+                    await self.recover_transport(room)
+                    if not self.player.finished(room):
+                        await self.player.c.send(room + '|/timer on')
+                except Exception:
+                    await self.player.c.close()
+                    await asyncio.sleep(1)
+                    continue
+                last_key = None
+                last_progress = time.monotonic()
+                continue
             req = self.player._request(room) or {}
             log = self.player.c.battles.get(room, {}).get("log", [])
             if not ots_accepted and any("/acceptopenteamsheets" in line for line in log):
-                await self.player.c.send(room + "|/acceptopenteamsheets")
+                try:
+                    await self.player.c.send(room + "|/acceptopenteamsheets")
+                except ConnectionError:
+                    if self.player.c.connected and self.player.c.logged_in:
+                        raise
+                    continue
                 ots_accepted = True
             key = (req.get("rqid", fingerprint(req)), fingerprint(req))
             if key != last_key:
@@ -199,7 +251,12 @@ class LiveSession:
                 retries = 0
             if req and not req.get("wait") and self.player.legal_choices(room):
                 async with decision_lock or nullcontext():
-                    decision = await self.choose(room, fmt, team, explore=learn)
+                    try:
+                        decision = await self.choose(room, fmt, team, explore=learn)
+                    except Exception:
+                        if not self.player.c.connected or not self.player.c.logged_in:
+                            continue
+                        raise
                 if not decision.get("already_submitted"):
                     retries += 1
                     if retries > 5:
@@ -209,6 +266,7 @@ class LiveSession:
             await asyncio.sleep(0.4)
         async with decision_lock or nullcontext():
             output = self.finish(room)
+        output['transport_recoveries'] = self.reconnect_counts.get(room, 0)
         if learn and output["experience"].get("recorded"):
             from ml.continuous import learning_report
             output["training"] = learning_report(output)

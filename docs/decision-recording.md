@@ -20,6 +20,14 @@ vectors, probability and episode identity. An older step without a snapshot rema
 `legacy-encoded-only`; no private request or named alternative is invented from
 later reveals. The existing feature schema and recorder version are preserved.
 
+If the playing socket disconnects, `ps_ml_play` makes at most three attempts per
+room to close the old transport, authenticate the configured account and rejoin
+that exact room. A repeated request resubmits the saved action without sampling
+again; a saved successful socket submission is retained if a resubmit fails.
+An unsent new proposal is excluded from training credit. Exhausting recovery
+returns an unfinished result and keeps the pending episode without a reward.
+This bounded recovery does not establish that arbitrary crashes are lossless.
+
 All recordings remain in the gitignored local data root. They include private team
 information and are not copied into the public viewer or source publication.
 The actor still uses its compact decision-time features; saving snapshots does not
