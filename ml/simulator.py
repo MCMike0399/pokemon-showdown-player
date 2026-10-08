@@ -65,6 +65,10 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
     unavailable = 0
     consecutive_unavailable = 0
     model = brain.model(fmt)
+    opponent_brain = None
+    if opponent == 'self':
+        opponent_brain = Brain(brain.store, brain.features)
+        opponent_brain.models[fmt] = opponent_model or model
 
     async def send(payload):
         process.stdin.write((json.dumps(payload) + "\n").encode())
@@ -123,8 +127,7 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
             elif opponent == "random":
                 choice = rng.choice(choices)
             elif opponent == "self":
-                s, a = brain.features.encode(ctx)
-                choice = choices[(opponent_model or model).predict(s, a, explore=training, preview=bool(request.get('teamPreview')))["index"]]
+                choice = opponent_brain.decide(ctx, explore=training, record=False)['choice']
             else:
                 # A separate frozen scripted opponent; never updated by training.
                 choice = max(choices, key=lambda c: brain.features.action(ctx, c)[-1])
@@ -142,6 +145,8 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                        "opponent": opponent, "learner_side": learner_side, "revision": model.revision})
         result["policy_mode"] = "sampled" if training or sample_actions else "greedy"
         result["unavailable_choices"] = unavailable
+        if opponent_model is not None:
+            result['opponent_revision'] = opponent_model.revision
         return result
     finally:
         # Truncations/errors remain pending in SQLite with no reward. They must

@@ -71,3 +71,21 @@ episode and each readable snapshot. PPO excludes recordings from another profile
 and both direct recording and live recovery refuse a change within a trajectory.
 Re-encoding old readable observations is useful for diagnosis; those new vectors
 must not be paired with old collecting log probabilities as fresh PPO data.
+
+Additional experimental profiles are opt-in. `tactics-v1` fixes colored public HP
+and scores estimated damage using observed stat boosts/burn, target HP, joint
+focus fire and friendly damage. Opponent stats/spreads remain estimates; this is
+not an exact damage calculator. Legacy profiles retain their original encoded HP
+values so stored collecting tensors keep their meaning.
+
+`preview-v1` adds a visible-opponent coverage/lead prior. `preview-v2` maps that
+prior monotonically into the bounded logit range; direct clipping can otherwise
+collapse every legal lineup to the same score. Preview profiles preserve turn
+encoding. A new profile/revision and complete candidate validation are required.
+
+Offline evaluation can hold an explicit opponent checkpoint fixed through
+`opponent_checkpoint_root`. Both policies then face the same model, including its
+own feature profile, research and scout inputs; paired validation checks the
+opponent revision as well as seeds/sides. This supports tougher comparisons than
+random and tactical-script opponents alone. Passing a local suite still does not
+establish human ladder strength.

@@ -33,12 +33,13 @@ def rollout(task: dict):
     brain = Brain(store, Features.cached(task["format"]))
     model = Model(Path(task["checkpoint_root"]), task["format"])
     brain.models[task["format"]] = model
+    opponent_model = Model(Path(task['opponent_checkpoint_root']), task['format']) if task.get('opponent_checkpoint_root') else None
     torch.manual_seed(task["seed"])
     try:
         return asyncio.run(play_local(brain, task["format"], task["team1"], task["team2"],
                                      opponent=task.get("opponent", "heuristic"), seed=task["seed"],
                                      training=task["training"], learner_side=task["side"],
-                                     sample_actions=task.get("sample_actions", False)))
+                                     sample_actions=task.get("sample_actions", False), opponent_model=opponent_model))
     finally:
         store.close()
 

@@ -6,6 +6,7 @@ the public player stream. Do not feed an omniscient simulator log to this module
 from __future__ import annotations
 
 from itertools import permutations, product
+import re
 from typing import Any
 
 
@@ -13,7 +14,7 @@ def to_id(value: str) -> str:
     return "".join(c for c in str(value).lower() if c.isalnum())
 
 
-def hp_fraction(condition: str | None) -> float:
+def legacy_hp_fraction(condition: str | None) -> float:
     text = (condition or "").split(" ")[0]
     if text == "0" or "fnt" in (condition or ""):
         return 0.0
@@ -22,6 +23,12 @@ def hp_fraction(condition: str | None) -> float:
         return max(0.0, min(1.0, float(current) / float(maximum)))
     except (ValueError, ZeroDivisionError):
         return 1.0
+
+
+def hp_fraction(condition: str | None) -> float:
+    # Public HP can carry the display color immediately after the denominator.
+    text = re.sub(r'^(\d+/\d+)[gry](?=\s|$)', r'\1', condition or '')
+    return legacy_hp_fraction(text)
 
 
 def unpack_team(packed: str) -> list[dict]:

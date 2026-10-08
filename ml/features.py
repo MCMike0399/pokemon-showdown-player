@@ -8,12 +8,12 @@ from pathlib import Path
 
 import numpy as np
 
-from battle_state import hp_fraction, to_id
+from battle_state import hp_fraction, legacy_hp_fraction, to_id
 
 SCHEMA = 1
 STATE_DIM = 384
 ACTION_DIM = 192
-FEATURE_PROFILES = {'legacy', 'weather-v1'}
+FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2'}
 
 
 class Features:
@@ -42,7 +42,7 @@ class Features:
         profile = ctx.get('feature_profile', 'legacy')
         if profile not in FEATURE_PROFILES:
             raise ValueError('unsupported feature profile')
-        if profile == 'legacy':
+        if profile in ('legacy', 'preview-v1', 'preview-v2'):
             return data
         state = ctx['state']
         active = state.get('my_actives', []) + state.get('opp_actives', [])
@@ -75,11 +75,12 @@ class Features:
             multiplier *= {0: 1.0, 1: 2.0, 2: 0.5, 3: 0.0}.get(code, 1.0)
         return multiplier
 
-    def _mon(self, vector, prefix, mon):
+    def _mon(self, vector, prefix, mon, profile='legacy'):
         for key in ("species", "item", "ability", "baseAbility", "teraType"):
             if mon.get(key):
                 self.add(vector, f"{prefix}/{key}/{to_id(mon[key])}")
-        self.add(vector, prefix + "/hp", hp_fraction(mon.get("condition")))
+        health = hp_fraction if profile == 'tactics-v1' else legacy_hp_fraction
+        self.add(vector, prefix + "/hp", health(mon.get("condition")))
         for status in ("par", "brn", "slp", "psn", "tox", "frz", "fnt"):
             if status in (mon.get("condition") or "").split():
                 self.add(vector, prefix + "/status/" + status)
@@ -112,7 +113,7 @@ class Features:
                 self.add(vector, side + "/condition/" + effect)
         for group in ("my_actives", "my_party", "opp_actives", "opp_revealed", "opp_team_sheet"):
             for i, mon in enumerate(state.get(group, [])):
-                self._mon(vector, f"{group}/{i}", mon)
+                self._mon(vector, f"{group}/{i}", mon, ctx.get('feature_profile', 'legacy'))
         for name in state.get("opp_preview", []):
             self.add(vector, "preview/" + to_id(name))
         for i, event in enumerate(reversed(state.get("history", []))):
@@ -120,20 +121,22 @@ class Features:
         for species, frequency in (knowledge or {}).items():
             self.add(vector, "meta/" + species, frequency)
         vector[-16] = min(float(state.get("turn", 0)) / 50, 2)
-        vector[-15] = sum(hp_fraction(m.get("condition")) for m in state.get("my_party", [])) / 6
+        health = hp_fraction if ctx.get('feature_profile') == 'tactics-v1' else legacy_hp_fraction
+        vector[-15] = sum(health(m.get("condition")) for m in state.get("my_party", [])) / 6
         vector[-14] = len(ctx.get("choices", [])) / 1000
         return np.clip(vector, -5, 5)
 
     def action(self, ctx: dict, choice: str) -> np.ndarray:
         vector = np.zeros(ACTION_DIM, dtype=np.float32)
         state = ctx["state"]
+        health = hp_fraction if ctx.get('feature_profile') == 'tactics-v1' else legacy_hp_fraction
         party = state.get("my_party", [])
         prior = 0.0
         if choice.startswith("team "):
             indices = [int(i) - 1 for i in choice[5:].split(",")]
             for order, index in enumerate(indices):
                 if index < len(party):
-                    self._mon(vector, f"team/{order}", party[index])
+                    self._mon(vector, f"team/{order}", party[index], ctx.get('feature_profile', 'legacy'))
             self.add(vector, "team-preview")
         else:
             for i, component in enumerate(choice.split(",")):
@@ -141,7 +144,7 @@ class Features:
                 self.add(vector, f"slot/{i}/{parts[0]}")
                 if parts[0] == "switch":
                     mon = party[int(parts[1]) - 1]
-                    self._mon(vector, f"switch/{i}", mon)
+                    self._mon(vector, f"switch/{i}", mon, ctx.get('feature_profile', 'legacy'))
                     prior -= 0.4
                 elif parts[0] == "move":
                     me = state.get("my_actives", [])[i]
@@ -166,7 +169,7 @@ class Features:
                     accuracy = 1.0 if accuracy is True else float(accuracy or 100) / 100
                     stab = 1.5 if data.get("type") in self.species(me.get("species", "")).get("types", []) else 1.0
                     pressure = sum(power * accuracy * stab * self.effectiveness(data.get("type", ""), m)
-                                   for m in targets if hp_fraction(m.get("condition")) > 0)
+                                   for m in targets if health(m.get("condition")) > 0)
                     if target < 0:
                         pressure *= -1
                     # A tactical initialization, not an exact damage calculator.
@@ -176,12 +179,20 @@ class Features:
                     vector[-16 + i * 4] = power
                     vector[-15 + i * 4] = data.get("priority", 0) / 7
                     vector[-14 + i * 4] = min(pressure, 8) / 4
-                    vector[-13 + i * 4] = hp_fraction(me.get("condition"))
+                    vector[-13 + i * 4] = health(me.get("condition"))
             components = choice.split(",")
             if len(components) == 2:
                 # Joint interaction allows learning focus fire, attack+support,
                 # double Protect and switch+attack rather than independent picks.
                 self.add(vector, "joint/" + "/".join(p.strip().split()[0] for p in components))
+        if ctx.get('feature_profile') == 'tactics-v1':
+            from ml.tactics import score
+            prior = score(ctx, choice, self)
+        elif ctx.get('feature_profile') in ('preview-v1', 'preview-v2') and choice.startswith('team '):
+            from ml.preview import score
+            prior = score(ctx, choice, self)
+            if ctx['feature_profile'] == 'preview-v2':
+                prior = 4 * prior / (4 + abs(prior))
         vector[-1] = max(-4, min(4, prior))
         return np.clip(vector, -5, 5)
 
