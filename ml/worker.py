@@ -83,6 +83,16 @@ def snapshot(source: Path, target_root: Path, fmt: str):
     return target
 
 
+def game_tasks(root, checkpoint_root, fmt, teams, games, training, seed_base, opponent_root):
+    """Fixed opponent identity remains independent of the candidate checkpoint."""
+    return [{'root': str(root), 'checkpoint_root': str(checkpoint_root), 'format': fmt,
+             'team1': teams[i % len(teams)], 'team2': teams[(i + 1) % len(teams)],
+             'seed': seed_base + i, 'side': 'p2' if (i + i // len(teams)) % 2 else 'p1',
+             'training': training, 'opponent': 'random' if i % 4 == 0 else 'self' if i % 4 == 1 else 'heuristic',
+             'opponent_checkpoint_root': str(opponent_root) if i % 4 == 1 else None}
+            for i in range(games)]
+
+
 def freeze_inputs(store: Store, destination: Path, fmt: str):
     """Both evaluations see the same research/scout, isolated from live feeds."""
     frozen = Store(destination)
@@ -209,11 +219,8 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
         return {"trained": False, "reason": "no legal local training teams"}
     seed_base = int(fingerprint(job["id"])[:8], 16) % 50000
     def tasks(checkpoint_root, games, training, seed_offset):
-        return [{"root": str(store.root), "checkpoint_root": str(checkpoint_root), "format": fmt,
-                 "team1": teams[i % len(teams)], "team2": teams[(i+1) % len(teams)],
-                 "seed": seed_base+seed_offset+i, "side": "p2" if (i+i//len(teams))%2 else "p1", "training": training,
-                 "opponent": "random" if i%4 == 0 else "heuristic"}
-                for i in range(games)]
+        return game_tasks(store.root, checkpoint_root, fmt, teams, games, training,
+                          seed_base + seed_offset, before_root)
     collected = None
     if job["kind"] == "practice" and config.simulation_games:
         collected = await parallel_games(tasks(before_root, config.simulation_games, True, 0), policy, deadline)

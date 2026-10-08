@@ -135,3 +135,10 @@ Checkpoint `policy_temperature` defaults to 1.0 for older models. Sampling and
 PPO likelihoods use the same temperature. A temperature change is a new policy:
 assign a new revision and evaluate it on development and untouched final cases
 before considering promotion. It is not a free runtime exploration knob.
+
+New background jobs use a mixed curriculum: one quarter random opponents, one
+quarter the collecting incumbent checkpoint, and one half tactical scripts.
+The checkpoint opponent is sampled during collection and greedy during evaluation.
+Both evaluated policies face that same frozen opponent, not a copy of themselves.
+Saved evaluation plans retain their original cases across retries. This strengthens
+future validation without changing completed campaign records or forcing promotion.

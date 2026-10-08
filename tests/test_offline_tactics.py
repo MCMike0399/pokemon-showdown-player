@@ -121,3 +121,18 @@ def test_bounded_preview_preserves_differences_that_clipping_erases():
     assert f.action(ctx,'team 1')[-1]==f.action(ctx,'team 2')[-1]==4
     ctx['feature_profile']='preview-v2'
     assert 0<f.action(ctx,'team 2')[-1]<f.action(ctx,'team 1')[-1]<4
+
+
+def test_background_curriculum_keeps_frozen_opponent_same_for_both_policies(tmp_path):
+    from ml.worker import game_tasks
+    teams=[[{'species':'First'}],[{'species':'Second'}]]
+    fixed=tmp_path/'fixed'
+    base=game_tasks(tmp_path,tmp_path/'base','format',teams,12,False,1,fixed)
+    candidate=game_tasks(tmp_path,tmp_path/'candidate','format',teams,12,False,1,fixed)
+    assert {t['opponent'] for t in base}=={'random','self','heuristic'}
+    for a,b in zip(base,candidate):
+        assert (a['seed'],a['side'],a['team1'],a['team2'],a['opponent'])==(b['seed'],b['side'],b['team1'],b['team2'],b['opponent'])
+        if a['opponent']=='self':
+            assert a['opponent_checkpoint_root']==b['opponent_checkpoint_root']==str(fixed)
+            assert a['opponent_checkpoint_root']!=a['checkpoint_root']
+            assert b['opponent_checkpoint_root']!=b['checkpoint_root']
