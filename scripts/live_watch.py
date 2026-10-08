@@ -3,6 +3,9 @@
 import json
 import re
 import sqlite3
+import threading
+import time
+import uuid
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +31,7 @@ def status():
     campaign = Path(directory)
     state = read(campaign / "status.json")
     manifest = read(campaign / "manifest.json")
+    control = read(campaign / "control.json")
     records = []
     try:
         for line in (campaign / "games.jsonl").read_text().splitlines():
@@ -46,13 +50,17 @@ def status():
     database = sqlite3.connect(dbpath.resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
     database.row_factory = sqlite3.Row
     try:
-        rows = [dict(row) for row in database.execute("""
-            SELECT status,outcome,revision,created,json_extract(data,'$.room') room,
-                   json_array_length(json_extract(data,'$.steps')) choices,
+        rooms = sorted(known)
+        placeholders = ','.join('?' for _ in rooms) or "NULL"
+        rows = [dict(row) for row in database.execute(f"""
+            SELECT status,outcome,created,json_extract(data,'$.room') room,
+                   CASE WHEN json_extract(data,'$.room')=? AND status!='complete'
+                        THEN json_array_length(json_extract(data,'$.steps')) ELSE 0 END choices,
                    json_extract(data,'$.side') side
             FROM episodes WHERE source='ladder' AND format=?
+                AND json_extract(data,'$.room') IN ({placeholders})
                 AND julianday(created)>=julianday(?) ORDER BY created
-        """, (manifest.get("format"), latest.get("started_at"))) if row["room"] in known]
+        """, (room, manifest.get("format"), *rooms, latest.get("started_at")))]
     finally:
         database.close()
     # Reconnects can leave several segments for one room. Count terminal rooms once.
@@ -73,7 +81,7 @@ def status():
             break
     return {"campaign": campaign.name, "room": room, "phase": state.get("phase", "waiting"),
             "score": score, "completed": len(complete),
-            "target": manifest.get("targets", {}).get("ladder_games", 100),
+            "target": control.get("target_ladder", state.get("target_ladder", manifest.get("targets", {}).get("ladder_games", 100))),
             "game": len(complete) + 1, "choices": live[-1]["choices"] if live else 0,
             "side": live[-1]["side"] if live else None,
             "updates": observer.get("actor", {}).get("updates"),
@@ -83,12 +91,13 @@ def status():
 
 def battle_log(room=None):
     latest = read(PROJECT / "data/ml/campaigns/latest.json")
-    state = read(Path(latest["directory"]) / "status.json")
+    state = read(Path(latest["directory"]) / "status.json") if latest.get("directory") else {}
     room = room or state.get("active_room")
     if room and ROOM.fullmatch(room):
         snapshot = read(PROJECT / "data/ml/live-watch" / (room + ".json"))
         if snapshot:
-            return snapshot
+            return {**snapshot, "turn": next((int(line.split('|')[2]) for line in reversed(snapshot.get("log", []))
+                                                if re.fullmatch(r"\|turn\|[0-9]+", line)), 0)}
     info = status()
     room = room or (info["recent"][0]["room"] if info["recent"] else None)
     if not room or not ROOM.fullmatch(room):
@@ -114,12 +123,73 @@ def battle_log(room=None):
     return {"room": room, "side": side, "log": lines, "live": False, "source": "completed-recording"}
 
 
+class StateHub:
+    """One read-only publisher; every connection starts with the latest full state.
+
+    Slow consumers skip superseded states rather than accumulating an event queue.
+    The player's atomic relay files and SQLite recordings survive viewer restarts.
+    """
+
+    def __init__(self):
+        self.condition = threading.Condition()
+        self.stopped = threading.Event()
+        self.instance = uuid.uuid4().hex
+        self.version = 0
+        self.payload = {"status": {"phase": "waiting", "score": [0, 0, 0], "recent": []},
+                        "battle": {"room": None, "log": [], "live": False}, "error": None}
+        self.signature = None
+
+    def publish(self, payload):
+        # checked_at is a health timestamp, not a change in campaign state.
+        stable = {**payload, "status": {key: value for key, value in payload["status"].items()
+                                       if key != "checked_at"}}
+        signature = json.dumps(stable, sort_keys=True)
+        with self.condition:
+            if signature == self.signature:
+                return
+            self.signature = signature
+            self.payload = payload
+            self.version += 1
+            self.condition.notify_all()
+
+    def snapshot(self, after=None, timeout=15):
+        with self.condition:
+            if after == self.version and not self.stopped.is_set():
+                self.condition.wait_for(lambda: self.version != after or self.stopped.is_set(), timeout)
+            return self.version, self.payload
+
+    def run(self):
+        next_status = 0
+        info = self.payload["status"]
+        while not self.stopped.is_set():
+            try:
+                if time.monotonic() >= next_status:
+                    info = status()
+                    next_status = time.monotonic() + 2
+                # Retain the last game between matches, until the next room starts.
+                previous = self.payload["battle"].get("room") if info.get("campaign") == self.payload["status"].get("campaign") else None
+                room = info.get("room") or previous
+                frame = battle_log(room)
+                self.publish({"status": info, "battle": frame, "error": None})
+            except (OSError, sqlite3.Error, ValueError, KeyError):
+                self.publish({**self.payload, "error": "Campaign state temporarily unavailable"})
+            self.stopped.wait(.25)
+
+
 class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
     def do_GET(self):
         route = urlsplit(self.path)
+        room = parse_qs(route.query).get("room", [None])[0]
+        if route.path in ("/api/battle", "/api/events") and room is not None and not ROOM.fullmatch(room):
+            self.send_error(400, "Invalid battle room")
+            return
+        if route.path == "/api/events":
+            return self.stream(room)
         if route.path in ("/api/status", "/api/battle"):
             try:
-                payload = status() if route.path == "/api/status" else battle_log(parse_qs(route.query).get("room", [None])[0])
+                payload = status() if route.path == "/api/status" else battle_log(room)
                 body = json.dumps(payload).encode()
                 content_type, code = "application/json", 200
             except (OSError, sqlite3.Error, ValueError):
@@ -142,7 +212,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Referrer-Policy", "no-referrer")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except OSError:
+            pass  # A viewer may navigate away while an asset/API reply is sent.
+
+    def stream(self, room):
+        hub = self.server.hub
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-transform")
+        self.send_header("X-Accel-Buffering", "no")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Connection", "close")
+        self.end_headers()
+        self.close_connection = True
+        self.connection.settimeout(20)
+        version = None
+        pinned = None
+        try:
+            self.wfile.write(b"retry: 1500\n\n")
+            self.wfile.flush()
+            while not hub.stopped.is_set():
+                current, payload = hub.snapshot(version)
+                if current == version:
+                    body = b": heartbeat\n\n"
+                else:
+                    if room and payload["battle"].get("room") != room:
+                        # Completed replays are immutable; avoid repeated SQLite reads.
+                        if not pinned or pinned.get("live") or not pinned.get("log"):
+                            pinned = battle_log(room)
+                        payload = {**payload, "battle": pinned}
+                    body = (f"id: {hub.instance}:{current}\nevent: state\ndata: " +
+                            json.dumps(payload) + "\n\n").encode()
+                self.wfile.write(body)
+                self.wfile.flush()
+                version = current
+        except (OSError, sqlite3.Error, ValueError, KeyError):
+            pass  # Browser reconnects with a fresh complete snapshot.
 
     def log_message(self, *args):
         pass
@@ -153,4 +260,15 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--port", type=int, default=18489)
     args = parser.parse_args()
-    ThreadingHTTPServer(("127.0.0.1", args.port), Handler).serve_forever()
+    hub = StateHub()
+    publisher = threading.Thread(target=hub.run, daemon=True)
+    publisher.start()
+    server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
+    server.hub = hub
+    try:
+        server.serve_forever()
+    finally:
+        hub.stopped.set()
+        with hub.condition:
+            hub.condition.notify_all()
+        server.server_close()

@@ -28,11 +28,11 @@ def render_log(lines):
 const fs = require('node:fs'), vm = require('node:vm');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const context = vm.createContext({
-  document: {getElementById: () => ({})},
+  document: {getElementById: () => ({}), addEventListener() {}},
   window: {addEventListener() {}},
   ResizeObserver: class {observe() {}},
-  Dex: {}, BattleSound: {setMute() {}},
-  fetch: () => new Promise(() => {}),
+  Dex: {getSpriteData() {}}, BattleSound: {setMute() {}},
+  EventSource: class {addEventListener() {} close() {}},
 });
 vm.runInContext(fs.readFileSync(input.viewer, 'utf8'), context);
 context.lines = input.lines;
@@ -81,13 +81,13 @@ const fs = require('node:fs'), vm = require('node:vm');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const events = [];
 const context = vm.createContext({
-  document: {getElementById: () => ({clientWidth:640, style:{}})},
+  document: {getElementById: () => ({clientWidth:640, style:{}, classList:{add() {}, remove() {}}}), addEventListener() {}},
   window: {addEventListener() {}},
   ResizeObserver: class {observe() {}},
-  Dex: {}, BattleSound: {setMute() {}},
+  Dex: {getSpriteData() {}}, BattleSound: {setMute() {}},
   jQuery: () => ({empty() {}}),
   setTimeout() {},
-  fetch: () => new Promise(() => {}),
+  EventSource: class {addEventListener() {} close() {}},
   Battle: class {
     constructor(options) {events.push(['create', options.paused]);}
     setViewpoint(side) {events.push(['viewpoint', side]);}
@@ -100,14 +100,16 @@ const context = vm.createContext({
 });
 vm.runInContext(fs.readFileSync(input.viewer, 'utf8'), context);
 let data = {room:'battle-gen9doublesou-1', side:'p2', live:true, log:input.lines};
-context.fetch = async () => ({ok:true, json:async () => data});
+context.data = data;
+vm.runInContext('shown = data.room', context);
 (async () => {
-  await vm.runInContext('connect()', context);
-  await vm.runInContext('connect()', context);
-  data = {...data, log:[...data.log, '|turn|2']};
-  await vm.runInContext('connect()', context);
-  data = {...data, room:'battle-gen9doublesou-2'};
-  await vm.runInContext('connect()', context);
+  vm.runInContext('applyBattle(data)', context);
+  vm.runInContext('applyBattle(data)', context);
+  context.data = {...data, log:[...data.log, '|turn|2']};
+  vm.runInContext('applyBattle(data)', context);
+  context.data = {...data, room:'battle-gen9doublesou-2'};
+  vm.runInContext('shown = data.room', context);
+  vm.runInContext('applyBattle(data)', context);
   process.stdout.write(JSON.stringify(events));
 })();
 """
@@ -121,3 +123,139 @@ context.fetch = async () => ({ok:true, json:async () => data});
     appended = [event[1] for event in events if event[0] == "append"]
     assert appended[:3] == [PREVIEW + ["|start"] + SWITCHES, [], ["|turn|2"]]
     assert events[events.index(["destroy"]) - 1] == ["pause"]
+
+
+def test_reconnect_catches_up_and_replays_ignore_other_rooms():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('viewer checks require Node')
+    script = r"""
+const fs = require('node:fs'), vm = require('node:vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const events = [];
+const context = vm.createContext({
+  document: {getElementById: () => ({clientWidth:640, style:{}, classList:{add() {}, remove() {}}}), addEventListener() {}},
+  window: {addEventListener() {}}, ResizeObserver: class {observe() {}},
+  Dex: {getSpriteData() {}}, BattleSound: {setMute() {}}, jQuery: () => ({empty() {}}),
+  EventSource: class {addEventListener() {} close() {}},
+  Battle: class {
+    constructor() {this.turn=1; this.stepQueue=[]; this.currentStep=0; events.push('create');}
+    setViewpoint() {} addBatch() {} seekTurn() {events.push('seek');}
+    play() {events.push('play');} pause() {} destroy() {}
+  },
+});
+vm.runInContext(fs.readFileSync(input.viewer, 'utf8'), context);
+context.data = {room:'battle-test-1', side:'p2', live:true, turn:1, log:['|turn|1']};
+vm.runInContext('shown=data.room; applyBattle(data)', context);
+vm.runInContext('applyBattle(data)', context); // Unchanged state does not start another animation loop.
+vm.runInContext('connect(); applyBattle(data)', context); // Reconnecting catches up even with the same log.
+context.data = {...context.data, turn:5, log:['|turn|1','|turn|5']};
+vm.runInContext('applyBattle(data)', context); // A large turn backlog must be skipped.
+context.data = {...context.data, log:['|turn|2','|turn|5']};
+vm.runInContext('applyBattle(data)', context); // Same-length changed prefix rebuilds instead of duplicating.
+const liveEvents = [...events];
+vm.runInContext('replay=true; relayRoom=null; applyBattle(data)', context);
+const replayEvents = events.slice(liveEvents.length);
+context.data = {...context.data, room:'battle-test-2'};
+vm.runInContext('applyBattle(data)', context);
+process.stdout.write(JSON.stringify({liveEvents, replayEvents, events}));
+"""
+    result = subprocess.run([node, '-e', script], input=json.dumps({'viewer': str(VIEWER)}),
+                            text=True, capture_output=True, check=True)
+    data = json.loads(result.stdout)
+    assert data['liveEvents'] == ['create', 'seek', 'play', 'seek', 'seek', 'create', 'seek', 'play']
+    assert data['replayEvents'] == ['create', 'play']
+    assert data['events'] == data['liveEvents'] + data['replayEvents']
+
+
+def test_http_503_retries_one_stream_and_cancels_old_retry():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('viewer checks require Node')
+    script = r"""
+const fs = require('node:fs'), vm = require('node:vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const sources = [], timers = new Map();
+let nextTimer = 1;
+const context = vm.createContext({
+  document: {getElementById: () => ({classList:{add(){}}}), addEventListener() {}},
+  window: {addEventListener() {}}, ResizeObserver: class {observe() {}},
+  Dex: {getSpriteData() {}}, BattleSound: {setMute() {}},
+  EventSource: class {
+    constructor() {this.readyState=0; sources.push(this);} addEventListener() {}
+    close() {this.readyState=2; this.closed=true;}
+  },
+  setTimeout(fn) {const id=nextTimer++; timers.set(id,fn); return id;},
+  clearTimeout(id) {timers.delete(id);},
+});
+vm.runInContext(fs.readFileSync(input.viewer, 'utf8'), context);
+sources[0].readyState=2; sources[0].onerror();
+const scheduled = timers.size;
+const retry = [...timers.values()][0]; timers.clear(); retry();
+const afterRetry = sources.length;
+sources[1].readyState=2; sources[1].onerror();
+vm.runInContext('connect()', context); // Clicking reconnect cancels the pending retry.
+sources[1].onerror(); // Events from the old stream must not schedule another retry.
+process.stdout.write(JSON.stringify({scheduled, afterRetry, count:sources.length,
+  pending:timers.size, closed:sources.slice(0,-1).every(s=>s.closed)}));
+"""
+    result = subprocess.run([node, '-e', script], input=json.dumps({'viewer': str(VIEWER)}),
+                            text=True, capture_output=True, check=True)
+    assert json.loads(result.stdout) == {'scheduled': 1, 'afterRetry': 2, 'count': 3, 'pending': 0, 'closed': True}
+
+
+def test_page_loads_animated_sprite_metadata_before_starting_renderer():
+    # The real Dex silently chooses still PNGs when the sprite metadata is absent.
+    # Guard the HTML bootstrap dependency that caused static Pokemon in the UI.
+    from html.parser import HTMLParser
+
+    class ScriptSources(HTMLParser):
+        def __init__(self):
+            super().__init__()
+            self.sources = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == 'script':
+                source = dict(attrs).get('src')
+                if source:
+                    self.sources.append(source)
+
+    parser = ScriptSources()
+    parser.feed(VIEWER.with_name('index.html').read_text())
+    metadata = 'https://play.pokemonshowdown.com/data/pokedex-mini.js'
+    assert metadata in parser.sources, 'Missing animated sprite metadata: Dex falls back to still PNGs'
+    assert parser.sources.index(metadata) < parser.sources.index('/viewer.js')
+
+
+def test_related_artwork_keeps_animated_sprite_dimensions_and_actual_cry():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('viewer checks require Node')
+    script = r"""
+const fs = require('node:fs'), vm = require('node:vm');
+const input = JSON.parse(fs.readFileSync(0, 'utf8'));
+const context = vm.createContext({
+  document: {getElementById: () => ({classList:{add(){},remove(){}}}), addEventListener() {}},
+  window: {addEventListener() {}}, ResizeObserver: class {observe() {}},
+  BattleSound: {setMute() {}}, EventSource: class {addEventListener() {} close() {}},
+  Dex: {
+    species: {get: id => ({name:id})},
+    getSpriteData(pokemon, isFront, options) {
+      const file = pokemon === 'Garchomp-Mega-Z' ? 'garchomp-megaz.png' : 'garchomp-mega.gif';
+      return {url:'https://play.pokemonshowdown.com/sprites/'+file,
+        w:file.endsWith('.gif')?131:96, h:file.endsWith('.gif')?92:96,
+        cryurl:pokemon+'.mp3', facing:isFront, gen:options.gen};
+    },
+  },
+});
+vm.runInContext(fs.readFileSync(input.viewer, 'utf8'), context);
+process.stdout.write(JSON.stringify(context.Dex.getSpriteData('Garchomp-Mega-Z',false,{gen:9})));
+"""
+    result = subprocess.run([node, '-e', script], input=json.dumps({'viewer': str(VIEWER)}),
+                            text=True, capture_output=True, check=True)
+    sprite = json.loads(result.stdout)
+    assert sprite['url'].endswith('/garchomp-mega.gif')
+    assert (sprite['w'], sprite['h']) == (131, 92)
+    assert sprite['cryurl'] == 'Garchomp-Mega-Z.mp3'
+    assert sprite['facing'] is False
+    assert sprite['gen'] == 9

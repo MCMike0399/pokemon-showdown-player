@@ -35,6 +35,7 @@ iframe{display:block;width:100%;height:calc(100vh - 192px);min-height:580px;bord
 #battle-log.battle-log{position:relative;inset:auto;height:220px;width:100%;padding:12px 18px;border:0;border-top:1px solid var(--line);color:#20324a;background:#fff;font-size:14px;overflow-y:auto}
 .playback{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:12px 18px;border-top:1px solid var(--line)}
 #viewer-status{font-size:12px;color:var(--muted);margin-left:auto}
+#sprite-notice{font-size:12px;color:var(--muted);padding:6px 18px;display:block;border-top:1px solid var(--line)}
 @media(max-width:480px){#viewer-status{width:100%;margin-left:0}.playback{gap:7px;padding:10px}}
 </style>
 <header><div><h1>Showdown live</h1><p>Champions M-C · Your agent’s ladder games</p></div><div class="signal"><i class="dot wait" id="dot"></i><span id="signal">Connecting</span></div></header>
@@ -45,6 +46,7 @@ iframe{display:block;width:100%;height:calc(100vh - 192px);min-height:580px;bord
  <div id="inline-player" class="hidden">
   <div id="arena-wrap"><div id="battle" class="battle"></div></div>
   <div class="playback"><button id="sound" aria-pressed="false">Sound off</button><button id="viewpoint">Switch viewpoint</button><button id="catchup">Jump to live</button><button id="reconnect">Reconnect</button><span id="viewer-status">Connecting…</span></div>
+  <span id="sprite-notice" class="hidden"></span>
   <div id="battle-log" class="battle-log" role="log" aria-label="Battle log"></div>
  </div>
 </section>
@@ -52,7 +54,7 @@ iframe{display:block;width:100%;height:calc(100vh - 192px);min-height:580px;bord
  <section class="scoreboard"><h2>Campaign score</h2><div class="scores"><div class="wins"><strong id="wins">—</strong><span>Wins</span></div><div class="losses"><strong id="losses">—</strong><span>Losses</span></div><div><strong id="ties">—</strong><span>Ties</span></div></div><div class="progress"><span id="progress">Loading verified results</span><progress id="bar" max="100" value="0"></progress></div></section>
  <section class="details"><h2>At the table</h2><div class="detail"><span>Format</span><strong>Champions M-C</strong></div><div class="detail"><span>Policy updates</span><strong id="updates">—</strong></div><div class="detail"><span>Choices this game</span><strong id="choices">—</strong></div><div class="detail"><span>Opponent samples</span><strong id="samples">—</strong></div></section>
  <section class="recent"><h2>Recent games</h2><div id="recent">No completed games yet.</div></section>
- <p class="note" id="note">Scores are verified against completed recordings. Auto-follow updates the spectator tab when a new game starts.</p>
+ <p class="note" id="note">Scores are verified against completed recordings. DiveMac keeps the battle state and streams updates to this viewer.</p>
 </aside>
 </main>
 <script>var exports=window;window.Config={routes:{client:"play.pokemonshowdown.com",dex:"dex.pokemonshowdown.com"}};</script>
@@ -64,6 +66,7 @@ iframe{display:block;width:100%;height:calc(100vh - 192px);min-height:580px;bord
 <script src="https://play.pokemonshowdown.com/js/battledata.js"></script>
 <script src="https://play.pokemonshowdown.com/data/text/en.js"></script>
 <script src="https://play.pokemonshowdown.com/data/pokedex.js"></script>
+<script src="https://play.pokemonshowdown.com/data/pokedex-mini.js"></script>
 <script src="https://play.pokemonshowdown.com/data/moves.js"></script>
 <script src="https://play.pokemonshowdown.com/data/items.js"></script>
 <script src="https://play.pokemonshowdown.com/data/abilities.js"></script>
