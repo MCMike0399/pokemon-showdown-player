@@ -43,3 +43,27 @@ def score(ctx, choice, features):
             names={to_id(m if isinstance(m,str) else m.get('id',m.get('move',''))) for m in mon.get('moves',[])}
             if names & {'electroshot','weatherball','hurricane','thunder'}:synergy+=.35
     return coverage/len(enemies)+.5*leads/len(enemies)-.15*exposure/len(enemies)+synergy
+
+
+def rain_lineup_score(ctx, choice, features):
+    """Explicit bring/lead coherence; no winner-derived expert action labels.
+
+The first two positions are leads. Bench order does not affect this prior.
+Rain-dependent attacks only get synergy when the setter is actually brought;
+a lead setter receives an extra bonus with an immediate rain beneficiary.
+"""
+    party = ctx['state'].get('my_party', [])
+    picked = [party[int(i) - 1] for i in choice[5:].split(',')]
+    def setter(mon):
+        return to_id(mon.get('ability') or mon.get('baseAbility') or '') == 'drizzle'
+    def beneficiary(mon):
+        names = {to_id(m if isinstance(m, str) else m.get('id', m.get('move', ''))) for m in mon.get('moves', [])}
+        return bool(names & {'electroshot', 'thunder', 'hurricane'}) or to_id(mon.get('ability') or mon.get('baseAbility') or '') in ('swiftswim', 'raindish', 'dryskin')
+    prior = .35 * score(ctx, choice, features)
+    if any(setter(m) for m in picked):
+        prior += .35 * sum(beneficiary(m) for m in picked)
+        if any(setter(m) for m in picked[:2]) and any(beneficiary(m) for m in picked[:2]):
+            prior += 1.2
+    elif any(beneficiary(m) for m in picked):
+        prior -= .35
+    return 4 * prior / (4 + abs(prior))

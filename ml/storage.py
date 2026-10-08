@@ -5,6 +5,7 @@ import hashlib
 import json
 import sqlite3
 import fcntl
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -80,6 +81,29 @@ class Store:
 
     def close(self):
         self.db.close()
+
+    def retain_checkpoint(self, model) -> str:
+        """Keep the collecting artifact once by digest, even after promotion.
+
+Only local model artifacts are retained; no replay labels or private requests
+are reconstructed. Atomic creation also tolerates concurrent local collectors.
+"""
+        target = self.root / 'models' / 'collected' / model.fmt / (model.checkpoint_sha256 + '.pt')
+        if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != model.checkpoint_sha256:
+            raise ValueError('retained collecting checkpoint digest mismatch')
+        if not target.exists():
+            payload = model.path.read_bytes()
+            if hashlib.sha256(payload).hexdigest() != model.checkpoint_sha256:
+                raise ValueError('collecting checkpoint changed before archival; reload between games')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=target.parent, suffix='.tmp', delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload)
+            try:
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return str(target.relative_to(self.root))
 
     @contextmanager
     def writer(self):

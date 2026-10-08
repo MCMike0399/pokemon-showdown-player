@@ -188,6 +188,65 @@ def test_play_reports_no_job_when_learning_disabled(session):
     assert brain.store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 0
 
 
+def test_terminal_battle_survives_enqueue_schema_error_and_retries_handoff(session, monkeypatch):
+    import ml.continuous as continuous
+    make, player, sent = session
+    brain = make()
+    live = LiveSession(brain, player)
+    original_enqueue = continuous.enqueue_battle
+    def outdated_config(*args):
+        raise TypeError("LearningConfig.__init__() got an unexpected keyword argument 'training_teams'")
+    monkeypatch.setattr(continuous, 'enqueue_battle', outdated_config)
+    async def run():
+        async def send(message):
+            pass
+        async def choose(room, choice):
+            player.c.battles[ROOM]['log'].append('|win|Player')
+        player.c.send, player.choose = send, choose
+        return await live.play(ROOM, FMT)
+    output = asyncio.run(run())
+    assert output['result']['winner'] == 'Player'
+    assert output['experience']['recorded']
+    assert output['training']['queued'] is False
+    assert output['background_learning']['error'] == {'stage': 'enqueue', 'type': 'TypeError'}
+    episodes = brain.store.episodes(FMT)
+    assert len(episodes) == 1 and episodes[0]['outcome'] == 1
+    assert not brain.pending
+    original_episode = json.dumps(episodes[0], sort_keys=True)
+    monkeypatch.setattr(continuous, 'enqueue_battle', original_enqueue)
+    again = live.finish(ROOM)
+    assert again['experience']['id'] == output['experience']['id']
+    assert again['background_learning']['job'] is not None
+    assert again['training']['queued'] is True
+    assert 'error' not in again['background_learning']
+    assert json.dumps(brain.store.episodes(FMT)[0], sort_keys=True) == original_episode
+    assert brain.store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 1
+    assert live.finish(ROOM) == again
+
+
+def test_optional_worker_start_failure_preserves_durable_job_and_has_bounded_retries(session, monkeypatch):
+    import ml.continuous as continuous
+    make, player, sent = session
+    brain = make()
+    live = LiveSession(brain, player)
+    asyncio.run(live.choose(ROOM, FMT))
+    player.c.battles[ROOM]['log'].append('|win|Player')
+    calls = []
+    def failed_start(*args):
+        calls.append(True)
+        raise OSError('worker launch fixture')
+    monkeypatch.setattr(continuous, 'kick_worker', failed_start)
+    output = live.finish(ROOM)
+    for _ in range(5):
+        output = live.finish(ROOM)
+    assert output['result']['winner'] == 'Player'
+    assert output['background_learning']['job'] is not None
+    assert output['background_learning']['error'] == {'stage': 'worker-start', 'type': 'OSError'}
+    assert len(calls) == 3
+    assert brain.store.db.execute('SELECT COUNT(*) FROM jobs').fetchone()[0] == 1
+    assert len(brain.store.episodes(FMT)) == 1
+
+
 def test_transport_reconnect_keeps_same_episode_and_saved_action(session):
     import copy
     make, player, sent = session

@@ -13,12 +13,18 @@ from battle_state import hp_fraction, legacy_hp_fraction, to_id
 SCHEMA = 1
 STATE_DIM = 384
 ACTION_DIM = 192
-FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2'}
+FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2', 'rain-v1', 'mechanics-v1', 'lineup-v1'}
 
 
 class Features:
     def __init__(self, dex: dict | None = None):
         self.dex = dex or {}
+        self._signature = None
+
+    def signature(self):
+        if self._signature is None:
+            self._signature = hashlib.sha256(json.dumps(self.dex, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+        return self._signature
 
     @classmethod
     def cached(cls, fmt: str = ""):
@@ -42,7 +48,7 @@ class Features:
         profile = ctx.get('feature_profile', 'legacy')
         if profile not in FEATURE_PROFILES:
             raise ValueError('unsupported feature profile')
-        if profile in ('legacy', 'preview-v1', 'preview-v2'):
+        if profile in ('legacy', 'preview-v1', 'preview-v2', 'lineup-v1'):
             return data
         state = ctx['state']
         active = state.get('my_actives', []) + state.get('opp_actives', [])
@@ -79,7 +85,7 @@ class Features:
         for key in ("species", "item", "ability", "baseAbility", "teraType"):
             if mon.get(key):
                 self.add(vector, f"{prefix}/{key}/{to_id(mon[key])}")
-        health = hp_fraction if profile == 'tactics-v1' else legacy_hp_fraction
+        health = hp_fraction if profile in ('tactics-v1', 'rain-v1') else legacy_hp_fraction
         self.add(vector, prefix + "/hp", health(mon.get("condition")))
         for status in ("par", "brn", "slp", "psn", "tox", "frz", "fnt"):
             if status in (mon.get("condition") or "").split():
@@ -121,7 +127,7 @@ class Features:
         for species, frequency in (knowledge or {}).items():
             self.add(vector, "meta/" + species, frequency)
         vector[-16] = min(float(state.get("turn", 0)) / 50, 2)
-        health = hp_fraction if ctx.get('feature_profile') == 'tactics-v1' else legacy_hp_fraction
+        health = hp_fraction if ctx.get('feature_profile') in ('tactics-v1', 'rain-v1') else legacy_hp_fraction
         vector[-15] = sum(health(m.get("condition")) for m in state.get("my_party", [])) / 6
         vector[-14] = len(ctx.get("choices", [])) / 1000
         return np.clip(vector, -5, 5)
@@ -129,7 +135,7 @@ class Features:
     def action(self, ctx: dict, choice: str) -> np.ndarray:
         vector = np.zeros(ACTION_DIM, dtype=np.float32)
         state = ctx["state"]
-        health = hp_fraction if ctx.get('feature_profile') == 'tactics-v1' else legacy_hp_fraction
+        health = hp_fraction if ctx.get('feature_profile') in ('tactics-v1', 'rain-v1') else legacy_hp_fraction
         party = state.get("my_party", [])
         prior = 0.0
         if choice.startswith("team "):
@@ -188,11 +194,20 @@ class Features:
         if ctx.get('feature_profile') == 'tactics-v1':
             from ml.tactics import score
             prior = score(ctx, choice, self)
+        elif ctx.get('feature_profile') == 'rain-v1':
+            from ml.rain import score
+            prior = score(ctx, choice, self)
+        elif ctx.get('feature_profile') == 'mechanics-v1':
+            from ml.mechanics import score
+            prior = score(ctx, choice, self)
         elif ctx.get('feature_profile') in ('preview-v1', 'preview-v2') and choice.startswith('team '):
             from ml.preview import score
             prior = score(ctx, choice, self)
             if ctx['feature_profile'] == 'preview-v2':
                 prior = 4 * prior / (4 + abs(prior))
+        elif ctx.get('feature_profile') == 'lineup-v1' and choice.startswith('team '):
+            from ml.preview import rain_lineup_score
+            prior = rain_lineup_score(ctx, choice, self)
         vector[-1] = max(-4, min(4, prior))
         return np.clip(vector, -5, 5)
 

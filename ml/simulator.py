@@ -15,6 +15,15 @@ from ml.teams import team_id
 BRIDGE = Path(__file__).resolve().parents[1] / "simulator.cjs"
 
 
+def simulator_seed(seed: int, encoding: str = 'legacy') -> list[int]:
+    if encoding == 'legacy':
+        return [seed % 65536, 7, 13, 19]
+    if encoding != 'full-v1' or not isinstance(seed, int) or not 0 <= seed < 2**64:
+        raise ValueError('full-v1 requires an unsigned 64-bit integer seed')
+    return [seed & 65535, ((seed >> 16) & 65535) ^ 7,
+            ((seed >> 32) & 65535) ^ 13, ((seed >> 48) & 65535) ^ 19]
+
+
 async def bridge_query(payload: dict) -> dict:
     process = await asyncio.create_subprocess_exec("node", str(BRIDGE), stdin=asyncio.subprocess.PIPE,
                                                  stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -49,9 +58,12 @@ async def load_dex(fmt: str) -> Features:
 async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: str = "heuristic",
                      seed: int = 0, training: bool = True, max_decisions: int = 1000,
                      teacher: bool = False, opponent_model=None, learner_side: str = "p1",
-                     sample_actions: bool = False) -> dict:
-    if opponent not in ("heuristic", "random", "self"):
-        raise ValueError("opponent must be heuristic, random or self")
+                     sample_actions: bool = False, open_team_sheets: bool = True, seed_encoding: str = 'legacy') -> dict:
+    if opponent not in ("heuristic", "random", "self", "tactical"):
+        raise ValueError("opponent must be heuristic, random, self or tactical")
+    if not isinstance(open_team_sheets, bool):
+        raise ValueError('open_team_sheets must be boolean')
+    seed_words = simulator_seed(seed, seed_encoding)
     if learner_side not in ("p1", "p2"):
         raise ValueError("learner side must be p1 or p2")
     process = await asyncio.create_subprocess_exec("node", str(BRIDGE), stdin=asyncio.subprocess.PIPE,
@@ -77,7 +89,7 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
     try:
         await send({"type": "start", "format": fmt, "team1": team1 if learner_side == "p1" else team2,
                     "team2": team2 if learner_side == "p1" else team1, "learnerSide": learner_side,
-                    "seed": [seed % 65536, 7, 13, 19]})
+                    "seed": seed_words, "openTeamSheets": open_team_sheets})
         while decisions < max_decisions:
             line = await asyncio.wait_for(process.stdout.readline(), timeout=30)
             if not line:
@@ -106,7 +118,7 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                     raise ValueError("simulator rejected generated action: " + public)
                 if public.startswith("|win|"):
                     result = {"room": room, "winner": public.split("|", 2)[2]}
-                elif public == "|tie|":
+                elif public in ('|tie', '|tie|'):
                     result = {"room": room, "winner": None, "tie": True}
             if not result.get("ongoing"):
                 break
@@ -118,6 +130,11 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
             sets = team1 if side == learner_side else team2
             ctx = {"room": room, "format": fmt, "request": request, "state": state, "choices": choices,
                    "source": "local", "team_id": team_id(fmt, sets) if sets else "random-generated",
+                   'team_sets': sets, 'simulation': {'seed': seed, 'learner_side': learner_side,
+                       'seed_encoding': seed_encoding, 'simulator_seed': seed_words,
+                       'opponent': opponent, 'open_team_sheets': open_team_sheets,
+                       'opponent_team': team_id(fmt, team2) if team2 else 'random-generated',
+                       'opponent_revision': opponent_model.revision if opponent_model is not None else None},
                    "public_log": logs[side]}
             if side == learner_side and teacher:
                 choice = max(choices, key=lambda c: brain.features.action(ctx, c)[-1])
@@ -128,6 +145,13 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                 choice = rng.choice(choices)
             elif opponent == "self":
                 choice = opponent_brain.decide(ctx, explore=training, record=False)['choice']
+            elif opponent == 'tactical':
+                from ml.preview import score as preview_score
+                if request.get('teamPreview'):
+                    choice = max(choices, key=lambda c: preview_score(ctx, c, brain.features))
+                else:
+                    tactical_ctx = {**ctx, 'feature_profile': 'mechanics-v1'}
+                    choice = max(choices, key=lambda c: brain.features.action(tactical_ctx, c)[-1])
             else:
                 # A separate frozen scripted opponent; never updated by training.
                 choice = max(choices, key=lambda c: brain.features.action(ctx, c)[-1])
@@ -145,6 +169,10 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                        "opponent": opponent, "learner_side": learner_side, "revision": model.revision})
         result["policy_mode"] = "sampled" if training or sample_actions else "greedy"
         result["unavailable_choices"] = unavailable
+        result.update(open_team_sheets=open_team_sheets,
+                      seed_encoding=seed_encoding, simulator_seed=seed_words,
+                      learner_team=team_id(fmt, team1) if team1 else 'random-generated',
+                      opponent_team=team_id(fmt, team2) if team2 else 'random-generated')
         if opponent_model is not None:
             result['opponent_revision'] = opponent_model.revision
         return result

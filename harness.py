@@ -215,14 +215,14 @@ class Player:
 
     def finished(self, room: str) -> bool:
         log = self.c.battles.get(room, {}).get("log", [])
-        return any(l.startswith("|win|") or l.startswith("|tie|") for l in log)
+        return any(l.startswith("|win|") or l in ('|tie', '|tie|') for l in log)
 
     def result(self, room: str) -> Dict[str, Any]:
         log = self.c.battles.get(room, {}).get("log", [])
         for l in log:
             if l.startswith("|win|"):
                 return {"room": room, "winner": l.split("|", 2)[2]}
-            if l.startswith("|tie|"):
+            if l in ('|tie', '|tie|'):
                 return {"room": room, "winner": None, "tie": True}
         return {"room": room, "winner": None, "ongoing": True}
 

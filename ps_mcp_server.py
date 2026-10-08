@@ -377,10 +377,13 @@ async def ps_team_plan(format: str, base: str = "", explore: bool = False,
 
 
 @mcp.tool()
-async def ps_ml_ladder(format: str, team: str = "", explore_team: bool = False) -> str:
+async def ps_ml_ladder(format: str, team: str = "", explore_team: bool = False,
+                       max_team_candidates: int = 8) -> str:
     """One player operation: select a team with the team model, validate, upload,
     and enter matchmaking on ps_login's existing connection. Explicit team limits
-    selection to that team and its researched variants. Does not log into another account."""
+    selection to that team and its researched variants. With an explicit team,
+    max_team_candidates=1 pins its exact sets for controlled comparisons.
+    Does not log into another account."""
     if not client.logged_in:
         raise ValueError("call ps_login once first")
     from ml.teams import TeamPlanner
@@ -391,7 +394,8 @@ async def ps_ml_ladder(format: str, team: str = "", explore_team: bool = False) 
             raise ValueError("finish the existing battle before another matchmaking operation")
         from ml.promotion import promote_ready
         promotion = promote_ready(brain.store, format)
-        plan = await TeamPlanner(brain.store, teams).plan(format, team, explore_team)
+        plan = await TeamPlanner(brain.store, teams).plan(format, team, explore_team,
+                                                       max_candidates=max_team_candidates)
         selected = plan["selected"]
         name = "ML-"+selected["id"]
         if name not in teams.list():

@@ -13,8 +13,10 @@ from ml.storage import Store, WriterBusy, now
 
 def paired_gate(base: list[dict], candidate: list[dict], games: int, margin: float) -> dict:
     complete = len(base) == len(candidate) == games
-    paired = complete and all((a.get('seed'), a.get('learner_side'), a.get('opponent'), a.get('opponent_revision')) ==
-                              (b.get('seed'), b.get('learner_side'), b.get('opponent'), b.get('opponent_revision'))
+    keys = ('seed', 'learner_side', 'opponent', 'opponent_revision', 'learner_team', 'opponent_team', 'open_team_sheets')
+    paired = complete and all(tuple(a.get(key) for key in keys) == tuple(b.get(key) for key in keys)
+                              and a.get('seed_encoding', 'legacy') == b.get('seed_encoding', 'legacy')
+                              and a.get('simulator_seed') == b.get('simulator_seed')
                               for a, b in zip(base, candidate))
     clean = paired and all(not g.get('unfinished') and not g.get('rejected_actions') and
                            (g.get('winner') or g.get('tie')) for g in base + candidate)

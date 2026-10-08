@@ -9,6 +9,19 @@ from ml.scout import PUBLIC_KINDS
 from ml.storage import now
 
 SNAPSHOT_VERSION = 1
+RECORDER_VERSION = 3
+
+
+def encoded_input(array):
+    """Compact dense JSON without losing a single nonzero float32 value.
+
+Zero-heavy feature arrays dominate episode size. Integer zero round-trips to
+the same tensor; the public list-shaped schema and old readers stay usable.
+"""
+    values = array.tolist()
+    if array.ndim == 1:
+        return [0 if value == 0 else value for value in values]
+    return [[0 if value == 0 else value for value in row] for row in values]
 # Additional observable battle events useful for diagnosis, beyond scout labels.
 BATTLE_KINDS = PUBLIC_KINDS | {
     'teampreview', 'teamsize', 'upkeep', 'cant', 'swap', 'callback',
@@ -29,7 +42,7 @@ def battle_lines(raw: list[str]) -> list[str]:
     result = []
     for line in raw:
         parts = line.split('|')
-        if len(parts) < 3 or parts[1] not in BATTLE_KINDS:
+        if len(parts) < 2 or parts[1] not in BATTLE_KINDS:
             continue
         if parts[1] == 'player':
             line = f'|player|{parts[2]}|Player-{parts[2]}'

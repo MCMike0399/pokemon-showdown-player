@@ -13,12 +13,26 @@ without entering an earlier decision's context. A different reconnect prefix get
 its own segment. Terminal closeout saves its final observable log reference.
 Chat, raw request protocol lines, HTML and authentication events are excluded from
 these logs; the dedicated private-request field contains the battle request itself.
+Argument-free events such as `|start` and the canonical `|tie` are retained. The
+player and local simulator recognize both canonical and trailing-pipe tie forms,
+so future draws finalize as zero rewards and remain available to the scout.
 
 Popped/rejected proposals stay in `discarded_proposals` for diagnosis and receive
 no PPO credit. Restart recovery preserves the original snapshot, action, feature
 vectors, probability and episode identity. An older step without a snapshot remains
 `legacy-encoded-only`; no private request or named alternative is invented from
-later reveals. The existing feature schema and recorder version are preserved.
+later reveals. The feature schema remains 1. New episodes use recorder version 3;
+old recordings are retained without migration or fabricated provenance.
+
+Recorder 3 adds the collecting checkpoint SHA-256, phase temperatures, feature
+profile, cached dex digest, and exact own sets when available. Local episodes also
+retain the opponent policy/team, side, sheet visibility and effective simulator
+seed. The collecting artifact is retained once by digest under
+`models/collected/<format>/`, so a later promotion does not erase its weights.
+Dense encoded arrays write numeric zero as `0`, preserving every float32
+input and the existing list-shaped JSON schema while reducing new record size.
+Historical digests/archives are not backfilled. A digest alone cannot reproduce
+a missing historical model.
 
 If the playing socket disconnects, `ps_ml_play` makes at most three attempts per
 room to close the old transport, authenticate the configured account and rejoin
@@ -47,12 +61,23 @@ saved legal choices. `start` is a zero-based decision index, not a battle turn.
 .venv/bin/python scripts/inspect_decision.py --room <battle-room> --start 1 --alternatives
 .venv/bin/python scripts/audit_campaign.py --campaign data/ml/campaigns/<campaign-id> \
   --output artifacts/campaign-audit.json
+.venv/bin/python scripts/audit_training_data.py --campaign data/ml/campaigns/<campaign-id> \
+  --output artifacts/training-data-audit.json
 ```
 
 The audit groups outcomes by team fingerprint and actor revision, reports preview
 entropy and lineup choices, counts switches and observed protection patterns, and
 marks missing historical context. These are hypotheses to investigate, not labels
 of optimal moves. Losing does not establish that every preceding action was wrong.
+
+The training-data audit checks mask/selection alignment, feature dimensions and
+finite values, collecting probabilities, duplicate requests, submitted flags,
+log-prefix digests and temporal ordering. It reports corpus/source counts,
+consumption and candidate-evaluation history. Fragmented rooms keep their verified
+outcome but are excluded as trajectories. PPO validates original checkpoint
+likelihoods before gradients and excludes whole incompatible episodes, retaining
+their data and consumption flags. Demonstration likelihoods now refer to the
+demonstrated command, even when that command differs from the actor's argmax.
 
 ## Phase-specific policy experiments
 
@@ -97,3 +122,14 @@ own feature profile, research and scout inputs; paired validation checks the
 opponent revision as well as seeds/sides. This supports tougher comparisons than
 random and tactical-script opponents alone. Passing a local suite still does not
 establish human ladder strength.
+
+`mechanics-v1` preserves state/preview encoding and adds turn pressure corrections
+for observed weather, boosts/burn, selected Mega form, known immunities/screens,
+joint Helping Hand and friendly damage. Locked Electro Shot releases are identified
+from the targetless request rather than guessed to be fresh charges. The prior
+still estimates pressure; it does not model the opponent's complete response.
+
+`lineup-v1` preserves turn encoding and adds a preview prior for bringing a rain
+setter with rain-dependent partners and leading those partners together, alongside
+visible coverage. Neither profile is enabled simply by installing source: they
+require a new checkpoint revision and a passing isolated evaluation.

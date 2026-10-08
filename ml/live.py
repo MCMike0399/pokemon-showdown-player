@@ -20,7 +20,7 @@ def context(player, room: str, fmt: str, team: str = "") -> dict:
     sets = player.teams.get(team)["sets"] if team else None
     if team and player.teams.get(team)["format"] != fmt:
         raise ValueError("stored team format does not match battle format")
-    return {"room": room, "format": fmt, "team_id": team_id(fmt, sets) if sets else "", "source": "ladder",
+    return {"room": room, "format": fmt, "team_id": team_id(fmt, sets) if sets else "", "source": "ladder", 'team_sets': sets,
             "turn": player.c.battle_summary(room).get("turn"), "request": request,
             "choices": player.legal_choices(room), "state": player.state_summary(room),
             "public_log": list(player.c.battles.get(room, {}).get("log", []))}
@@ -152,9 +152,43 @@ class LiveSession:
         self.submitted[key] = {"log_index": log_index, "decision": decision}
         return decision
 
+    def _handoff(self, room: str, fmt: str, episode_id: str, previous=None):
+        """Optional learning cannot undo a persisted terminal battle outcome."""
+        from ml.scout import ingest_public
+        from ml.continuous import enqueue_battle, kick_worker
+        learning = dict(previous or {'job': None})
+        learning.pop('error', None)
+        learning['attempts'] = learning.get('attempts', 0) + 1
+        stage = 'public-experience'
+        try:
+            if 'public_experience' not in learning:
+                learning['public_experience'] = ingest_public(
+                    self.brain.store, fmt, self.player.c.battles.get(room, {}).get('log', []),
+                    'own-live-game', 'own-' + room)
+            stage = 'enqueue'
+            if not learning.get('job'):
+                learning['job'] = enqueue_battle(self.brain.store, fmt, episode_id)
+            if learning['job']:
+                stage = 'worker-start'
+                kick_worker(self.brain.store.root)
+        except Exception as error:
+            # Do not expose arbitrary exception messages (which can include
+            # private configuration). The phase/type identify the failed seam.
+            learning['error'] = {'stage': stage, 'type': type(error).__name__}
+        return learning
+
     def finish(self, room: str):
         if room in self.finished_outputs:
-            return self.finished_outputs[room]
+            output = self.finished_outputs[room]
+            learning = output.get('background_learning') or {}
+            if learning.get('error') and learning.get('attempts', 0) < 3:
+                fmt = output['experience'].get('format') or (room.split('-')[1] if room.startswith('battle-') else None)
+                if fmt:
+                    output['background_learning'] = self._handoff(room, fmt, output['experience'].get('id', room), learning)
+                    if 'training' in output:
+                        from ml.continuous import learning_report
+                        output['training'] = learning_report(output)
+            return output
         req = self.player._request(room) or {}
         side = req.get("side", {}).get("id") or self.brain.room_side(room)
         result = self.player.result(room)
@@ -176,16 +210,9 @@ class LiveSession:
         learning = None
         if not result.get("ongoing") and room not in self.finished_rooms:
             self.finished_rooms.add(room)
-            from ml.scout import ingest_public
-            from ml.continuous import enqueue_battle, kick_worker
             fmt = record.get("format") or (room.split("-")[1] if room.startswith("battle-") else None)
             if fmt:
-                public = ingest_public(self.brain.store, fmt,
-                                       self.player.c.battles.get(room, {}).get("log", []), "own-live-game", "own-"+room)
-                learning = {"public_experience": public,
-                            "job": enqueue_battle(self.brain.store, fmt, record.get("id", room))}
-                if learning["job"]:
-                    kick_worker(self.brain.store.root)
+                learning = self._handoff(room, fmt, record.get('id', room))
         if not result.get("ongoing"):
             self.submitted = {key: value for key, value in self.submitted.items() if key[0] != room}
         output = {"result": result, "experience": record, "background_learning": learning}

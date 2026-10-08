@@ -39,7 +39,9 @@ def rollout(task: dict):
         return asyncio.run(play_local(brain, task["format"], task["team1"], task["team2"],
                                      opponent=task.get("opponent", "heuristic"), seed=task["seed"],
                                      training=task["training"], learner_side=task["side"],
-                                     sample_actions=task.get("sample_actions", False), opponent_model=opponent_model))
+                                     sample_actions=task.get("sample_actions", False), opponent_model=opponent_model,
+                                     open_team_sheets=task.get('open_team_sheets', True),
+                                     seed_encoding=task.get('seed_encoding', 'legacy')))
     finally:
         store.close()
 
@@ -83,14 +85,31 @@ def snapshot(source: Path, target_root: Path, fmt: str):
     return target
 
 
-def game_tasks(root, checkpoint_root, fmt, teams, games, training, seed_base, opponent_root):
+def game_tasks(root, checkpoint_root, fmt, teams, games, training, seed_base, opponent_root,
+               learner_team=None, curriculum='legacy', open_team_sheet_probability=.08):
     """Fixed opponent identity remains independent of the candidate checkpoint."""
-    return [{'root': str(root), 'checkpoint_root': str(checkpoint_root), 'format': fmt,
-             'team1': teams[i % len(teams)], 'team2': teams[(i + 1) % len(teams)],
+    tasks = [{'root': str(root), 'checkpoint_root': str(checkpoint_root), 'format': fmt,
+             'team1': learner_team if learner_team is not None else teams[i % len(teams)],
+             'team2': teams[(i + 1) % len(teams)],
              'seed': seed_base + i, 'side': 'p2' if (i + i // len(teams)) % 2 else 'p1',
              'training': training, 'opponent': 'random' if i % 4 == 0 else 'self' if i % 4 == 1 else 'heuristic',
              'opponent_checkpoint_root': str(opponent_root) if i % 4 == 1 else None}
             for i in range(games)]
+    if curriculum == 'ladder-v1':
+        import random
+        cycle = ('self', 'tactical', 'heuristic', 'self', 'tactical', 'random', 'heuristic', 'tactical')
+        for i, task in enumerate(tasks):
+            # Complete a team sweep before changing opponent policy. The old
+            # i%4 schedule confounded opponent identity with team index when
+            # the pool size was a multiple of four.
+            opponent = cycle[(i // len(teams) + seed_base) % len(cycle)]
+            task.update(opponent=opponent,
+                opponent_checkpoint_root=str(opponent_root) if opponent == 'self' else None,
+                seed_encoding='full-v1',
+                open_team_sheets=random.Random((seed_base + i) ^ 0x50A7).random() < open_team_sheet_probability)
+    elif curriculum != 'legacy':
+        raise ValueError('unknown practice curriculum')
+    return tasks
 
 
 def freeze_inputs(store: Store, destination: Path, fmt: str):
@@ -98,7 +117,7 @@ def freeze_inputs(store: Store, destination: Path, fmt: str):
     frozen = Store(destination)
     try:
         with frozen.db:
-            for table in ('research_teams', 'documents', 'scout_samples'):
+            for table in ('research_teams', 'documents', 'public_battles', 'scout_samples'):
                 rows = store.db.execute(f"SELECT * FROM {table} WHERE format=?", (fmt,)).fetchall()
                 frozen.db.execute(f"DELETE FROM {table}")
                 if rows:
@@ -179,7 +198,8 @@ async def evaluate_saved(store, job, config, policy, deadline, work):
         return report
     evaluation = paired_gate(results['incumbent'], results['candidate'], plan['games'], plan['margin'])
     evaluation.update(games_per_policy=plan['games'], policy_mode='sampled',
-                      same_starting_scout_research=True, team_pool_size=plan['team_pool_size'])
+                      same_starting_scout_research=True, team_pool_size=plan['team_pool_size'],
+                      training_team=plan.get('training_team'))
     with store.writer():
         current = Model(store.root, fmt)
         staged = current.revision == state['training']['previous_revision'] and stage(store, fmt, current.revision, candidate.path, evaluation)
@@ -217,20 +237,38 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
             teams.append(sets)
     if not teams:
         return {"trained": False, "reason": "no legal local training teams"}
+    focus, focus_metadata = None, None
+    focus_name = config.training_teams.get(fmt)
+    if focus_name:
+        from harness import TeamStore
+        from ml.teams import team_id
+        focused = TeamStore().get(focus_name)
+        if focused['format'] != fmt:
+            raise ValueError('focused training team has a different format')
+        validation = await validate_team(fmt, focused['sets'])
+        if validation['errors']:
+            raise ValueError('focused training team is illegal: ' + '; '.join(validation['errors']))
+        focus = focused['sets']
+        focus_metadata = {'name': focus_name, 'fingerprint': team_id(fmt, focus)}
     seed_base = int(fingerprint(job["id"])[:8], 16) % 50000
     def tasks(checkpoint_root, games, training, seed_offset):
         return game_tasks(store.root, checkpoint_root, fmt, teams, games, training,
-                          seed_base + seed_offset, before_root)
+                          seed_base + seed_offset, before_root, learner_team=focus,
+                          curriculum=config.curriculum, open_team_sheet_probability=config.open_team_sheet_probability)
     collected = None
     if job["kind"] == "practice" and config.simulation_games:
         collected = await parallel_games(tasks(before_root, config.simulation_games, True, 0), policy, deadline)
     episodes = store.episodes(fmt, None if job["payload"].get("imitation") else incumbent.revision)
+    if focus_metadata:
+        episodes = [e for e in episodes if e.get('team') == focus_metadata['fingerprint']]
     if not episodes:
-        return {"trained": False, "reason": "no compatible complete episodes", "collection": collected}
+        return {"trained": False, "reason": "no compatible complete episodes", "collection": collected,
+                "training_team": focus_metadata}
     steps = sum(len(e.get('steps', [])) for e in episodes if e.get('on_policy') or job['payload'].get('imitation'))
     if steps < config.min_training_steps:
         return {"trained": False, "reason": "accumulating compatible experience", "steps": steps,
-                "required_steps": config.min_training_steps, "collection": collected}
+                "required_steps": config.min_training_steps, "collection": collected,
+                "training_team": focus_metadata}
     if time.monotonic() >= deadline or policy.sample()["deferred"]:
         return {"deferred": True, "reason": "resource/time budget reached; experience retained"}
     snapshot(incumbent.path, candidate_root, fmt)
@@ -264,7 +302,8 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
         task.update(inference_root=str(inputs), sample_actions=True)
     import hashlib
     atomic_json(work / 'evaluation-plan.json', {'incumbent': eval_tasks, 'candidate': candidate_tasks,
-                'games': config.evaluation_games, 'margin': config.promotion_margin, 'team_pool_size': len(teams)})
+                'games': config.evaluation_games, 'margin': config.promotion_margin, 'team_pool_size': len(teams),
+                'training_team': focus_metadata})
     atomic_json(work / 'training-state.json', {'training': training, 'backend': backend, 'collection': collected,
                 'candidate_sha256': hashlib.sha256(candidate.path.read_bytes()).hexdigest()})
     return await evaluate_saved(store, job, config, policy, deadline, work)

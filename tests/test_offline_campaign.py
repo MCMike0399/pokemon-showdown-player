@@ -36,6 +36,62 @@ def test_preflight_preserves_recovery_state_and_rejects_bad_targets(campaign):
     controller.db.close()
 
 
+def test_completion_only_resumes_past_deadline_without_changing_target(campaign):
+    import math
+    directory, _ = campaign
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    manifest['deadline_at'] = '2026-10-08T13:00:00+00:00'
+    (directory / 'manifest.json').write_text(json.dumps(manifest))
+    controller = runner.Campaign(directory)
+    original = controller.deadline()
+    (directory / 'control.json').write_text(json.dumps({'target_ladder': 500, 'completion_only': True}))
+    assert math.isinf(controller.deadline()) and controller.target() == 500
+    controller.status('Resume to target')
+    assert json.loads((directory / 'status.json').read_text())['stop_mode'] == 'target'
+    (directory / 'control.json').write_text(json.dumps({'target_ladder': 500, 'completion_only': False}))
+    assert controller.deadline() == original
+    (directory / 'control.json').write_text(json.dumps({'completion_only': 'yes'}))
+    with pytest.raises(runner.Blocked, match='boolean'):
+        controller.deadline()
+    controller.db.close()
+
+
+def test_next_search_can_pin_corrected_team_without_changing_active_recovery(campaign):
+    directory, _ = campaign
+    controller = runner.Campaign(directory)
+    (directory / 'control.json').write_text(json.dumps({'target_ladder': 100, 'team_base': 'Corrected rain',
+                                                       'explore_team': False, 'max_team_candidates': 1}))
+    assert controller.search_options() == {'format': FMT, 'team': 'Corrected rain', 'explore_team': False,
+                                          'max_team_candidates': 1}
+    assert controller.previous['actual_team'] == 'Exact'
+    assert controller.state['active_room'] == ROOM
+    (directory / 'control.json').write_text(json.dumps({'max_team_candidates': True}))
+    with pytest.raises(runner.Blocked, match='integer'):
+        controller.search_options()
+    controller.db.close()
+
+
+def test_status_distinguishes_completed_original_goal_from_expanded_target(campaign):
+    directory, store = campaign
+    manifest = json.loads((directory / 'manifest.json').read_text())
+    manifest['targets']['ladder_games'] = 1
+    (directory / 'manifest.json').write_text(json.dumps(manifest))
+    adjustment = {'team': 'Corrected rain', 'actor_decision': 'retain evaluated incumbent'}
+    (directory / 'control.json').write_text(json.dumps({'target_ladder': 5, 'finalized_adjustment': adjustment}))
+    store.save_episode({'id': 'verified', 'room': ROOM, 'format': FMT, 'team': 'exact',
+                        'source': 'ladder', 'revision': 'collected', 'status': 'complete', 'outcome': 1, 'steps': []})
+    (directory / 'games.jsonl').write_text(json.dumps({'room': ROOM, 'result': {'winner': 'Guest'}}) + '\n')
+    controller = runner.Campaign(directory)
+    controller.status('Continue expanded target')
+    status = json.loads((directory / 'status.json').read_text())
+    assert status['original_target_complete'] is True
+    assert status['original_target_ladder'] == 1
+    assert status['target_ladder'] == 5
+    assert status['completed'] == 1
+    assert status['finalized_adjustment'] == adjustment
+    controller.db.close()
+
+
 def test_nonterminal_attempts_preserve_active_room_without_counting(campaign):
     directory, _ = campaign
     controller = runner.Campaign(directory)

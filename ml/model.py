@@ -5,6 +5,7 @@ import uuid
 import tempfile
 import time
 import os
+import hashlib
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +76,7 @@ class Model:
         else:
             self.save()
         self.loaded_mtime = self.path.stat().st_mtime_ns
+        self.checkpoint_sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()
 
     def save(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +91,7 @@ class Model:
                         "optimizer": self.optimizer.state_dict()}, tmp)
             tmp.replace(self.path)
             self.loaded_mtime = self.path.stat().st_mtime_ns
+            self.checkpoint_sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()
         finally:
             tmp.unlink(missing_ok=True)
 
@@ -110,13 +113,13 @@ class Model:
                                     device=logits.device, dtype=logits.dtype)
         return logits / temperatures[:, None]
 
-    def predict(self, state, actions, explore: bool = False, preview: bool = False):
+    def predict(self, state, actions, explore: bool = False, preview: bool = False, selected_index: int | None = None):
         device = next(self.net.parameters()).device
         with torch.no_grad():
             logits, value = self.net(torch.as_tensor(state, device=device)[None], torch.as_tensor(actions, device=device)[None])
             logits = logits / self.temperature(preview)
             dist = Categorical(logits=logits[0])
-            index = int(dist.sample()) if explore else int(logits[0].argmax())
+            index = selected_index if selected_index is not None else int(dist.sample()) if explore else int(logits[0].argmax())
             return {"index": index, "logprob": float(dist.log_prob(torch.tensor(index, device=device))),
                     "value": float(value[0]), "probabilities": dist.probs.tolist()}
 
@@ -142,6 +145,8 @@ class Model:
             raise ValueError("target KL must be positive and at most 1")
         samples = []
         ids = []
+        excluded = []
+        from ml.data_quality import trajectory_issues
         for episode in episodes:
             if episode["format"] != self.fmt or episode.get("status") != "complete":
                 continue
@@ -154,6 +159,10 @@ class Model:
             trajectory = episode.get("steps", [])
             if not trajectory or episode.get("schema") != SCHEMA:
                 continue
+            issues = trajectory_issues(episode)
+            if issues:
+                excluded.append({'id': episode['id'], 'issues': issues})
+                continue
             ids.append(episode["id"])
             advantage = 0.0
             next_value = 0.0
@@ -163,11 +172,40 @@ class Model:
                 reward = float(episode["outcome"] or 0) if i == len(trajectory) - 1 else 0.0
                 delta = reward + 0.99 * next_value - step.get("value", 0.0)
                 advantage = delta + 0.99 * 0.95 * advantage
-                prepared.append({**step, "advantage": advantage, "return": advantage + step.get("value", 0.0)})
+                prepared.append({**step, "advantage": advantage, "return": advantage + step.get("value", 0.0),
+                                 '_episode_id': episode['id'], '_source': episode.get('source', 'unknown')})
                 next_value = step.get("value", 0.0)
             samples.extend(reversed(prepared))
         if not samples:
-            return {"trained": False, "reason": "no compatible unconsumed demonstrations" if imitation else "no complete stochastic rollouts from the current model revision"}
+            return {"trained": False, "reason": "no compatible unconsumed demonstrations" if imitation else "no complete stochastic rollouts from the current model revision",
+                    'excluded_episodes': excluded}
+        maximum_logprob_error = 0.0
+        from ml.batching import RolloutBatcher
+        device = next(self.net.parameters()).device
+        batcher = RolloutBatcher(samples, device)
+        if not imitation:
+            invalid = set()
+            with torch.no_grad():
+                for start in range(0, len(samples), 32):
+                    if deadline is not None and time.monotonic() >= deadline:
+                        raise TimeoutError('training budget expired during rollout validation')
+                    batch = samples[start:start + 32]
+                    states, actions, mask, indices = batcher.batch(range(start, start + len(batch)))
+                    logits, _ = self.net(states, actions, mask)
+                    likelihood = Categorical(logits=self.training_logits(logits, batch)).log_prob(indices)
+                    errors = (likelihood - torch.tensor([s['logprob'] for s in batch], device=device)).abs().tolist()
+                    maximum_logprob_error = max(maximum_logprob_error, max(errors))
+                    invalid.update(s['_episode_id'] for s, error in zip(batch, errors) if error > 1e-4)
+            if invalid:
+                excluded.extend({'id': key, 'issues': ['collecting-checkpoint-likelihood-mismatch']} for key in sorted(invalid))
+                ids = [key for key in ids if key not in invalid]
+                samples = [s for s in samples if s['_episode_id'] not in invalid]
+            if not samples:
+                return {'trained': False, 'reason': 'no rollouts match the collecting checkpoint likelihood',
+                        'excluded_episodes': excluded, 'maximum_collecting_logprob_error': maximum_logprob_error}
+            if invalid:
+                del batcher
+                batcher = RolloutBatcher(samples, device)
         advantages = np.array([s["advantage"] for s in samples], dtype=np.float32)
         # One tiny batch must not lose all its policy gradient when variance is 0.
         if len(samples) > 1 and advantages.std() > 1e-6:
@@ -187,8 +225,7 @@ class Model:
                     raise TimeoutError("training budget expired before saving candidate")
                 started = time.monotonic()
                 batch = [samples[i] for i in order[start:start + 32]]
-                states, actions, mask, indices = self.batch(batch)
-                states, actions, mask, indices = (t.to(device) for t in (states, actions, mask, indices))
+                states, actions, mask, indices = batcher.batch(order[start:start + 32])
                 logits, values = self.net(states, actions, mask)
                 logits = self.training_logits(logits, batch)
                 dist = Categorical(logits=logits)
@@ -219,7 +256,7 @@ class Model:
                 with torch.no_grad():
                     for start in range(0, len(samples), 32):
                         batch = samples[start:start + 32]
-                        states, actions, mask, indices = (t.to(device) for t in self.batch(batch))
+                        states, actions, mask, indices = batcher.batch(range(start, start + len(batch)))
                         logits, _ = self.net(states, actions, mask)
                         logits = self.training_logits(logits, batch)
                         old = torch.tensor([s['logprob'] for s in batch], device=device)
@@ -241,4 +278,8 @@ class Model:
                 "target_kl": target_kl, "kl_history": kl_history,
                 "clip_fraction_history": clip_fractions,
                 "early_stopped": not imitation and len(kl_history) < epochs,
-                "previous_revision": old_revision, "revision": self.revision, "consumed": ids}
+                "previous_revision": old_revision, "revision": self.revision, "consumed": ids,
+                'excluded_episodes': excluded, 'maximum_collecting_logprob_error': maximum_logprob_error,
+                'batch_cache': batcher.stats(),
+                'source_steps': {source: sum(s['_source'] == source for s in samples)
+                                 for source in sorted({s['_source'] for s in samples})}}

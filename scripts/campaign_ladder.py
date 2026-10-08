@@ -15,6 +15,8 @@ from mcp.client.stdio import stdio_client
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
+from ml.recording import RECORDER_VERSION
+
 
 def utc():
     return datetime.now(timezone.utc).isoformat()
@@ -78,7 +80,8 @@ class Campaign:
         self.seen = seen
         self.state = {"phase": "preflight", "active_room": self.previous.get("active_room"),
                       "current_tool": None, "completed": len(seen), "errors": [],
-                      "recorder_version": 2, "controller_version": 3}
+                      "recorder_version": RECORDER_VERSION,
+                      "controller_version": 3}
         self.db = sqlite3.connect((REPO / "data/ml/experience.sqlite3").as_uri() + "?mode=ro", uri=True)
         self.db.row_factory = sqlite3.Row
         self.recount()
@@ -100,8 +103,38 @@ class Campaign:
             raise Blocked("campaign target must be an integer 1..1000")
         return target
 
+    def deadline(self):
+        control = read(self.directory / 'control.json')
+        completion_only = control.get('completion_only', False)
+        if type(completion_only) is not bool:
+            raise Blocked('completion_only must be boolean')
+        if completion_only:
+            return float('inf')
+        return datetime.fromisoformat(self.manifest['deadline_at'].replace('Z', '+00:00')).timestamp()
+
+    def search_options(self):
+        """Apply team changes only at the next search; current rooms retain exact sets."""
+        control = read(self.directory / "control.json")
+        team = control.get('team_base', self.base)
+        explore = control.get('explore_team', len(self.seen) >= 50)
+        candidates = control.get('max_team_candidates', 8)
+        if not isinstance(team, str) or not team.strip() or len(team) > 200:
+            raise Blocked('team_base must name an existing team')
+        if type(explore) is not bool:
+            raise Blocked('explore_team must be boolean')
+        if type(candidates) is not int or not 1 <= candidates <= 32:
+            raise Blocked('max_team_candidates must be an integer 1..32')
+        return {'format': self.format, 'team': team, 'explore_team': explore,
+                'max_team_candidates': candidates}
+
     def status(self, next_step):
         self.state.update(updated_at=utc(), next_step=next_step, target_ladder=self.target())
+        original = self.manifest['targets']['ladder_games']
+        self.state.update(original_target_ladder=original, original_target_complete=len(self.seen) >= original)
+        self.state['stop_mode'] = 'target' if read(self.directory / 'control.json').get('completion_only', False) else 'deadline-or-target'
+        finalized = read(self.directory / 'control.json').get('finalized_adjustment')
+        if finalized:
+            self.state['finalized_adjustment'] = finalized
         atomic(self.directory / "status.json", self.state)
 
     async def call(self, session, tool, args, room=None):
@@ -165,7 +198,8 @@ class Campaign:
         if len(matches) != 1:
             raise Blocked("terminal battle does not have exactly one verified completed recording")
         episode = matches[0]
-        record = {"game": self.state["completed"] + 1, "room": room, "team_requested": self.base, "team_used": team,
+        requested = (self.previous if resumed else self.state).get('requested_team') or self.base
+        record = {"game": self.state["completed"] + 1, "room": room, "team_requested": requested, "team_used": team,
                   "team_fingerprint": episode["team"], "result": result, "winner": result.get("winner"),
                   "finish": finished, "actor_revision": episode["revision"], "episode_id": episode["id"],
                   "recorder_version": json.loads(episode["data"]).get("recorder_version"),
@@ -181,6 +215,7 @@ class Campaign:
 
     async def run(self):
         generation = source_generation()
+        self.state['source_generation'] = generation
         parameters = StdioServerParameters(command=str(REPO / ".venv/bin/python"), args=[str(REPO / "ps_mcp_server.py")])
         async with stdio_client(parameters) as (reader, writer):
             async with ClientSession(reader, writer, read_timeout_seconds=1200) as session:
@@ -195,7 +230,7 @@ class Campaign:
                     await self.call(session, "ps_join", {"room": pending}, pending)
                     await asyncio.sleep(1)
                     await self.play(session, pending, team, resumed=True)
-                deadline = datetime.fromisoformat(self.manifest["deadline_at"].replace("Z", "+00:00")).timestamp()
+                deadline = self.deadline()
                 while len(self.seen) < self.target() and time.time() < deadline:
                     if source_generation() != generation:
                         self.state.update(phase='source_reload_requested', active_room=None, current_tool=None)
@@ -208,7 +243,9 @@ class Campaign:
                     for attempt in range(3):
                         if time.time() >= deadline:
                             break
-                        search = await self.call(session, "ps_ml_ladder", {"format": self.format, "team": self.base, "explore_team": len(self.seen) >= 50})
+                        options = self.search_options()
+                        self.state['requested_team'] = options['team']
+                        search = await self.call(session, "ps_ml_ladder", options)
                         promotion = search.get('promotion') or {}
                         if promotion.get('promoted'):
                             self.state['actor_revision'] = promotion['revision']

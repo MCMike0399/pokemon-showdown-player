@@ -28,6 +28,9 @@ class LearningConfig:
     max_tournament_teams: int = 12
     resource: dict = field(default_factory=lambda: asdict(ResourcePolicy()))
     archives: list[str] = field(default_factory=list)
+    training_teams: dict[str, str] = field(default_factory=dict)
+    curriculum: str = 'ladder-v1'
+    open_team_sheet_probability: float = .08
 
     def __post_init__(self):
         from battle_state import to_id
@@ -45,6 +48,15 @@ class LearningConfig:
         from ml.feeds import ARCHIVES
         if any(name not in ARCHIVES for name in self.archives):
             raise ValueError("archive must be an approved pinned source")
+        if not isinstance(self.training_teams, dict) or any(
+                not isinstance(fmt, str) or not fmt or fmt != to_id(fmt) or
+                not isinstance(name, str) or not name.strip() or len(name) > 200
+                for fmt, name in self.training_teams.items()):
+            raise ValueError("training_teams must map format ids to stored team names")
+        if self.curriculum not in ('legacy', 'ladder-v1'):
+            raise ValueError('curriculum must be legacy or ladder-v1')
+        if not isinstance(self.open_team_sheet_probability, (int, float)) or not 0 <= self.open_team_sheet_probability <= 1:
+            raise ValueError('open team sheet probability must be 0..1')
 
     @classmethod
     def load(cls, root: Path = DEFAULT_ROOT):

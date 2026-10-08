@@ -76,6 +76,7 @@ class Brain:
         if record and not explore and demonstration is None:
             raise ValueError("PPO recording requires sampled actions (explore=True)")
         if record or demonstration is not None:
+            from ml.recording import RECORDER_VERSION, encoded_input
             side = (ctx["request"].get("side") or {}).get("id", "p1")
             restored = self.resume(ctx["room"], side)
             if restored is None and any(row["status"] == "complete" for row in self.store.room_episodes(ctx["room"], side)):
@@ -84,6 +85,11 @@ class Brain:
         collecting = self.pending.get((ctx['room'], ctx['request'].get('side', {}).get('id', 'p1')))
         if collecting and collecting.get('feature_profile', 'legacy') != model.feature_profile:
             raise ValueError('cannot change feature profile during an episode')
+        policy = (collecting or {}).get('collecting_policy')
+        if policy and (policy['checkpoint_sha256'] != model.checkpoint_sha256 or
+                       policy['policy_temperature'] != model.policy_temperature or
+                       policy['preview_temperature'] != model.preview_temperature):
+            raise ValueError('cannot change the collecting checkpoint or temperatures during an episode')
         ctx = {**ctx, 'feature_profile': model.feature_profile}
         # Research affects bounded species-frequency features, never raw text.
         from ml.research import species_prior
@@ -103,11 +109,12 @@ class Brain:
                 for move in opponent["moves"]:
                     features.add(state, "scout/" + opponent["slot"][-1] + "/" + move["move"], move["probability"])
         preview = bool(ctx['request'].get('teamPreview'))
-        prediction = model.predict(state, actions, explore, preview=preview)
+        demonstrated_index = None
         if demonstration is not None:
             if demonstration not in ctx["choices"]:
                 raise ValueError("demonstrated action is not in the legal mask")
-            prediction["index"] = ctx["choices"].index(demonstration)
+            demonstrated_index = ctx["choices"].index(demonstration)
+        prediction = model.predict(state, actions, explore, preview=preview, selected_index=demonstrated_index)
         choice = ctx["choices"][prediction["index"]]
         if record or demonstration is not None:
             room = ctx["room"]
@@ -119,7 +126,14 @@ class Brain:
                            "schema": SCHEMA, "created": now(), "status": "pending", "steps": [],
                            "side": key[1],
                            "feature_profile": model.feature_profile,
-                           "recorder_version": 2,
+                           "recorder_version": RECORDER_VERSION,
+                           'collecting_policy': {'checkpoint_sha256': model.checkpoint_sha256,
+                               'checkpoint_archive': self.store.retain_checkpoint(model),
+                               'policy_temperature': model.policy_temperature,
+                               'preview_temperature': model.preview_temperature,
+                               'feature_profile': model.feature_profile, 'dex_sha256': features.signature()},
+                           'team_sets': ctx.get('team_sets'),
+                           'simulation': ctx.get('simulation'),
                            "on_policy": demonstration is None, "demonstration": demonstration is not None}
                 self.pending[key] = episode
             if episode["revision"] != model.revision or episode["format"] != fmt or episode["team"] != ctx.get("team_id", ""):
@@ -129,7 +143,7 @@ class Brain:
             # Rejects and retries overwrite the same decision, rather than giving
             # unexecuted proposals credit for the eventual game outcome.
             request_id = ctx["request"].get("rqid", fingerprint(ctx["request"]))
-            step = {"request_id": request_id, "state": state.tolist(), "actions": actions.tolist(),
+            step = {"request_id": request_id, "state": encoded_input(state), "actions": encoded_input(actions),
                     "index": prediction["index"], "choice": choice, "logprob": prediction["logprob"], "value": prediction["value"]}
             from ml.recording import snapshot
             step['snapshot'] = snapshot(episode, ctx, prediction, knowledge, scout_predictions, model.temperature(preview))
