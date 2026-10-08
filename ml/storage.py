@@ -69,6 +69,8 @@ class Store:
                 id TEXT PRIMARY KEY, format TEXT NOT NULL, species TEXT NOT NULL,
                 move TEXT NOT NULL, vector TEXT NOT NULL, battle TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS scout_species_moves ON scout_samples
+                (format, species, move);
             CREATE TABLE IF NOT EXISTS team_metadata (
                 id TEXT PRIMARY KEY, data TEXT NOT NULL
             );

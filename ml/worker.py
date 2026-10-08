@@ -487,6 +487,10 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
     if not training.get("trained"):
         return {"training": training, "collection": collected}
     candidate.set_device("cpu")
+    if candidate.feature_profile.startswith('strategic-'):
+        from ml.postgame import refresh_knowledge
+        training['behavior_feedback'] = refresh_knowledge(store, candidate)
+        candidate.save()
     if source_guard:
         source_guard(force=True)
     # Saved candidate uses CPU-compatible load; active checkpoint is untouched.

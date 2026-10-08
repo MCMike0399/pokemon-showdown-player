@@ -160,7 +160,12 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
         if result.get("ongoing"):
             result = {"room": room, "unfinished": True}
         else:
-            brain.finish(room, result, "LocalBrain", learner_side)
+            # A terminal event can arrive first on the other player's stream.
+            # Preserve verified attribution in the learner's public archive;
+            # no hidden request or unobserved move is copied across perspectives.
+            if not any(line.startswith('|win|') or line in ('|tie', '|tie|') for line in logs[learner_side]):
+                logs[learner_side].append('|tie|' if result.get('tie') else '|win|' + result['winner'])
+            brain.finish(room, result, "LocalBrain", learner_side, public_log=logs[learner_side])
             if training or teacher:
                 from ml.scout import ingest_public
                 result["public_experience"] = ingest_public(brain.store, fmt, logs[learner_side], "local-simulation", room,

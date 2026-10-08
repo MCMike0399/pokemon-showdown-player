@@ -70,6 +70,9 @@ class Model:
         self.policy_temperature = 1.0
         self.preview_temperature = None
         self.feature_profile = 'legacy'
+        self.strategy_knowledge = checkpoint.get('strategy_knowledge', {}) if checkpoint else {}
+        if not isinstance(self.strategy_knowledge, dict):
+            raise ValueError('strategy knowledge must be a checkpointed dictionary')
         if self.path.exists():
             if checkpoint["schema"] != SCHEMA or checkpoint["format"] != fmt:
                 raise ValueError("checkpoint schema/format mismatch")
@@ -102,6 +105,7 @@ class Model:
                         "policy_temperature": self.policy_temperature,
                         "preview_temperature": self.preview_temperature,
                         "feature_profile": self.feature_profile,
+                        "strategy_knowledge": self.strategy_knowledge,
                         "optimizer": self.optimizer.state_dict()}, tmp)
             tmp.replace(self.path)
             self.loaded_mtime = self.path.stat().st_mtime_ns

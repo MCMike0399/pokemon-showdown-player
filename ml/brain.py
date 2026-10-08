@@ -94,7 +94,8 @@ class Brain:
                        policy['policy_temperature'] != model.policy_temperature or
                        policy['preview_temperature'] != model.preview_temperature):
             raise ValueError('cannot change the collecting checkpoint or temperatures during an episode')
-        ctx = {**ctx, 'feature_profile': model.feature_profile}
+        ctx = {**ctx, 'feature_profile': model.feature_profile,
+               'strategy_knowledge': model.strategy_knowledge}
         # Research affects bounded species-frequency features, never raw text.
         from ml.research import species_prior
         knowledge = species_prior(self.inference_store, fmt)
@@ -199,6 +200,14 @@ class Brain:
         if public_log is not None:
             from ml.recording import record_log
             episode['terminal_log'] = record_log(episode, public_log)
+        # Completed records are immutable. Attach guarded feedback before the
+        # single terminal write; review failures cannot block attribution.
+        if public_log is not None:
+            from ml.postgame import review
+            try:
+                episode['postgame'] = review(episode, public_log)
+            except Exception as error:
+                episode['postgame'] = {'version': 1, 'error': type(error).__name__}
         self.store.save_episode(episode)
         del self.pending[key]
         return {"recorded": True, "id": episode["id"], "format": episode["format"], "steps": len(episode["steps"]), "outcome": episode["outcome"]}

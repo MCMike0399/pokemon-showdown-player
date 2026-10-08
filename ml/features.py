@@ -13,7 +13,7 @@ from battle_state import hp_fraction, legacy_hp_fraction, to_id
 SCHEMA = 1
 STATE_DIM = 384
 ACTION_DIM = 192
-FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2', 'rain-v1', 'mechanics-v1', 'lineup-v1', 'opening-v1', 'opening-v2', 'mega-v1'}
+FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2', 'rain-v1', 'mechanics-v1', 'lineup-v1', 'opening-v1', 'opening-v2', 'mega-v1', 'strategic-v1', 'strategic-turn-v1', 'strategic-preview-v1'}
 
 
 class Features:
@@ -140,7 +140,7 @@ class Features:
         prior = 0.0
         if choice.startswith("team "):
             indices = [int(i) - 1 for i in choice[5:].split(",")]
-            if ctx.get('feature_profile') == 'opening-v2':
+            if ctx.get('feature_profile') in ('opening-v2', 'strategic-v1', 'strategic-preview-v1'):
                 indices = indices[:2] + sorted(indices[2:])
             for order, index in enumerate(indices):
                 if index < len(party):
@@ -193,7 +193,14 @@ class Features:
                 # Joint interaction allows learning focus fire, attack+support,
                 # double Protect and switch+attack rather than independent picks.
                 self.add(vector, "joint/" + "/".join(p.strip().split()[0] for p in components))
-        if ctx.get('feature_profile') == 'tactics-v1':
+        if ctx.get('feature_profile') in ('strategic-v1', 'strategic-turn-v1', 'strategic-preview-v1'):
+            from ml.strategy import score
+            if ctx['feature_profile'] == 'strategic-v1' or choice.startswith('team ') == (ctx['feature_profile'] == 'strategic-preview-v1'):
+                prior = score(ctx, choice, self)
+                # Preserve matchup ordering instead of flattening many strong
+                # joint/preview scores to the final feature's hard cap.
+                prior = 4 * prior / (4 + abs(prior))
+        elif ctx.get('feature_profile') == 'tactics-v1':
             from ml.tactics import score
             prior = score(ctx, choice, self)
         elif ctx.get('feature_profile') == 'rain-v1':

@@ -87,7 +87,7 @@ async def run(root, output, fmt, focus, practice, development, final, seed, seco
                 model.enable_matchups()
                 model.preview_training_weight = 4
             model.feature_profile = feature_profile
-            model.preview_temperature = .35 if feature_profile.startswith('opening-') else incumbent.preview_temperature
+            model.preview_temperature = .25 if feature_profile.startswith('strategic-') else .35 if feature_profile.startswith('opening-') else incumbent.preview_temperature
             model.revision = uuid.uuid4().hex
             model.save()
             plan[name + '_sha256'] = digest(model.path)
@@ -230,7 +230,7 @@ if __name__ == '__main__':
     parser.add_argument('--rounds', type=int, default=1)
     parser.add_argument('--matchups', action='store_true')
     parser.add_argument('--initial-checkpoint', type=Path)
-    parser.add_argument('--profile', choices=['opening-v1', 'opening-v2'], default='opening-v1')
+    parser.add_argument('--profile', choices=['opening-v1', 'opening-v2', 'strategic-v1'], default='opening-v1')
     args = parser.parse_args()
     if not all(4 <= n <= 1000 for n in (args.practice, args.development, args.final)) or not 10 <= args.seconds <= 7200 or not 1 <= args.rounds <= 8:
         parser.error('panels must be 4..1000 and seconds 10..7200')
