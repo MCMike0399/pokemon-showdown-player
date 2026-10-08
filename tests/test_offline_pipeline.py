@@ -133,7 +133,7 @@ def test_pressure_guard_aborts_unsaved_training_without_consuming_data(tmp_path)
         store.close()
 
 
-def test_warning_pressure_and_swap_rate_defer_background_work(monkeypatch):
+def test_yellow_pressure_allows_work_but_red_and_swap_rate_defer(monkeypatch):
     from types import SimpleNamespace
     monkeypatch.setattr('ml.resources.psutil.virtual_memory', lambda: SimpleNamespace(available=8 * 2**30))
     monkeypatch.setattr('ml.resources.psutil.cpu_percent', lambda interval: 10)
@@ -141,6 +141,10 @@ def test_warning_pressure_and_swap_rate_defer_background_work(monkeypatch):
     monkeypatch.setattr('ml.resources.psutil.swap_memory', lambda: swap)
     monkeypatch.setattr('ml.resources.memory_pressure', lambda: 2)
     policy = ResourcePolicy()
+    assert policy.sample()['training_allowed']
+    monkeypatch.setattr('ml.resources.memory_pressure', lambda: 4)
+    assert not policy.sample()['training_allowed']
+    monkeypatch.setattr('ml.resources.memory_pressure', lambda: 6)
     assert not policy.sample()['training_allowed']
     monkeypatch.setattr('ml.resources.memory_pressure', lambda: 1)
     assert policy.sample()['training_allowed']  # Old swap usage alone is not pressure.

@@ -43,7 +43,7 @@ def rollout(task: dict):
     from ml.simulator import play_local
     torch.set_num_threads(1)
     store = Store(Path(task["root"]))
-    inputs = Store(Path(task['inference_root'])) if task.get('inference_root') else None
+    inputs = Store.read_only(Path(task['inference_root'])) if task.get('inference_root') else None
     brain = Brain(store, Features.cached(task["format"]), inference_store=inputs)
     model = Model(Path(task["checkpoint_root"]), task["format"])
     brain.models[task["format"]] = model
@@ -88,7 +88,8 @@ async def parallel_games(tasks: list[dict], policy: ResourcePolicy, deadline: fl
             if workers == 0:
                 return {"games": results, "deferred": True, "resources": resources}
             from ml.pipeline import simulator_slots
-            with simulator_slots(Path(tasks[cursor]['root']), policy.max_workers, workers) as slots:
+            slot_root = Path(tasks[cursor].get('simulator_slots_root', tasks[cursor]['root']))
+            with simulator_slots(slot_root, policy.max_workers, workers) as slots:
                 if not slots:
                     return {'games': results, 'deferred': True, 'reason': 'shared simulator slots in use'}
                 wave = tasks[cursor:cursor+slots]

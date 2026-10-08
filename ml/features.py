@@ -13,7 +13,7 @@ from battle_state import hp_fraction, legacy_hp_fraction, to_id
 SCHEMA = 1
 STATE_DIM = 384
 ACTION_DIM = 192
-FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2', 'rain-v1', 'mechanics-v1', 'lineup-v1'}
+FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2', 'rain-v1', 'mechanics-v1', 'lineup-v1', 'opening-v1', 'opening-v2', 'mega-v1'}
 
 
 class Features:
@@ -32,7 +32,7 @@ class Features:
         if fmt and (root / "dex" / fmt).exists():
             root = root / "dex" / fmt
         return cls({name: json.loads((root / f"{name}.json").read_text())
-                    for name in ("moves", "pokedex", "typechart") if (root / f"{name}.json").exists()})
+                    for name in ("moves", "pokedex", "typechart", "natures", "rules") if (root / f"{name}.json").exists()})
 
     @staticmethod
     def add(vector, name, value=1.0):
@@ -48,7 +48,7 @@ class Features:
         profile = ctx.get('feature_profile', 'legacy')
         if profile not in FEATURE_PROFILES:
             raise ValueError('unsupported feature profile')
-        if profile in ('legacy', 'preview-v1', 'preview-v2', 'lineup-v1'):
+        if profile in ('legacy', 'preview-v1', 'preview-v2', 'lineup-v1', 'mega-v1', 'opening-v2'):
             return data
         state = ctx['state']
         active = state.get('my_actives', []) + state.get('opp_actives', [])
@@ -85,7 +85,7 @@ class Features:
         for key in ("species", "item", "ability", "baseAbility", "teraType"):
             if mon.get(key):
                 self.add(vector, f"{prefix}/{key}/{to_id(mon[key])}")
-        health = hp_fraction if profile in ('tactics-v1', 'rain-v1') else legacy_hp_fraction
+        health = hp_fraction if profile in ('tactics-v1', 'rain-v1', 'opening-v1') else legacy_hp_fraction
         self.add(vector, prefix + "/hp", health(mon.get("condition")))
         for status in ("par", "brn", "slp", "psn", "tox", "frz", "fnt"):
             if status in (mon.get("condition") or "").split():
@@ -127,7 +127,7 @@ class Features:
         for species, frequency in (knowledge or {}).items():
             self.add(vector, "meta/" + species, frequency)
         vector[-16] = min(float(state.get("turn", 0)) / 50, 2)
-        health = hp_fraction if ctx.get('feature_profile') in ('tactics-v1', 'rain-v1') else legacy_hp_fraction
+        health = hp_fraction if ctx.get('feature_profile') in ('tactics-v1', 'rain-v1', 'opening-v1') else legacy_hp_fraction
         vector[-15] = sum(health(m.get("condition")) for m in state.get("my_party", [])) / 6
         vector[-14] = len(ctx.get("choices", [])) / 1000
         return np.clip(vector, -5, 5)
@@ -135,11 +135,13 @@ class Features:
     def action(self, ctx: dict, choice: str) -> np.ndarray:
         vector = np.zeros(ACTION_DIM, dtype=np.float32)
         state = ctx["state"]
-        health = hp_fraction if ctx.get('feature_profile') in ('tactics-v1', 'rain-v1') else legacy_hp_fraction
+        health = hp_fraction if ctx.get('feature_profile') in ('tactics-v1', 'rain-v1', 'opening-v1') else legacy_hp_fraction
         party = state.get("my_party", [])
         prior = 0.0
         if choice.startswith("team "):
             indices = [int(i) - 1 for i in choice[5:].split(",")]
+            if ctx.get('feature_profile') == 'opening-v2':
+                indices = indices[:2] + sorted(indices[2:])
             for order, index in enumerate(indices):
                 if index < len(party):
                     self._mon(vector, f"team/{order}", party[index], ctx.get('feature_profile', 'legacy'))
@@ -208,6 +210,22 @@ class Features:
         elif ctx.get('feature_profile') == 'lineup-v1' and choice.startswith('team '):
             from ml.preview import rain_lineup_score
             prior = rain_lineup_score(ctx, choice, self)
+        elif ctx.get('feature_profile') in ('opening-v1', 'opening-v2', 'mega-v1'):
+            from ml.opening import preview_score, turn_score, own_form
+            if choice.startswith('team '):
+                prior = preview_score(ctx, choice, self) if ctx['feature_profile'] in ('opening-v1', 'opening-v2') else 0
+            else:
+                if ctx['feature_profile'] == 'opening-v1':
+                    prior = turn_score(ctx, choice, self)
+                elif any(p in ('mega', 'megax', 'megay') for p in choice.replace(',', ' ').split()):
+                    base = ', '.join(' '.join(p for p in c.split() if p not in ('mega', 'megax', 'megay')) for c in choice.split(','))
+                    prior += turn_score(ctx, choice, self) - turn_score(ctx, base, self)
+                for i, parts in enumerate(p.strip().split() for p in choice.split(',')):
+                    if parts[0] == 'move' and any(x in parts for x in ('mega', 'megax', 'megay')):
+                        actor = own_form(ctx, state['my_actives'][i], self, True)
+                        self._mon(vector, f'prospective/{i}', actor, ctx['feature_profile'])
+            if ctx['feature_profile'] == 'opening-v1' or (ctx['feature_profile'] == 'opening-v2' and choice.startswith('team ')):
+                prior = 4 * prior / (4 + abs(prior))
         vector[-1] = max(-4, min(4, prior))
         return np.clip(vector, -5, 5)
 

@@ -22,20 +22,29 @@ torch.set_num_threads(max(1, min(4, int(os.environ.get("PS_TORCH_THREADS", "1"))
 
 
 class ActorCritic(nn.Module):
-    def __init__(self):
+    def __init__(self, architecture='concat-v1'):
         super().__init__()
+        if architecture not in ('concat-v1', 'matchup-v1'):
+            raise ValueError('unsupported actor architecture')
+        self.architecture = architecture
         self.state_encoder = nn.Sequential(nn.Linear(STATE_DIM, 128), nn.Tanh())
         self.action_encoder = nn.Sequential(nn.Linear(ACTION_DIM, 96), nn.Tanh())
         self.actor = nn.Sequential(nn.Linear(224, 96), nn.Tanh(), nn.Linear(96, 1))
         self.critic = nn.Sequential(nn.Linear(128, 64), nn.Tanh(), nn.Linear(64, 1))
         nn.init.zeros_(self.actor[-1].weight)
         nn.init.zeros_(self.actor[-1].bias)
+        if architecture == 'matchup-v1':
+            self.matchup_state = nn.Linear(128, 96, bias=False)
+            self.matchup_score = nn.Linear(96, 1, bias=False)
+            nn.init.zeros_(self.matchup_score.weight)
 
     def forward(self, states, actions, mask=None):
         s = self.state_encoder(states)
         a = self.action_encoder(actions)
         repeated = s[:, None, :].expand(-1, actions.shape[1], -1)
         logits = self.actor(torch.cat((repeated, a), dim=-1)).squeeze(-1) + actions[:, :, -1]
+        if self.architecture == 'matchup-v1':
+            logits = logits + self.matchup_score(a * self.matchup_state(s)[:, None, :]).squeeze(-1)
         if mask is not None:
             logits = logits.masked_fill(~mask, torch.finfo(logits.dtype).min)
         return logits, self.critic(s).squeeze(-1)
@@ -47,9 +56,14 @@ class Model:
             raise ValueError("format must be a Showdown format id")
         self.path = Path(root) / "models" / (fmt + ".pt")
         self.fmt = fmt
+        checkpoint = torch.load(self.path, map_location='cpu', weights_only=True) if self.path.exists() else None
+        self.architecture = checkpoint.get('architecture', 'concat-v1') if checkpoint else 'concat-v1'
+        self.preview_training_weight = float(checkpoint.get('preview_training_weight', 1)) if checkpoint else 1.0
+        if not 1 <= self.preview_training_weight <= 16:
+            raise ValueError('preview training weight must be 1..16')
         with torch.random.fork_rng(devices=[]):
             torch.random.default_generator.manual_seed(seed)
-            self.net = ActorCritic()
+            self.net = ActorCritic(self.architecture)
         self.optimizer = torch.optim.Adam(self.net.parameters(), lr=3e-4)
         self.revision = uuid.uuid4().hex
         self.updates = 0
@@ -57,7 +71,6 @@ class Model:
         self.preview_temperature = None
         self.feature_profile = 'legacy'
         if self.path.exists():
-            checkpoint = torch.load(self.path, map_location="cpu", weights_only=True)
             if checkpoint["schema"] != SCHEMA or checkpoint["format"] != fmt:
                 raise ValueError("checkpoint schema/format mismatch")
             self.net.load_state_dict(checkpoint["model"])
@@ -84,6 +97,7 @@ class Model:
             tmp = Path(handle.name)
         try:
             torch.save({"schema": SCHEMA, "format": self.fmt, "revision": self.revision,
+                        'architecture': self.architecture, 'preview_training_weight': self.preview_training_weight,
                         "updates": self.updates, "model": self.net.state_dict(),
                         "policy_temperature": self.policy_temperature,
                         "preview_temperature": self.preview_temperature,
@@ -91,9 +105,30 @@ class Model:
                         "optimizer": self.optimizer.state_dict()}, tmp)
             tmp.replace(self.path)
             self.loaded_mtime = self.path.stat().st_mtime_ns
-            self.checkpoint_sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()
         finally:
             tmp.unlink(missing_ok=True)
+        self.checkpoint_sha256 = hashlib.sha256(self.path.read_bytes()).hexdigest()
+
+    def enable_matchups(self):
+        """Explicit candidate migration; zero residual preserves existing logits.
+
+        An additional state/action product provides a direct learning signal for
+        matchup-conditioned preferences. Old artifacts remain concat-v1.
+        """
+        if self.architecture == 'matchup-v1':
+            return
+        device = next(self.net.parameters()).device
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(17)
+            net = ActorCritic('matchup-v1').to(device)
+        missing, unexpected = net.load_state_dict(self.net.state_dict(), strict=False)
+        if set(missing) != {'matchup_state.weight', 'matchup_score.weight'} or unexpected:
+            raise ValueError('unsupported matchup migration')
+        self.net = net
+        self.optimizer = torch.optim.Adam(net.parameters(), lr=3e-4)
+        self.architecture = 'matchup-v1'
+        self.revision = uuid.uuid4().hex
+        self.save()
 
     def set_device(self, device: str = "cpu"):
         if device == "mps" and not torch.backends.mps.is_available():
@@ -237,15 +272,18 @@ class Model:
                 logits = self.training_logits(logits, batch)
                 dist = Categorical(logits=logits)
                 logprobs = dist.log_prob(indices)
+                phase_weights = torch.tensor([self.preview_training_weight if s.get('choice', '').startswith('team ') else 1
+                                              for s in batch], device=device, dtype=logits.dtype)
+                phase_weights = phase_weights / phase_weights.mean()
                 if imitation:
-                    loss = -logprobs.mean()
+                    loss = -(logprobs * phase_weights).mean()
                 else:
                     old = torch.tensor([s["logprob"] for s in batch], device=device)
                     adv = torch.tensor([s["advantage"] for s in batch], device=device)
                     returns = torch.tensor([s["return"] for s in batch], device=device)
                     ratio = (logprobs - old).exp()
-                    policy = -torch.minimum(ratio * adv, ratio.clamp(0.8, 1.2) * adv).mean()
-                    loss = policy + 0.5 * (values - returns).square().mean() - 0.01 * dist.entropy().mean()
+                    policy = -torch.minimum(ratio * adv, ratio.clamp(0.8, 1.2) * adv)
+                    loss = ((policy + 0.5 * (values - returns).square() - 0.01 * dist.entropy()) * phase_weights).mean()
                 if not torch.isfinite(loss):
                     raise RuntimeError("non-finite training loss; checkpoint has not been saved")
                 self.optimizer.zero_grad()
@@ -284,6 +322,7 @@ class Model:
         self.updates += 1
         self.save()
         return {"trained": True, "algorithm": "behavior-cloning" if imitation else "PPO", "episodes": len(ids),
+                'architecture': self.architecture, 'preview_training_weight': self.preview_training_weight,
                 "steps": len(samples), "loss": sum(losses) / len(losses),
                 "epochs_completed": len(kl_history) if not imitation else epochs,
                 "target_kl": target_kl, "kl_history": kl_history,

@@ -91,7 +91,8 @@ class ResourcePolicy:
         cpu_workers = max(0, int((self.max_system_cpu_percent - cpu) * cores / 100))
         workers = max(0, min(self.max_workers, cores - self.reserve_cores, memory_workers, cpu_workers))
         healthy = (free >= self.min_available_gb and cpu < self.max_system_cpu_percent
-                   and pressure in (None, 1) and swapout_rate <= self.max_swapout_mb_per_second)
+                   and (pressure is None or not pressure & 4)
+                   and swapout_rate <= self.max_swapout_mb_per_second)
         if not healthy:
             workers = 0
         disk_free = psutil.disk_usage(str(Path.cwd())).free / 2**30

@@ -138,6 +138,7 @@ class Brain:
                                'checkpoint_archive': self.store.retain_checkpoint(model),
                                'policy_temperature': model.policy_temperature,
                                'preview_temperature': model.preview_temperature,
+                               'architecture': model.architecture,
                                'feature_profile': model.feature_profile, 'dex_sha256': features.signature()},
                            'team_sets': ctx.get('team_sets'),
                            'simulation': ctx.get('simulation'),

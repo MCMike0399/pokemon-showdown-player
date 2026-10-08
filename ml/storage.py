@@ -84,6 +84,17 @@ class Store:
     def close(self):
         self.db.close()
 
+    @classmethod
+    def read_only(cls, root: Path):
+        """Frozen inference inputs need no schema initialization or writer access."""
+        store = cls.__new__(cls)
+        store.root = Path(root)
+        store.db = sqlite3.connect((store.root / 'experience.sqlite3').resolve().as_uri() + '?mode=ro',
+                                   uri=True, check_same_thread=False, timeout=30)
+        store.db.row_factory = sqlite3.Row
+        store.db.execute('PRAGMA query_only=ON')
+        return store
+
     def retain_checkpoint(self, model) -> str:
         """Keep the collecting artifact once by digest, even after promotion.
 

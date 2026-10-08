@@ -48,9 +48,11 @@ async function run(input) {
     const pokedex = Object.fromEntries(dex.species.all().map(p => [p.id, {name: p.name, types: p.types,
       baseStats: p.baseStats, baseSpecies: p.baseSpecies, requiredItem: p.requiredItem, abilities: p.abilities}]));
     const moves = Object.fromEntries(dex.moves.all().map(m => [m.id, {name: m.name, basePower: m.basePower,
-      accuracy: m.accuracy, type: m.type, category: m.category, priority: m.priority, target: m.target}]));
+      accuracy: m.accuracy, type: m.type, category: m.category, priority: m.priority, target: m.target, flags: m.flags}]));
     const typechart = Object.fromEntries(dex.types.all().map(t => [t.name, {damageTaken: t.damageTaken}]));
-    emit({format: input.format, mod: format.mod, dex: {pokedex, moves, typechart}});
+    const natures = Object.fromEntries(dex.natures.all().map(n => [n.id, {plus: n.plus, minus: n.minus}]));
+    const rules = {champions: format.mod.startsWith('champions'), level_clause_mod: dex.formats.getRuleTable(format).has('levelclausemod')};
+    emit({format: input.format, mod: format.mod, dex: {pokedex, moves, typechart, natures, rules}});
   } else if (input.type === 'start') {
     if (battle) throw new Error('A simulator process runs exactly one game');
     const format = Dex.formats.get(input.format);

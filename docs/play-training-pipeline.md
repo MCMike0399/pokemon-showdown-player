@@ -110,10 +110,11 @@ bound their simultaneous waves. Headroom is rechecked between waves. Pools exit
 after bounded cycles. Launchd uses background priority and low-priority I/O.
 
 Training checks CPU, RAM, macOS memory pressure, free disk and swap-out rate at
-minibatch/validation checkpoints, sampling at most every five seconds. Warning/
-critical pressure or swap-out above 32 MiB/s yields the private update; source
+minibatch/validation checkpoints, sampling at most every five seconds. Red
+critical pressure (level 4) or swap-out above 32 MiB/s yields the private update; source
 experience stays unused and the playing checkpoint stays intact. Old swap
-occupancy alone does not prove current pressure. Darwin uses the kernel's
+occupancy alone does not prove current pressure. Yellow warning pressure (level 2)
+permits work when the separate CPU, free-memory and swap-rate limits pass. Darwin uses the kernel's
 exported dispatch-level conversion. [Apple XNU implementation](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_memorystatus_notify.c).
 
 MPS fraction caps an allocator relative to recommended working-set size; it is

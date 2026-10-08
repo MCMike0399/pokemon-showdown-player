@@ -123,6 +123,9 @@ opponent revision as well as seeds/sides. This supports tougher comparisons than
 random and tactical-script opponents alone. Passing a local suite still does not
 establish human ladder strength.
 
+For joint preview and prospective Mega scoring, isolated fresh-rollout training
+and paired evaluation, see [Opening and Mega policy](opening-policy.md).
+
 `mechanics-v1` preserves state/preview encoding and adds turn pressure corrections
 for observed weather, boosts/burn, selected Mega form, known immunities/screens,
 joint Helping Hand and friendly damage. Locked Electro Shot releases are identified
