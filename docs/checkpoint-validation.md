@@ -34,6 +34,7 @@ Each row compares policies on complete matching seeds, sides, opponent policies,
 | Frozen earlier v4 on the larger new panel |121|131|192|30/20|0.10132|Failed|
 | Mega-focused control on larger panel |121|105|192|21/37|0.98763|Failed|
 | V4 after four additional fresh updates |121|140|192|38/19|0.00817|Failed minimum gain|
+| Fresh v4 confirmation, prospective5-point gate |136|139|200|27/24|0.38988|Failed|
 
 The v4 gain was7.29 percentage points: promising but below the declared10-point minimum and insufficient under the one-sided paired p<=0.05 requirement. Rejected weights/reports remain retained locally; all of these independent final panels stayed unopened. The collecting live turn temperature is0.25. The v3 temperature0.7 experiment increased exploration relative to it.
 
@@ -48,3 +49,9 @@ The reviewed public source passed259 tests, including native-mechanics, continua
 A candidate requires a complete clean development gate and an independent final gate before staging. Source generation, parent revision and checkpoint hash must match; promotion occurs before matchmaking between recorded battles. The currently selected live model remains strategic-v1. Any prospective confirmation must declare its criteria before inspecting new cases; the completed10-point-gate verdicts stay unchanged.
 
 The trained v4 stratum results were: self55 cases26→35 wins; pressure44 cases21→32; tactical49 cases36→35; heuristic22 cases17→16; random22 cases21→22. The aggregate improvement does not establish superiority in every opponent group, and the curriculum coverage gap remains explicit.
+
+## Fresh confirmation after the minimum-gain decision
+
+The operator prospectively selected a5-percentage-point minimum while retaining the one-sidedp<=0.05 threshold. The completed10-point verdicts were left unchanged. A new200-case development panel used the immutable trained weights, new seeds, the same source/team pool and matching frozen scouting/research content. It finished139–136 (+1.5 points,p=.38988), failing both the practical and statistical criteria. Its independent200-case final remained unopened, and the live weights were retained.
+
+Fresh strata: self55 cases27→31; tactical55 cases45→38; pressure46 cases26→29; heuristic22 cases16→19; random22 cases22→22. The earlier9.9-point result did not replicate. The evidence supports investigating the tactical-opponent failures, not deploying the candidate or pooling panels after the fact to manufacture a pass. Selected replay diagnoses stay separate from PPO/expert labels.
