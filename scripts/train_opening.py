@@ -31,7 +31,7 @@ def digest(path):
 
 
 async def run(root, output, fmt, focus, practice, development, final, seed, seconds,
-              rounds=1, matchups=False, initial=None, profile='opening-v1'):
+              rounds=1, matchups=False, initial=None, profile='opening-v1', opponent_pool=None, pressure=False):
     from harness import TeamStore
     from ml.simulator import validate_team, load_dex
     from ml.teams import team_id
@@ -66,6 +66,14 @@ async def run(root, output, fmt, focus, practice, development, final, seed, seco
                     teams.append(sets)
         finally:
             db.close()
+        if opponent_pool:
+            from ml.teams import team_id
+            for sets in json.loads(opponent_pool.read_text()):
+                validation = await validate_team(fmt, sets)
+                if validation['errors']:
+                    raise ValueError('illegal declared opponent fixture: ' + '; '.join(validation['errors']))
+                if team_id(fmt, sets) not in {team_id(fmt, t) for t in teams}:
+                    teams.append(sets)
         if not teams:
             raise ValueError('no legal frozen opponent pool')
         features = await load_dex(fmt)
@@ -75,6 +83,7 @@ async def run(root, output, fmt, focus, practice, development, final, seed, seco
                 'source_generation': source_generation(), 'dex_sha256': features.signature(),
                 'practice': practice, 'development': development, 'final': final, 'seed': seed,
                 'rounds': rounds, 'matchups': matchups, 'profile': profile,
+                'pressure_opponent': pressure, 'opponent_pool_sha256': digest(opponent_pool) if opponent_pool else None,
                 'initial_checkpoint_sha256': digest(initial) if initial else None,
                 'margin': .1, 'selection': 'Development-passing trained candidate; independent final gate before staging.',
                 'notes': ['New-profile stochastic own rollouts only, no legacy PPO relabeling.',
@@ -100,7 +109,7 @@ async def run(root, output, fmt, focus, practice, development, final, seed, seco
     for name in ('policy', 'mega'):
         if digest(output / name / 'models' / (fmt + '.pt')) != plan[name + '_sha256']:
             raise ValueError('frozen policy changed')
-    cycle = ('self', 'tactical', 'heuristic', 'self', 'tactical', 'heuristic', 'random', 'tactical')
+    cycle = ('self', 'tactical', 'pressure', 'self', 'heuristic', 'pressure', 'random', 'tactical') if plan.get('pressure_opponent') else ('self', 'tactical', 'heuristic', 'self', 'tactical', 'heuristic', 'random', 'tactical')
 
     def tasks(label, count, offset, training):
         result = []
@@ -230,10 +239,13 @@ if __name__ == '__main__':
     parser.add_argument('--rounds', type=int, default=1)
     parser.add_argument('--matchups', action='store_true')
     parser.add_argument('--initial-checkpoint', type=Path)
-    parser.add_argument('--profile', choices=['opening-v1', 'opening-v2', 'strategic-v1'], default='opening-v1')
+    parser.add_argument('--opponent-pool', type=Path)
+    parser.add_argument('--pressure-opponent', action='store_true')
+    parser.add_argument('--profile', choices=['opening-v1', 'opening-v2', 'strategic-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4'], default='opening-v1')
     args = parser.parse_args()
     if not all(4 <= n <= 1000 for n in (args.practice, args.development, args.final)) or not 10 <= args.seconds <= 7200 or not 1 <= args.rounds <= 8:
         parser.error('panels must be 4..1000 and seconds 10..7200')
     print(json.dumps(asyncio.run(run(args.root.resolve(), args.output.resolve(), args.format, args.focus,
           args.practice, args.development, args.final, args.seed, args.seconds, args.rounds,
-          args.matchups, args.initial_checkpoint.resolve() if args.initial_checkpoint else None, args.profile)), indent=2))
+          args.matchups, args.initial_checkpoint.resolve() if args.initial_checkpoint else None, args.profile,
+          args.opponent_pool.resolve() if args.opponent_pool else None, args.pressure_opponent)), indent=2))

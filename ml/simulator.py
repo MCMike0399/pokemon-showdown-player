@@ -59,8 +59,8 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                      seed: int = 0, training: bool = True, max_decisions: int = 1000,
                      teacher: bool = False, opponent_model=None, learner_side: str = "p1",
                      sample_actions: bool = False, open_team_sheets: bool = True, seed_encoding: str = 'legacy') -> dict:
-    if opponent not in ("heuristic", "random", "self", "tactical"):
-        raise ValueError("opponent must be heuristic, random, self or tactical")
+    if opponent not in ("heuristic", "random", "self", "tactical", "pressure"):
+        raise ValueError("opponent must be heuristic, random, self, tactical or pressure")
     if not isinstance(open_team_sheets, bool):
         raise ValueError('open_team_sheets must be boolean')
     seed_words = simulator_seed(seed, seed_encoding)
@@ -145,6 +145,9 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                 choice = rng.choice(choices)
             elif opponent == "self":
                 choice = opponent_brain.decide(ctx, explore=training, record=False)['choice']
+            elif opponent == 'pressure':
+                from ml.pressure import score as pressure_score
+                choice = max(choices, key=lambda c: pressure_score(ctx, c, brain.features))
             elif opponent == 'tactical':
                 from ml.preview import score as preview_score
                 if request.get('teamPreview'):

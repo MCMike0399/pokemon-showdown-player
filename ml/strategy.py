@@ -15,6 +15,7 @@ from ml.mechanics import charging, known_mon
 from ml.opening import own_form, preview_score, _hit
 from ml.rain import fake_out_available, weather
 from ml.tactics import damage, stat
+from ml.strategic_mechanics import SLEEP
 
 PROTECT = {'protect', 'detect', 'spikyshield', 'banefulbunker', 'silktrap', 'burningbulwark'}
 
@@ -51,6 +52,9 @@ def speed(mon, side, state, features):
 def hit(actor, target, name, data, state, features, side, spread=False):
     ctx = {'state': state, 'feature_profile': 'mechanics-v1'}
     data = features.move_data(ctx, name, data, actor, [target])
+    if state.get('_strategic_v4'):
+        from ml.continuation import variable_power
+        data = variable_power(name, data, actor)
     ability = to_id(actor.get('ability') or actor.get('baseAbility'))
     kind = data.get('type', '')
     priority = move_priority(actor, name, data, state, features)
@@ -59,7 +63,12 @@ def hit(actor, target, name, data, state, features, side, spread=False):
         ('armortail', 'queenlymajesty', 'dazzling') and hp_fraction(m.get('condition')) > 0 for m in defenders) or
         ('psychicterrain' in effects(state.get('field', [])) and grounded(target, features))):
         return 0.0
-    amount = damage(actor, target, data, {**state, 'weather': weather(state, actor)}, features, spread)
+    if state.get('_strategic_v2'):
+        from ml.strategic_mechanics import estimate, move_data
+        data = move_data(name, data, actor, state, grounded(actor, features))
+        amount = estimate(actor, target, name, data, {**state, 'weather': weather(state, actor)}, features, spread)
+    else:
+        amount = damage(actor, target, data, {**state, 'weather': weather(state, actor)}, features, spread)
     if ability == 'toughclaws' and data.get('flags', {}).get('contact'):
         amount *= 5325 / 4096
     if ability == 'adaptability' and kind in features.species(actor.get('species', '')).get('types', []):
@@ -86,9 +95,10 @@ def hit(actor, target, name, data, state, features, side, spread=False):
             amount *= .5
         if name in ('earthquake', 'bulldoze', 'magnitude') and 'grassyterrain' in field:
             amount *= .5
-    if to_id(target.get('item')) == 'assaultvest' and data.get('category') == 'Special':
+    special_defense = data.get('category') == 'Special' and not (state.get('_strategic_v2') and name in ('psyshock', 'psystrike', 'secretsword'))
+    if to_id(target.get('item')) == 'assaultvest' and special_defense:
         amount /= 1.5
-    if weather(state, target) == 'sandstorm' and 'Rock' in features.species(target.get('species', '')).get('types', []) and data.get('category') == 'Special':
+    if weather(state, target) == 'sandstorm' and 'Rock' in features.species(target.get('species', '')).get('types', []) and special_defense:
         amount /= 1.5
     return amount
 
@@ -148,9 +158,19 @@ def hypotheses(ctx, mon, targets, features):
         data = features.dex.get('moves', {}).get(name, {})
         if not data or (name == 'fakeout' and not fake_out_available(ctx, mon)):
             continue
-        if not data.get('basePower') and name not in PROTECT | {'tailwind', 'trickroom', 'helpinghand', 'wideguard', 'thunderwave', 'willowisp', 'spore', 'followme', 'ragepowder'}:
+        extra_support = SLEEP if ctx['state'].get('_strategic_v2') else set()
+        if ctx['state'].get('_strategic_v4'):
+            from ml.continuation import SETUP, RECOVERY
+            extra_support = extra_support | SETUP.keys() | RECOVERY
+            if name in RECOVERY and hp_fraction(mon.get('condition')) >= .9:
+                continue
+        if not data.get('basePower') and name not in PROTECT | extra_support | {'tailwind', 'trickroom', 'helpinghand', 'wideguard', 'thunderwave', 'willowisp', 'spore', 'followme', 'ragepowder'}:
             continue
         weight = 2 + math.sqrt(counts.get(name, 0)) + min(3, recent[name])
+        if ctx['state'].get('_strategic_v2') and name in SLEEP:
+            weight *= 1.5
+        if ctx['state'].get('_strategic_v4') and name in RECOVERY:
+            weight *= 2.5 * (1 - hp_fraction(mon.get('condition')))
         if name in PROTECT:
             weight *= 1.5 if hp_fraction(mon.get('condition')) < .4 else .65
             if recent[name] and any(e.get('turn') == ctx['state'].get('turn', 0) - 1 and to_id(e.get('move')) in PROTECT and e.get('slot') == mon.get('slot', '')[-1:] and e.get('side') == 'theirs' for e in ctx['state'].get('history', [])):
@@ -163,10 +183,16 @@ def hypotheses(ctx, mon, targets, features):
                                'basePower': 90, 'accuracy': 100, 'target': 'normal'}, 3))
     attacks = sorted((c for c in candidates if c[1].get('basePower')), key=lambda c:
                      max((hit(mon, t, c[0], c[1], ctx['state'], features, 'theirs') for t in targets), default=0) * c[2], reverse=True)[:2]
-    support = sorted((c for c in candidates if not c[1].get('basePower')), key=lambda c: -c[2])[:1]
+    support = sorted((c for c in candidates if not c[1].get('basePower')), key=lambda c: -c[2])[:2 if ctx['state'].get('_strategic_v4') else 1]
     result = []
     for name, data, weight in attacks + support:
-        if data.get('target') in ('allAdjacent', 'allAdjacentFoes') or not data.get('basePower'):
+        if ctx['state'].get('_strategic_v2') and name in SLEEP:
+            for index, target in enumerate(targets):
+                from ml.strategic_mechanics import sleep_probability
+                chance = sleep_probability(mon, target, name, data, ctx['state'], features)
+                if chance:
+                    result.append((name, data, index, weight * chance))
+        elif data.get('target') in ('allAdjacent', 'allAdjacentFoes') or not data.get('basePower'):
             result.append((name, data, None, weight))
         else:
             ranked = sorted(range(len(targets)), key=lambda i: hit(mon, targets[i], name, data, ctx['state'], features, 'theirs') / max(.2, hp_fraction(targets[i].get('condition'))), reverse=True)
@@ -337,6 +363,7 @@ def simulate(ctx, ours, theirs, prepared, features, reverse_ties=False):
             targets = [target] if target is not None else list(range(n))
             events.append((n + j, name, data, targets))
     protected, flinched, wide, helper, redirects = set(), set(), set(), {}, {}
+    availability = [1.0] * len(mons)
     while events:
         def initiative(event):
             i, name, data, _ = event
@@ -353,12 +380,30 @@ def simulate(ctx, ours, theirs, prepared, features, reverse_ties=False):
         if hp[i] <= 0 or i in flinched or 'slp' in mons[i].get('condition', '').split() or 'frz' in mons[i].get('condition', '').split():
             continue
         side = 'mine' if i < n else 'theirs'
+        from ml.strategic_mechanics import SLEEP, move_data, sleep_probability
+        if state.get('_strategic_v2'):
+            data = move_data(name, data, mons[i], state, grounded(mons[i], features))
+            if data.get('target') in ('allAdjacent', 'allAdjacentFoes'):
+                targets = list(range(n, len(mons))) if i < n else list(range(n))
         sign = 1 if i < n else -1
         if name in PROTECT:
             previous = any(e.get('side') == side and e.get('slot') == mons[i].get('slot', '')[-1:] and e.get('turn') == state.get('turn', 0) - 1 and to_id(e.get('move')) in PROTECT for e in state.get('history', []))
             if not previous:
                 protected.add(i)
             continue
+        if state.get('_strategic_v4'):
+            from ml.continuation import SETUP, RECOVERY, boosts, potential
+            if name in SETUP:
+                opposing = mons[n:] if i < n else mons[:n]
+                before = potential(mons[i], opposing, state, features, side, hit, speed)
+                mons[i]['boosts'] = boosts(mons[i], name)
+                after = potential(mons[i], opposing, state, features, side, hit, speed)
+                value += sign * .45 * (after - before) * availability[i]
+                continue
+            if name in RECOVERY:
+                hp[i] = min(1, hp[i] + .5 * availability[i])
+                set_health(mons[i], hp[i])
+                continue
         if name == 'wideguard':
             wide.add(side)
             continue
@@ -380,6 +425,22 @@ def simulate(ctx, ours, theirs, prepared, features, reverse_ties=False):
                 state['hazards'] = {**state.get('hazards', {}), side: list(state.get('hazards', {}).get(side, [])) + ['Tailwind']}
             after = initiative_value(ctx, mons[:n], mons[n:], state, features, room)
             value += .4 * (after - before)
+            continue
+        if state.get('_strategic_v2') and name in SLEEP:
+            for j in targets[:1]:
+                if j in protected or hp[j] <= 0:
+                    continue
+                defending = 'mine' if j < n else 'theirs'
+                if defending in redirects:
+                    redirect, powder = redirects[defending]
+                    immune = powder == 'ragepowder' and ('Grass' in features.species(mons[i].get('species', '')).get('types', []) or to_id(mons[i].get('item')) == 'safetygoggles' or to_id(mons[i].get('ability')) == 'overcoat')
+                    if hp[redirect] > 0 and not immune:
+                        j = redirect
+                if j in protected or 'substitute' in effects(mons[j].get('volatiles', [])) or 'safeguard' in effects(state.get('hazards', {}).get(defending, [])):
+                    continue
+                chance = sleep_probability(mons[i], mons[j], name, data, state, features) * availability[i]
+                value += sign * .25 * chance
+                availability[j] *= 1 - chance
             continue
         if name in ('thunderwave', 'willowisp', 'spore'):
             for j in targets[:1]:
@@ -421,7 +482,7 @@ def simulate(ctx, ours, theirs, prepared, features, reverse_ties=False):
             target_side = 'mine' if j < n else 'theirs'
             if spread and target_side in wide:
                 continue
-            amount = hit(mons[i], mons[j], name, data, state, features, side, spread and sum(hp[t] > 0 for t in targets) > 1) * helper.get(i, 1)
+            amount = hit(mons[i], mons[j], name, data, state, features, side, spread and sum(hp[t] > 0 for t in targets) > 1) * helper.get(i, 1) * availability[i]
             if amount <= 0:
                 continue
             before = hp[j]
@@ -447,6 +508,9 @@ def simulate(ctx, ours, theirs, prepared, features, reverse_ties=False):
     value -= sum((initial[j] - hp[j]) * (1 + .2 * role_value(ctx, ours[j][1], prepared, features)) +
                  (.9 + role_value(ctx, ours[j][1], prepared, features)) * (initial[j] > 0 and hp[j] == 0) for j in range(n))
     value -= .08 * sum(c[2] in PROTECT for c in ours)
+    if ctx.get('feature_profile') in ('strategic-v2', 'strategic-v3', 'strategic-v4'):
+        from ml.strategic_mechanics import unproductive_solo_protect
+        value -= unproductive_solo_protect(ctx, ours, mons[n:])
     # Residual damage makes a lost tempo turn consequential. Known healing is
     # included; undisclosed recovery and field-expiry timers remain uncertain.
     for i, mon in enumerate(mons):
@@ -534,6 +598,10 @@ def opening_score(ctx, choice, features):
 
 
 def score(ctx, choice, features):
+    if ctx.get('feature_profile') in ('strategic-v2', 'strategic-mechanics-v2', 'strategic-v3', 'strategic-v4'):
+        if '_strategic_v2_context' not in ctx:
+            ctx['_strategic_v2_context'] = {**ctx, 'state': {**ctx['state'], '_strategic_v2': True, '_strategic_v4': ctx.get('feature_profile') == 'strategic-v4'}}
+        ctx = ctx['_strategic_v2_context']
     if choice.startswith('team '):
         return opening_score(ctx, choice, features)
     return turn_score(ctx, choice, features)
