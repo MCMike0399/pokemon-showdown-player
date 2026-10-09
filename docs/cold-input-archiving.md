@@ -6,7 +6,7 @@ scout inputs. `scripts/archive_collection_inputs.py` compresses closed snapshots
 without changing the main experience database, candidate evaluation inputs,
 checkpoints, game recordings or training labels.
 
-The live processing storage limit is 100 GiB. Archiving preserves that limit;
+The live processing storage limit is 150 GiB (`resource.max_disk_gb`). Archiving preserves that limit;
 it does not increase CPU, GPU, memory or simulator allowances. Each archive is
 fully decompressed and checked against its original SHA-256 and byte count
 before removing the uncompressed duplicate. Its `.archive.json` records the
@@ -26,6 +26,24 @@ Apply a bounded batch while respecting the live resource configuration:
 .venv/bin/python scripts/archive_collection_inputs.py --apply --limit 16 \
   --respect-resource-budget --report data/ml/maintenance/cold-input-archive-latest.json
 ```
+
+## Compaction under storage pressure
+
+Finished candidate evaluations keep a frozen input database under
+`data/ml/candidates/*/evaluation-inputs/` (about 300-600 MB each). With
+`--when-over F`, when the data root exceeds `F x max_disk_gb` these snapshots are
+also compacted (oldest first, same byte-exact verification), until use falls
+below `--target x max_disk_gb` (default .75). A candidate is eligible only after
+its `report.json` exists. Snapshots that still have a journal or an open reader
+are skipped.
+
+```sh
+.venv/bin/python scripts/archive_collection_inputs.py --apply --limit 16 \
+  --respect-resource-budget --when-over .85 --target .75 \
+  --report data/ml/maintenance/cold-input-archive-latest.json
+```
+
+The `dev.burbuja.pokemon-cold-archive` LaunchAgent runs this every 900 s.
 
 The command uses one low-priority process and an exclusive archive lock.
 Running jobs, missing completion reports, symlinks, nonempty SQLite journals

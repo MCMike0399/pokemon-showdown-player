@@ -1,7 +1,8 @@
 """Lossless, reversible archival of completed collection inference snapshots.
 
-Never archives the main experience DB, live/queued/running collection inputs,
-evaluation inputs or checkpoints. Every byte is round-trip verified before the
+Under storage pressure (--when-over), finished candidates' frozen evaluation
+input snapshots are compacted too. Never archives the main experience DB,
+live/queued/running inputs, unfinished candidates or checkpoints. Every byte is round-trip verified before the
 uncompressed duplicate is removed. Default is a dry run.
 """
 import argparse
@@ -44,6 +45,24 @@ def eligible(root):
     db.close();return result
 
 
+def eligible_candidates(root):
+    """Finished candidate evaluations: their frozen input DB snapshot is never written again."""
+    result=[]
+    for folder in sorted((root/'candidates').iterdir()) if (root/'candidates').exists() else []:
+        source=folder/'evaluation-inputs/experience.sqlite3'
+        if not source.is_file() or source.is_symlink() or not (folder/'report.json').is_file():continue
+        if any(Path(str(source)+suffix).exists() and Path(str(source)+suffix).stat().st_size for suffix in ['-wal','-journal']):continue
+        result.append((source,'candidate:'+folder.name))
+    # Oldest first: the most recent evaluations are the likeliest to be inspected.
+    result.sort(key=lambda item:item[0].stat().st_mtime)
+    return result
+
+
+def data_gb(root):
+    out=subprocess.run(['du','-sk',str(root)],capture_output=True,text=True)
+    return int(out.stdout.split()[0])/2**20 if out.returncode==0 and out.stdout else 0.0
+
+
 def opened_paths(paths):
     executable=shutil.which('lsof')
     if not executable:raise RuntimeError('lsof required to verify snapshots are not open')
@@ -81,11 +100,14 @@ def archive(source,job,root):
         if verified!=hasher.hexdigest() or verified_size!=size:raise ValueError('archive roundtrip failed')
         current=source.stat()
         if (before.st_ino,before.st_mtime_ns,before.st_size)!=(current.st_ino,current.st_mtime_ns,current.st_size):raise ValueError('snapshot changed during archive')
-        db=sqlite3.connect((root/'experience.sqlite3').resolve().as_uri()+'?mode=ro',uri=True)
-        try:
-            row=db.execute('SELECT status FROM jobs WHERE id=?',(job,)).fetchone()
-            if not row or row[0]!='complete':raise ValueError('collection is no longer terminal')
-        finally:db.close()
+        if job.startswith('candidate:'):
+            if not (source.parent.parent/'report.json').is_file():raise ValueError('candidate is no longer terminal')
+        else:
+            db=sqlite3.connect((root/'experience.sqlite3').resolve().as_uri()+'?mode=ro',uri=True)
+            try:
+                row=db.execute('SELECT status FROM jobs WHERE id=?',(job,)).fetchone()
+                if not row or row[0]!='complete':raise ValueError('collection is no longer terminal')
+            finally:db.close()
         if str(source.resolve()) in opened_paths([source]):raise ValueError('snapshot opened during archive')
         if any(Path(str(source)+suffix).exists() and Path(str(source)+suffix).stat().st_size for suffix in ['-wal','-journal']):raise ValueError('snapshot gained a journal')
         info={'original':source.name,'job':job,'sha256':verified,'original_bytes':size,'gzip_bytes':temporary.stat().st_size,'compression':'gzip-level3','byte_exact_verified':True}
@@ -122,32 +144,51 @@ def restore(zipped):
     return {'restored':str(source),'sha256':meta['sha256']}
 
 
-def run(root,apply,limit,respect_budget=False):
-    paths=eligible(root);opened=opened_paths([p for p,_ in paths]) if paths else set();paths=[(p,j) for p,j in paths if str(p.resolve()) not in opened]
+def run(root,apply,limit,respect_budget=False,when_over=None,target=None):
+    """Collections are always eligible. When data use exceeds `when_over` x budget,
+    finished candidate snapshots are compacted too, until use falls below `target` x budget."""
+    paths=eligible(root)
+    budget=None;used=None;pressure=False
+    if when_over is not None:
+        from ml.continuous import LearningConfig
+        budget=float(LearningConfig.load(root).resource['max_disk_gb']);used=data_gb(root)
+        pressure=used>when_over*budget
+        if pressure:paths=paths+eligible_candidates(root)
+    opened=opened_paths([p for p,_ in paths]) if paths else set();paths=[(p,j) for p,j in paths if str(p.resolve()) not in opened]
     if limit:paths=paths[:limit]
     policy=None
     if respect_budget:
         from ml.continuous import LearningConfig
         from ml.resources import ResourcePolicy
         policy=ResourcePolicy(**LearningConfig.load(root).resource)
-    result={'eligible':len(paths),'eligible_bytes':sum(p.stat().st_size for p,_ in paths),'applied':apply,'archives':[]}
+    result={'eligible':len(paths),'eligible_bytes':sum(p.stat().st_size for p,_ in paths),'applied':apply,'archives':[],
+            'data_gb':None if used is None else round(used,3),'budget_gb':budget,'storage_pressure':pressure}
     if apply:
+        freed=0
         for path,job in paths:
+            if pressure and target is not None and job.startswith('candidate:') and used-freed/2**30<target*budget:
+                result['reached_target']=True;break
             if policy:
                 resources=policy.sample()
                 if not resources['training_allowed']:
                     result.update(deferred=True,reason='host resource budget',resources=resources);break
-            result['archives'].append(archive(path,job,root))
+            entry=archive(path,job,root)
+            freed+=entry.get('saved_bytes',0)
+            result['archives'].append(entry)
             print(json.dumps(result['archives'][-1]),flush=True)
+        result['freed_gb']=round(freed/2**30,3)
     return result
 
 
 if __name__=='__main__':
-    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,default=ROOT/'data/ml');p.add_argument('--apply',action='store_true');p.add_argument('--limit',type=int,default=0);p.add_argument('--respect-resource-budget',action='store_true');p.add_argument('--restore',type=Path);p.add_argument('--report',type=Path,required=True);a=p.parse_args()
+    p=argparse.ArgumentParser();p.add_argument('--root',type=Path,default=ROOT/'data/ml');p.add_argument('--apply',action='store_true');p.add_argument('--limit',type=int,default=0);p.add_argument('--respect-resource-budget',action='store_true');p.add_argument('--restore',type=Path);p.add_argument('--report',type=Path,required=True)
+    p.add_argument('--when-over',type=float,help='Also compact finished candidate snapshots when data use exceeds this fraction of max_disk_gb')
+    p.add_argument('--target',type=float,default=.75,help='Stop candidate compaction below this fraction of max_disk_gb');a=p.parse_args()
+    if a.when_over is not None and not 0<a.target<a.when_over<=1:p.error('need 0 < target < when-over <= 1')
     if a.limit<0:p.error('limit must be nonnegative')
     a.report.parent.mkdir(parents=True,exist_ok=True)
     os.nice(15)
     with (a.root/'cold-input-archive.lock').open('a') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        r=restore(a.restore) if a.restore else run(a.root,a.apply,a.limit,a.respect_resource_budget)
+        r=restore(a.restore) if a.restore else run(a.root,a.apply,a.limit,a.respect_resource_budget,a.when_over,a.target if a.when_over is not None else None)
     a.report.write_text(json.dumps(r,indent=2));print(json.dumps({k:v for k,v in r.items() if k!='archives'}))

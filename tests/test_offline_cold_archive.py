@@ -90,3 +90,29 @@ def test_scheduled_archival_defers_to_resource_guard(closed_snapshot,monkeypatch
     monkeypatch.setattr(ResourcePolicy,'sample',lambda self:{'training_allowed':False})
     result=archive.run(root,True,16,respect_budget=True)
     assert result['deferred'] and result['archives']==[] and source.exists()
+
+
+def _candidate(root, name, finished=True):
+    folder=root/'candidates'/name;(folder/'evaluation-inputs').mkdir(parents=True)
+    if finished:(folder/'report.json').write_text('{}')
+    source=folder/'evaluation-inputs/experience.sqlite3'
+    with sqlite3.connect(source) as db:
+        db.execute('CREATE TABLE t(v TEXT)');db.execute('INSERT INTO t VALUES(?)',('frozen input '*3000,))
+    return source
+
+
+def test_candidate_snapshots_compact_only_under_storage_pressure(closed_snapshot,monkeypatch):
+    root,source=closed_snapshot
+    done=_candidate(root,'finished');running=_candidate(root,'running',finished=False)
+    original=done.read_bytes()
+    monkeypatch.setattr('ml.continuous.LearningConfig.load',lambda r:type('C',(),{'resource':{'max_disk_gb':150.0}})())
+    # Below the trigger: only completed collections are archived, candidates untouched.
+    monkeypatch.setattr(archive,'data_gb',lambda r:100.0)
+    result=archive.run(root,True,16,when_over=.85,target=.75)
+    assert not result['storage_pressure'] and done.exists() and not source.exists()
+    # Over the trigger: finished candidate snapshots compact losslessly; running ones never.
+    monkeypatch.setattr(archive,'data_gb',lambda r:140.0)
+    result=archive.run(root,True,16,when_over=.85,target=.75)
+    assert result['storage_pressure'] and not done.exists() and running.exists()
+    archive.restore(Path(str(done)+'.gz'))
+    assert done.read_bytes()==original

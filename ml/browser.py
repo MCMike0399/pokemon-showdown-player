@@ -134,6 +134,8 @@ class BrowserPlayer:
         if decision_interval < 0:
             raise ValueError('decision interval must be nonnegative')
         self.page, self.brain = page, brain
+        # Optional async ctx -> choice override (search agent); never recorded.
+        self.decider = None
         self.decision_interval = decision_interval
         self.last_submission = 0.0
         self.answered = set()
@@ -156,6 +158,12 @@ class BrowserPlayer:
         return snapshot
 
     async def login(self, username, password):
+        # A persistent profile re-authenticates on its own a few seconds after
+        # load; let that finish instead of racing it with the login form.
+        try:
+            await self.page.wait_for_function("() => app.user.get('named')", timeout=10000)
+        except Exception:
+            pass
         identity = await self.page.evaluate("() => ({name:app.user.get('name'),named:app.user.get('named')})")
         if identity['named']:
             if to_id(identity['name']) != to_id(username):
@@ -216,7 +224,7 @@ class BrowserPlayer:
         # A locator can wait while a newer request arrives. Cancel the click at
         # DOM dispatch time as well as checking freshness before selecting it.
         await self.page.evaluate(r"""s => {
-            window.__psBrowserClickGuard = {room:s.room, request:JSON.stringify(s.request), blocked:false};
+            window.__psBrowserClickGuard = {room:s.room, rqid:(s.request||{}).rqid, blocked:false};
             if (window.__psBrowserGuardInstalled) return;
             window.__psBrowserGuardInstalled = true;
             document.addEventListener('click', e => {
@@ -224,7 +232,9 @@ class BrowserPlayer:
                 if (!g) return;
                 const r=app.rooms[g.room];
                 if (!r || !r.el.contains(e.target)) return;
-                if (JSON.stringify(r.request)!==g.request || (r.choice && r.choice.waiting)) {
+                // The client annotates its request copy while rendering; only the
+                // server request id identifies a newer request.
+                if (!r.request || r.request.rqid!==g.rqid || (r.choice && r.choice.waiting)) {
                     g.blocked=true; e.preventDefault(); e.stopImmediatePropagation();
                 }
             }, true);
@@ -236,24 +246,35 @@ class BrowserPlayer:
 
     async def _submit(self, snapshot, choice):
         room = snapshot['room']
-        key = request_key(snapshot)
+        key = (snapshot.get('request') or {}).get('rqid')
         if choice not in legal_choices(snapshot.get('request')):
             raise ValueError('model choice is outside the legal request mask')
         current = await self.snapshot(room)
-        if request_key(current) != key or current.get('waiting') or current.get('partial'):
+        if (current.get('request') or {}).get('rqid') != key or current.get('waiting') or current.get('partial'):
             raise ValueError('request changed or browser already has a choice')
         root = self.page.locator(f'[id="room-{room}"]')
 
         async def click(name, value):
-            await root.locator(f'button[name="{name}"][value="{value}"]').click(timeout=10000)
+            await root.locator(f'button[name="{name}"][value="{value}"]').click(timeout=90000)
             if await self.page.evaluate('() => !!window.__psBrowserClickGuard?.blocked'):
                 raise ValueError('request changed while waiting for browser control')
 
         if choice.startswith('team '):
             for number in map(int, choice[5:].split(',')):
                 current = await self.snapshot(room)
-                if request_key(current) != key or current.get('waiting'):
+                if (current.get('request') or {}).get('rqid') != key or current.get('waiting'):
                     raise ValueError('request changed during preview clicks')
+                # The client builds its preview choice when controls render; a fast
+                # decision can arrive first, so wait for the order to exist.
+                for _ in range(40):
+                    if current.get('previewOrder'):
+                        break
+                    await asyncio.sleep(.25)
+                    current = await self.snapshot(room)
+                    if (current.get('request') or {}).get('rqid') != key or current.get('waiting'):
+                        raise ValueError('request changed during preview clicks')
+                if not current.get('previewOrder'):
+                    raise ValueError('team preview controls never rendered')
                 # Buttons index the dynamically reordered preview, not the party.
                 position = current['previewOrder'].index(number)
                 await click('chooseTeamPreview', position)
@@ -265,7 +286,7 @@ class BrowserPlayer:
                 if tokens[0] == 'default':
                     raise ValueError('default has no explicit browser control; stop for inspection')
                 current = await self.snapshot(room)
-                if request_key(current) != key or current.get('waiting'):
+                if (current.get('request') or {}).get('rqid') != key or current.get('waiting'):
                     raise ValueError('request changed during action clicks')
                 if tokens[0] == 'switch':
                     select = root.locator('button[name="selectSwitch"]:visible')
@@ -292,8 +313,8 @@ class BrowserPlayer:
                     if target is not None:
                         await click('chooseMoveTarget', int(target))
         # An incomplete click sequence never counts as a submitted action.
-        await self.page.wait_for_function("s => {const r=app.rooms[s.room];return r && ((r.choice && r.choice.waiting) || r.battle.ended || (r.request && r.request.rqid !== s.rqid));}", arg={'room': room, 'rqid': key[0]}, timeout=10000)
-        self.log('submitted', room=room, request_id=key[0], choice=choice)
+        await self.page.wait_for_function("s => {const r=app.rooms[s.room];return r && ((r.choice && r.choice.waiting) || r.battle.ended || (r.request && r.request.rqid !== s.rqid));}", arg={'room': room, 'rqid': key}, timeout=10000)
+        self.log('submitted', room=room, request_id=key, choice=choice)
 
     async def play(self, room, fmt, *, sets=None, timeout=180, record=True):
         if self.brain is None:
@@ -315,6 +336,16 @@ class BrowserPlayer:
                     self.brain.reject(room, side, reason='browser-unconfirmed-terminal-proposal')
                 user = next((line.split('|')[3] for line in snapshot['log'] if line.startswith('|player|' + side + '|')), snapshot['user']['name'])
                 saved = self.brain.finish(room, outcome, user, side, public_log=snapshot['log'])
+                if self.decider is not None:
+                    # Search games are not PPO episodes, but their public log still
+                    # feeds the store (scout samples, opponent sets, learning data).
+                    try:
+                        from ml.scout import ingest_public
+                        saved = {**(saved or {}), 'public_experience': ingest_public(
+                            self.brain.store, fmt, snapshot['log'], 'own-live-game', 'own-' + room,
+                            features=self.brain.features)}
+                    except Exception as error:
+                        saved = {**(saved or {}), 'public_experience': {'imported': False, 'error': type(error).__name__}}
                 self.log('terminal', result=outcome, experience=saved, log=snapshot['log'])
                 return outcome
             key = request_key(snapshot)
@@ -370,11 +401,27 @@ class BrowserPlayer:
                     if fingerprint(saved.get('snapshot', {}).get('request')) != fingerprint(ctx['request']):
                         raise ValueError('recovered request differs from the recorded proposal; inspect before resuming')
                     decision = {'choice': saved['choice'], 'recorded': True, 'recovered': True}
+                elif self.decider is not None:
+                    if record:
+                        raise ValueError('search decisions are not PPO recordings; use --no-record')
+                    started = time.perf_counter()
+                    decision = {'choice': await self.decider(ctx), 'revision': pinned[0], 'recorded': False,
+                                'decider': getattr(self.decider, '__name__', 'search'),
+                                'inference_ms': round((time.perf_counter() - started) * 1000, 1)}
                 else:
                     decision = self.brain.decide(ctx, explore=record, record=record)
                 if not decision.get('recovered') and decision['revision'] != pinned[0]:
                     raise ValueError('checkpoint changed during model inference')
                 self.log('decision', room=room, request=ctx['request'], state=ctx['state'], decision=decision)
+                if self.decider is not None:
+                    # Search thinks for seconds; the client may rewrite its copy of
+                    # the same server request meanwhile. Submit against a fresh
+                    # snapshot of that same request id, never a newer request.
+                    fresh = await self.snapshot(room)
+                    if ((fresh.get('request') or {}).get('rqid') != (snapshot.get('request') or {}).get('rqid')
+                            or fresh.get('waiting') or decision['choice'] not in legal_choices(fresh.get('request'))):
+                        raise ValueError('request changed during search; inspect before resuming')
+                    snapshot = fresh
                 await self.submit(snapshot, decision['choice'])
                 self.last_submission = time.monotonic()
                 if decision.get('recorded'):

@@ -18,6 +18,10 @@ Always-on use: [OpenClaw decision/team workflow](docs/agent-workflow.md) ·
 [Programmatic browser play](docs/browser-play.md) uses Playwright clicks and the
 same local model for decisions, without OpenClaw or per-turn LLM calls.
 
+[Simulator search agent](docs/search-agent.md) (`--search`) decides each turn by
+simulating every action pair in the official engine over opponent sets sampled from
+ladder usage statistics: 30 wins vs the PPO policy's 19 on the same 45 real-team games.
+
 ## What's here
 - `ps_client.py` - async client over wss://sim3.psim.us/showdown/websocket (SockJS).
   Handles challstr, login (assertion), rooms, message buffering and battle state.

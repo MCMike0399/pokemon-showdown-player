@@ -76,6 +76,21 @@ async def run(args):
                     await page.goto('https://play.pokemonshowdown.com/', wait_until='domcontentloaded')
                     await page.wait_for_function('window.app && app.user && window.BattleFormats')
                     player = BrowserPlayer(page, None if args.inspect else Brain(Store(args.root)), log_path=output / 'events.jsonl')
+                    agent = None
+                    if args.search and not args.inspect:
+                        from search.agent import SearchAgent
+                        brain = player.brain
+
+                        async def preview(ctx):
+                            return brain.decide(ctx, explore=False, record=False)['choice']
+                        agent = SearchAgent(fmt=args.format, worlds=args.search_worlds, engines=args.search_engines,
+                                            screen={'probe': 4, 'keep_opp': 20, 'keep_ours': 24}, preview=preview,
+                                            seed=int(time.time()))
+
+                        async def search_decider(ctx):
+                            return await agent.decide(ctx)
+                        player.decider = search_decider
+                        player.log('search_agent', worlds=args.search_worlds, engines=args.search_engines)
                     if args.inspect:
                         # Read-only transport smoke: no login, matchmaking or moves.
                         print(json.dumps(await page.evaluate("() => ({client:!!app.rooms, named:!!app.user.get('named'), title:document.title})")))
@@ -124,6 +139,10 @@ async def run(args):
                         outcome = await player.play(room, args.format, sets=team['sets'] if team else None,
                                                     timeout=args.stall_timeout, record=not args.no_record)
                         print(json.dumps({'game': game + 1, 'result': outcome}), flush=True)
+                    if agent is not None:
+                        player.log('search_stats', **{k: v for k, v in agent.stats.items() if k != 'errors'},
+                                   errors=agent.stats['errors'][-20:])
+                        await agent.close()
                     player.log('stopped', finish_active_game=True)
                     print('Browser run stopped; evidence: ' + str(output), flush=True)
                 finally:
@@ -148,6 +167,9 @@ def parser():
     p.add_argument('--chrome', action='store_true', help='Use installed Google Chrome')
     p.add_argument('--inspect', action='store_true', help='Read-only browser check; no login or games')
     p.add_argument('--no-record', action='store_true', help='Greedy inference without PPO recording')
+    p.add_argument('--search', action='store_true', help='Decide turns with the simulator search agent (implies --no-record)')
+    p.add_argument('--search-worlds', type=int, default=6, help='Determinized opponent worlds per decision')
+    p.add_argument('--search-engines', type=int, default=3, help='Parallel search engine processes')
     p.add_argument('--search-timeout', type=int, default=120)
     p.add_argument('--stall-timeout', type=int, default=180)
     p.add_argument('--game-delay', type=float, default=30, help='Seconds between completed games and the next search')
@@ -161,6 +183,10 @@ if __name__ == '__main__':
         p.error('games must be 1..1000 and timeouts 5..600 seconds')
     if not 0 <= args.game_delay <= 3600:
         p.error('game delay must be 0..3600 seconds')
+    if args.search:
+        args.no_record = True
+        if not 1 <= args.search_worlds <= 32 or not 1 <= args.search_engines <= 8:
+            p.error('search worlds must be 1..32 and engines 1..8')
     if not args.format.isalnum() or (args.room and not all(c.isalnum() or c == '-' for c in args.room)):
         p.error('format and room must be Showdown identifiers')
     asyncio.run(run(args))
