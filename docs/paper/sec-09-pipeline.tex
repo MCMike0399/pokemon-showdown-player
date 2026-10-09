@@ -1,0 +1,254 @@
+\section{The training pipeline on CPU and Apple MPS}
+\label{sec:pipeline}
+
+\subsection{From a game to a deployed checkpoint}
+Figure~\ref{fig:pipeline} traces one unit of experience through the pipeline.
+Each arrow is a durable hand-off: a SQLite row, a job, a file written by
+atomic replacement, or a lease. A crash at any point therefore leaves either
+the old state or the new one, and the next supervisor tick resumes from it.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[x=1cm,y=1cm,
+  pstep/.style={box,text width=33mm,minimum height=13mm},
+  pgate/.style={warmbox,text width=33mm,minimum height=13mm}]
+  \node[pstep] (c) at (0,0) {\textbf{1 Collect} (CPU)\\self-play, sampled\\at $\tau=0.25$};
+  \node[pstep] (q) at (4.4,0) {\textbf{2 Queue}\\complete episodes\\and a \code{learn} job};
+  \node[pgate] (g) at (8.8,0) {\textbf{3 Learner gates}\\nothing staged; $<2$\\in flight; $\ge256$ steps};
+  \node[pgate] (v) at (13.2,0) {\textbf{4 Validate}\\quality checks;\\likelihood $\le10^{-4}$};
+  \node[pstep] (p) at (13.2,-2.6) {\textbf{5 PPO} (MPS)\\GAE, 4 epochs,\\KL stop at 0.03};
+  \node[pstep] (s) at (8.8,-2.6) {\textbf{6 Save candidate}\\mark consumed;\\freeze inputs; scout};
+  \node[pstep] (e) at (4.4,-2.6) {\textbf{7 Evaluate} (CPU)\\incumbent, then\\candidate, paired};
+  \node[pgate] (pg) at (0,-2.6) {\textbf{8 Paired gate}\\margin $\lceil nm\rceil$ and\\sign test $p\le0.05$};
+  \node[pstep] (r) at (0,-5.4) {\textbf{9 Stage}\\ready slot, SHA-256,\\source generation};
+  \node[pgate] (pr) at (4.4,-5.4) {\textbf{10 Promote}\\between games, no\\pending ladder game};
+  \node[pstep] (d) at (8.8,-5.4) {\textbf{11 Reload}\\the actor reloads\\by revision};
+  \node[box,text width=33mm,minimum height=13mm,draw=muted,fill=white] (rej) at (13.2,-5.4) {\textcolor{muted}{Rejected candidate}\\\textcolor{muted}{kept for audit}};
+  \draw[arr] (c)--(q); \draw[arr] (q)--(g); \draw[arr] (g)--(v); \draw[arr] (v)--(p);
+  \draw[arr] (p)--(s); \draw[arr] (s)--(e); \draw[arr] (e)--(pg);
+  \draw[arr] (pg)-- node[note,left]{pass} (r); \draw[arr] (r)--(pr); \draw[arr] (pr)--(d);
+  \draw[darr] (pg.south east) |- node[note,above,pos=.75]{fail} (13.2,-4.0) -- (rej.north);
+  \draw[darr] (d.south) -- ++(0,-1.0) -| node[note,below,pos=.25]{the new incumbent collects the next batch} (-2.3,0) -- (c.west);
+  \draw[darr] (g.north) to[out=90,in=90,looseness=.6] node[note,above]{defer and retry later} (q.north);
+\end{tikzpicture}}
+\caption{The lifecycle of experience. Orange boxes are gates that can stop
+the flow. Steps 1 and 7 run on the CPU, step 5 on the MPS GPU. Promotion
+(step 10) is called by the player between games, never by a worker. Episodes
+are marked consumed when the candidate is saved, before it is evaluated, so
+``trained'' means \emph{used for a candidate}, not \emph{deployed}.}
+\label{fig:pipeline}
+\end{figure}
+
+\paragraph{Collection.} The collector snapshots the incumbent and freezes
+its inference inputs. It then plays \code{simulation_games} games (default
+24) in waves of spawned one-thread processes. Each process drives the
+official \code{BattleStream} through \code{simulator.cjs} and observes only
+its own player stream. The \code{ladder-v1} curriculum cycles the opponent
+through
+\[
+  (\text{self},\ \text{tactical},\ \text{heuristic},\ \text{self},\ \text{tactical},\ \text{random},\ \text{heuristic},\ \text{tactical}),
+\]
+with index $(\lfloor i/|\text{teams}|\rfloor+\text{seed})\bmod8$, so one
+opponent completes a sweep of the team pool before the next takes over. In
+each cycle that is 2/8 self-play against the frozen incumbent, 3/8 tactical,
+2/8 heuristic and 1/8 random. Open team sheets are drawn with probability
+0.08. Sides alternate as $(i+\lfloor i/|\text{teams}|\rfloor)\bmod2$. Seeds
+are 64-bit, split into four 16-bit words. An earlier encoding used only 16
+bits and was retired.
+
+\paragraph{Learning.} The learner applies the gates of step~3, the
+validation of step~4 and the loss of Section~\ref{sec:learning}. It runs on
+the device chosen by \code{backend_for}. In automatic mode MPS is chosen only
+if its benchmarked time is at most 0.85 of the CPU time. Any device error
+retrains the same batch from the incumbent on the CPU. For the strategic
+profiles the learner then refreshes the candidate's embedded
+\code{strategy_knowledge} with new ladder postgame counts. It also trains the
+public-move scout on the same lane.
+
+\paragraph{Evaluation.} Incumbent and candidate are frozen CPU snapshots.
+They play $n$ games each (60 in the deployed configuration; default 20), on
+seeds $s_0+100000+i$ derived from the job identity. Actions are sampled at the
+checkpoint temperature. Both panels face the same frozen \code{self} snapshot
+and the same frozen inputs. Panels resume after interruption. The evaluator
+abandons a plan if the source generation, parent revision or candidate hash
+has changed.
+
+\subsection{Three lanes on one laptop}
+Figure~\ref{fig:lanes} shows how the work is shared out in time. A supervisor
+under launchd \code{KeepAlive} wakes every 15\,s. It reloads the autopilot
+settings, samples resources, enqueues daily feeds and collection, and starts at
+most one child per lane, running \code{python -m ml.worker --lane} with the
+lane name (\code{collector}, \code{learner} or \code{evaluator}). Each child takes
+its own lock and claims jobs atomically with \code{BEGIN IMMEDIATE}. A job's
+lease is its time budget plus 60\,s. A job can be claimed while its attempt
+count is below three, and a deferral gives its attempt back, so deferrals do
+not exhaust a job.
+A child exits after its time budget, and the next tick replaces it.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \def\W{14.2}
+  \foreach \y/\name in {0/{Supervisor\\(CPU)},-1.25/{Collector\\(CPU)},-2.5/{Learner\\(MPS GPU)},-3.75/{Evaluator\\(CPU)},-5.0/{Live runner\\(CPU + Node)}}{
+    \draw[lane] (0,\y-0.45) rectangle (\W,\y+0.45);
+    \node[lanelabel] at (-0.15,\y) {\name};
+  }
+  % supervisor ticks
+  \foreach \x in {0.3,1.3,...,13.3}{ \fill[accent] (\x,0) circle (1.6pt); }
+  \node[note,anchor=west] at (13.45,0) {15\,s};
+  % collector
+  \fill[pale,draw=ink] (0.3,-1.6) rectangle (4.6,-0.9); \node[font=\scriptsize] at (2.45,-1.25) {rollouts: 24 games, spawned};
+  \fill[pale,draw=ink] (8.4,-1.6) rectangle (12.6,-0.9); \node[font=\scriptsize] at (10.5,-1.25) {next collection (new incumbent)};
+  % learner
+  \fill[warm,draw=seriesB!70!black] (4.8,-2.85) rectangle (6.2,-2.15); \node[font=\scriptsize] at (5.5,-2.5) {PPO};
+  \fill[warm,draw=seriesB!70!black] (6.3,-2.85) rectangle (7.0,-2.15); \node[font=\scriptsize] at (6.65,-2.5) {scout};
+  \node[note,anchor=north] at (5.9,-2.9) {seconds per batch};
+  % evaluator
+  \fill[paleink,draw=ink] (7.1,-4.1) rectangle (9.9,-3.4); \node[font=\scriptsize] at (8.5,-3.75) {incumbent panel ($n$)};
+  \fill[paleink,draw=ink] (10.0,-4.1) rectangle (12.8,-3.4); \node[font=\scriptsize] at (11.4,-3.75) {candidate panel ($n$)};
+  \fill[warm,draw=seriesB!70!black] (12.9,-4.1) rectangle (13.7,-3.4); \node[font=\scriptsize] at (13.3,-3.75) {gate};
+  % live runner
+  \foreach \a/\b in {0.3/2.6,3.1/5.6,6.1/8.2,8.7/11.3,11.8/13.9}{
+    \fill[white,draw=muted] (\a,-5.35) rectangle (\b,-4.65);
+  }
+  \node[font=\scriptsize,text=muted] at (1.45,-5.0) {game};
+  \node[font=\scriptsize,text=muted] at (12.85,-5.0) {game};
+  \draw[arr] (4.6,-1.25) to[out=0,in=180] (4.8,-2.5);
+  \draw[arr] (7.0,-2.5) to[out=0,in=180] (7.1,-3.75);
+  \draw[darr,draw=seriesB] (13.3,-4.1) to[out=-90,in=90] node[note,right,pos=.6,text=seriesB!80!black]{staged} (11.55,-4.62);
+  \node[note,text=seriesB!80!black] at (11.55,-5.65) {promoted in the gap between games};
+\end{tikzpicture}}
+\caption{Schematic timeline of the lanes; durations are not to scale. The
+collector and evaluator share one pool of simulator slots. Within the default
+budget of four, the evaluator gets half (calibrated locally to three) and the
+collector the rest. The learner owns the GPU. The live runner is outside the
+pipeline and only ever consumes a staged candidate at a game boundary.}
+\label{fig:lanes}
+\end{figure}
+
+\subsection{Resource admission}
+Every lane re-samples the host before starting work and at minibatch
+checkpoints. With $C$ logical cores, a measured CPU load of $u$ percent,
+available memory $F$\,GiB, $r$ resident workers and an estimated $m$\,MiB per
+worker, the allowed simulator worker count is
+\begin{align}
+  W_{\mathrm{mem}}&=\max\!\big(0,\lfloor(F-F_{\min})1024/m\rfloor+r\big),\qquad
+  W_{\mathrm{cpu}}=\max\!\big(0,\lfloor(u_{\max}-u)C/100\rfloor\big),\\
+  W&=\mathbf 1[\text{healthy}]\cdot\max\!\big(0,\min[W_{\max},\,C-C_{\mathrm{res}},\,W_{\mathrm{mem}},\,W_{\mathrm{cpu}}]\big),
+\end{align}
+where \emph{healthy} means $F\ge F_{\min}$, $u<u_{\max}$, swap-out below its
+limit, no critical memory pressure (macOS
+\code{kern.memorystatus_vm_pressure_level} flag value~4), and at least 2\,GiB
+of free disk. ``Yellow'' pressure (flag value~2) is allowed; only ``red''
+blocks. The code
+defaults are $C_{\mathrm{res}}=3$, $F_{\min}=2$\,GiB, $W_{\max}=4$,
+$u_{\max}=75\%$, $m=400$\,MiB and swap-out 32\,MiB/s. The deployment uses a
+modestly higher CPU ceiling and a calibrated swap limit. Optional work also
+stops above 90\% of the storage budget (Figure~\ref{fig:storage}).
+
+\begin{proposition}[Headroom invariants]
+\label{prop:headroom}
+Whenever $W>0$:
+\begin{enumerate}
+  \item at most $C-C_{\mathrm{res}}$ simulator workers run, so $C_{\mathrm{res}}$
+    cores stay free of simulator workers;
+  \item if each \emph{new} worker uses at most $m$\,MiB, launching $W-r$ of them
+    leaves at least $F_{\min}$ GiB available;
+  \item if each worker adds at most $100/C$ percentage points of load (one core),
+    the projected load $u+100W/C$ stays at or below $u_{\max}$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(1) $W\le C-C_{\mathrm{res}}$. (2) $W-r\le\lfloor(F-F_{\min})1024/m\rfloor$, so
+$(W-r)m/1024\le F-F_{\min}$. (3) $W\le\lfloor(u_{\max}-u)C/100\rfloor$ gives
+$100W/C\le u_{\max}-u$.
+\end{proof}
+
+\intuition{The memory term credits resident workers, whose memory is already
+counted in $F$. The CPU term does not credit them, even though their load is
+already in $u$. It is therefore conservative and can under-admit while workers
+are running. These are cooperative limits enforced by the application, not OS
+quotas. Another service can still take the headroom between samples, and the
+5-second re-sampling only bounds how long that can go unnoticed.}
+
+\subsection{The MPS lane}
+The learner calls
+\code{torch.mps.set_per_process_memory_fraction(0.12)}, which caps its Metal
+allocations at 12\% of the device's recommended working-set size
+\citep{pytorchmps}. Its thread count is limited and it runs at
+\code{nice} 10. A GPU duty fraction $d\in(0,1]$ throttles training. After each
+optimizer step the learner synchronizes with Metal, measures the step's busy
+time $e_k$, and sleeps
+\begin{equation}
+  s_k=e_k\Big(\frac1d-1\Big).
+\end{equation}
+
+\begin{proposition}[Duty cycle]
+\label{prop:duty}
+Under this rule each step, and therefore any union of steps, has busy fraction
+exactly $d$: $\sum_ke_k/\sum_k(e_k+s_k)=d$.
+\end{proposition}
+\begin{proof}
+$e_k+s_k=e_k/d$, so $\sum_k(e_k+s_k)=\sum_ke_k/d$.
+\end{proof}
+The proposition concerns wall-clock time inside the training loop, measured
+after synchronization. It is not a statement about instantaneous GPU
+utilization, which the application cannot observe. The default is $d=0.5$.
+For these small cached batches, half duty cost several times the full-duty
+time: 34.99 vs.\ 7.45\,ms per update in Table~\ref{tab:bench}, which is more
+than the factor of two Proposition~\ref{prop:duty} accounts for. The
+deployment therefore runs at full duty and relies on the memory cap and the
+admission guards (\code{docs/offline-ppo-followup.md}).
+
+\subsection{The tensor cache}
+Rebuilding Python feature lists dominated training time, so batches are
+converted to tensors once. With $N$ steps and at most $C$ candidates per step,
+the resident footprint in float32 is
+$N(384\cdot4+C(192\cdot4+1)+8)$ bytes. The extra byte per candidate is its mask
+entry and the 8 bytes per step hold the index. The batch is kept on the device
+if this is at most $2^{27}$ bytes (128\,MiB). Otherwise a bounded CPU LRU cache
+transfers minibatches one at a time.
+
+\begin{example}[When a batch stays resident]
+A batch containing a 360-candidate preview has $C=360$, so each step costs
+$1536+360\cdot769+8=278{,}384$ bytes. The residency limit is
+$\lfloor2^{27}/278{,}384\rfloor=482$ steps. Recent production batches of 404
+and 415 steps were resident; a 617-step batch used the CPU cache.
+\end{example}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrr}
+\toprule
+64-decision batch, up to 360 choices & Before cache (ms/update) & After cache (ms/update) \\
+\midrule
+CPU & 43.08 & 14.08 \\
+MPS, 50\% duty & 121.61 & 34.99 \\
+MPS, full duty & 44.06 & 7.45 \\
+\bottomrule
+\end{tabular}
+\caption{Bounded M5 timing windows from \code{docs/m5-learning-orchestration-research.md}.
+They were measured while other workloads ran, so they are diagnostic timings
+rather than randomized comparisons. A raw kernel benchmark favoured MPS by
+only 1.057 vs.\ 1.512\,ms; most of the speedup came from caching.}
+\label{tab:bench}
+\end{table}
+
+\subsection{Safe reloads of source code}
+The \emph{source generation} is a SHA-256 over the entry points,
+\code{simulator.cjs}, the lock file and all \code{ml/*.py} files. Rollouts
+refuse to run under a mismatched generation. On a change, the supervisor stops
+starting children, drains the running ones and exits with code 75 so that
+launchd restarts it under the new code. Evaluation plans and staged candidates
+record their generation, and promotion refuses a candidate evaluated under
+different code. A source change therefore invalidates evaluations; it never
+mixes code versions inside one comparison. On 8--9 October, 25 evaluations
+were abandoned for this reason and two because the parent had advanced.
+
+\source{\code{ml/pipeline.py} (supervisor, slots), \code{ml/worker.py}
+(lanes, collection, learn, evaluate), \code{ml/resources.py}
+(\code{ResourcePolicy}, \code{BackgroundGuard}, \code{backend_for}),
+\code{ml/batching.py}, \code{ml/reload.py}, \code{ml/simulator.py},
+\code{simulator.cjs}, \code{scripts/learning_service.py}.}

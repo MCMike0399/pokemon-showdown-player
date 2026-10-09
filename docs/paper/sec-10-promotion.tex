@@ -1,0 +1,191 @@
+\section{Promotion: a paired test and what it can certify}
+\label{sec:promotion}
+
+\subsection{The paired design}
+For game $i$ the incumbent and the candidate face identical conditions: the
+same seed, side, opponent, opponent revision, learner team, opponent team,
+open-sheet flag, seed encoding and effective simulator seed. The gate rejects
+the run if any of these differ between the two panels. Let
+$X_i^I,X_i^C\in\{0,1\}$ be the incumbent's and the candidate's wins in pair
+$i$. Pairs with $X_i^I=X_i^C$ are \emph{concordant} and carry no information
+about which policy is better. The informative pairs are the gains ($X^C=1$,
+$X^I=0$), counted by $g$, and the losses, counted by $\ell$. The discordant
+total is $d=g+\ell$, and $W_C-W_I=g-\ell$. Figure~\ref{fig:paired} shows the
+idea.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[x=0.95cm,y=1cm]
+  \foreach \i/\a/\b in {1/1/1,2/0/1,3/1/1,4/0/0,5/1/0,6/0/1,7/1/1,8/0/1,9/0/0,10/1/1,11/0/1,12/1/1}{
+    \ifnum\a=1 \fill[seriesA] (\i,0) circle (0.17); \else \draw[seriesA,thick] (\i,0) circle (0.17); \fi
+    \ifnum\b=1 \fill[seriesA] (\i,-0.8) circle (0.17); \else \draw[seriesA,thick] (\i,-0.8) circle (0.17); \fi
+    \node[note] at (\i,0.5) {\i};
+  }
+  \foreach \i in {2,6,8,11}{ \draw[draw=accent,very thick,rounded corners=2pt] (\i-0.35,-1.15) rectangle (\i+0.35,0.35); }
+  \draw[draw=seriesB!80!black,very thick,rounded corners=2pt,dashed] (5-0.35,-1.15) rectangle (5+0.35,0.35);
+  \node[lanelabel] at (0.4,0) {incumbent};
+  \node[lanelabel] at (0.4,-0.8) {candidate};
+  \node[note,anchor=west] at (12.6,0.15) {filled = win};
+  \node[note,anchor=west,text=accent] at (12.6,-0.35) {solid box = gain ($g=4$)};
+  \node[note,anchor=west,text=seriesB!80!black] at (12.6,-0.85) {dashed box = loss ($\ell=1$)};
+  \node[note] at (6.5,-1.55) {seed $i$: same teams, side, opponent and simulator seed in both panels};
+\end{tikzpicture}}
+\caption{The paired design on twelve illustrative seeds. Only the five
+discordant seeds bear on the comparison. Here $g=4$, $\ell=1$ and
+$p=\Prob(\Bin(5,\tfrac12)\ge4)=0.1875$, so this run would fail.}
+\label{fig:paired}
+\end{figure}
+
+\subsection{The gate}
+With $n$ games per policy and margin $m$, a candidate passes when
+\begin{equation}
+  \text{clean}\ \wedge\ \big(W_C-W_I\ge\lceil nm\rceil\big)\ \wedge\
+  p\le0.05,\qquad
+  p=\sum_{k=g}^{d}\binom dk2^{-d}\quad(p=1\text{ if }d=0).
+  \label{eq:gate}
+\end{equation}
+\emph{Clean} means: the run is complete and fully paired; there are no
+unfinished games and no rejected actions; and every game has a winner or a
+tie. The defaults are $n=20$, $m=0.10$; the deployment uses $n=60$, $m=0.05$.
+The first edition's gate formula, $\max(1,\lfloor nm+0.999\rfloor)$ with no
+test, is obsolete.
+
+\begin{proposition}[Validity of the gate's test]
+\label{prop:signtest}
+Suppose the pairs are independent, and under the null hypothesis each
+discordant pair is equally likely to be a gain or a loss:
+$\Prob(X^C=1,X^I=0)=\Prob(X^C=0,X^I=1)$ for every pair. Then
+$\Prob(p\le\alpha)\le\alpha$ for every $\alpha\in[0,1]$. In particular, the
+gate passes a candidate that is no better than the incumbent with
+probability at most 0.05.
+\end{proposition}
+\begin{proof}
+Condition on which pairs are discordant, and hence on $d$. Under the null,
+independence and the equal-probability condition make each discordant pair a
+gain with probability $\tfrac12$, independently. So $g\mid d\sim\Bin(d,\tfrac12)$.
+The statistic $p$ is the upper-tail probability of this exact distribution at
+the observed $g$. By the standard property of discrete tail probabilities,
+$\Prob(p\le\alpha\mid d)\le\alpha$. Averaging over $d$ preserves the bound.
+The other gate conditions only remove passes.
+\end{proof}
+
+This is the exact conditional form of McNemar's test \citep{mcnemar}. It needs
+neither a normal approximation nor equal marginal rates across pairs. Its
+null is ``no systematic difference on the evaluated distribution'', not ``no
+difference anywhere''.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{rrrr}
+\toprule
+Discordant pairs $d$ & Minimum gains $g$ & Minimum net $g-\ell$ & $p$ at that $g$ \\
+\midrule
+4 or fewer & --- & impossible & $\ge0.0625$ \\
+5 & 5 & 5 & 0.0313 \\
+8 & 7 & 6 & 0.0352 \\
+10 & 9 & 8 & 0.0107 \\
+15 & 12 & 9 & 0.0176 \\
+20 & 15 & 10 & 0.0207 \\
+30 & 20 & 10 & 0.0494 \\
+40 & 26 & 12 & 0.0403 \\
+\bottomrule
+\end{tabular}
+\caption{What the sign test demands. With $n=60$, $m=0.05$ the margin
+requires a net of only $\lceil3\rceil=3$, so the test is always the binding
+condition. The one production pass on 9 October was 38 $\to$ 46 wins with
+$g=9$, $\ell=1$, $p=0.0107$.}
+\label{tab:signtest}
+\end{table}
+
+\caveat{The source computes $\lceil nm\rceil$ in floating point. For some
+pairs this exceeds the exact ceiling by one; for example
+$100\times0.07=7.000000000000001$ rounds up to 8. The configurations actually
+used, $(20,0.10)$, $(60,0.05)$, $(96,0.10)$, $(192,0.10)$ and $(200,0.05)$, are
+unaffected. A rational or integer form would remove the edge case.}
+
+\subsection{Many gates: multiplicity and the winner's curse}
+\label{sec:multiplicity}
+One valid test is not the same as a valid campaign of tests. Between 8
+October 18:18\,UTC and 9 October 19:57\,UTC the pipeline completed 129 paired
+60-game gates, and one passed.
+
+\begin{proposition}[Expected false promotions]
+\label{prop:multiplicity}
+Run $K$ gates, each with type-I error at most $\alpha$ under its null. If every
+candidate is null, the expected number of passes is at most $K\alpha$, and the
+probability of at least one pass is at most $\min(1,K\alpha)$. Testing each at
+$\alpha/K$ (Bonferroni) bounds the family-wise error by $\alpha$.
+\end{proposition}
+\begin{proof}
+The expected number of passes is the sum of the individual pass probabilities,
+each at most $\alpha$ under the null. The union bound gives the second claim
+and, with $\alpha/K$, the third.
+\end{proof}
+
+With $K=129$ and $\alpha=0.05$, up to 6.45 false passes are possible even if
+no candidate is better, so a single pass is not evidence that PPO is improving
+the actor. The exact sign test is discrete and conservative, so the true
+expectation is somewhat lower, but the conclusion stands. A Bonferroni
+threshold would be $0.05/129\approx3.9\times10^{-4}$; the observed $p=0.0107$
+does not meet it. The project's own history shows the \emph{winner's curse}
+directly. \code{matchup-v1} passed development ($p=0.0068$) and then tied its
+independent final 126--126. \code{strategic-v4} reached $p=0.008$ on a
+development panel and then went 139--136 on a fresh confirmation ($p=0.39$).
+Selection on one panel inflates that panel's apparent effect. An independent,
+prospectively specified final panel is the remedy, and the project's
+experiment runner (\code{scripts/train_opening.py}) uses one.
+
+\subsection{What the gate does not measure}
+Since 9 October the gate evaluates the \emph{sampled self-play actor} against
+scripted opponents and a frozen copy of itself. Live turns, however, are
+decided by search, and the actor only chooses team previews, greedily. A
+candidate that passes therefore improves a decision system that is not the
+one deployed for turns. Its effect on live play runs through the preview, and
+through the data the next candidates are trained on.
+Section~\ref{sec:limits} lists this construct-validity gap as the most
+important open problem in the evaluation design.
+
+\subsection{A distribution-free certificate (proposed, not implemented)}
+\label{sec:certificate}
+A lower confidence bound on the improvement would be a stronger deployment
+rule than a test.
+
+\begin{theorem}[Paired Hoeffding lower bound]
+\label{thm:evaluation}
+Fix both decision systems before evaluation. Draw $n$ evaluation units
+independently from a declared target distribution, and in unit $i$ run both
+systems on matching conditions. Let $D_i=X_i^C-X_i^I\in[-1,1]$ have common
+mean $\Delta$, with $\overline D=n^{-1}\sum_iD_i$. Then, for $\delta\in(0,1)$,
+\begin{equation}
+  \Prob\!\Big(\Delta\ge\overline D-\sqrt{2\log(1/\delta)/n}\Big)\ge1-\delta.
+\label{eq:certificate}
+\end{equation}
+\end{theorem}
+\begin{proof}
+Hoeffding's inequality for independent variables in intervals of width 2
+gives $\Prob(\overline D-\Delta\ge\eta)\le\exp(-2n^2\eta^2/(4n))=\exp(-n\eta^2/2)$
+\citep{hoeffding}. Set $\eta=\sqrt{2\log(1/\delta)/n}$ and take complements.
+\end{proof}
+
+\begin{example}[How much evidence a margin is]
+At $n=60$ and $\delta=0.05$ the radius is $\sqrt{2\log20/60}\approx0.316$. The
+production pass, with $\overline D=8/60\approx0.133$, has lower bound $-0.18$,
+so the certificate does not establish improvement. A radius of 0.10 needs
+$n\ge\lceil2\log20/0.01\rceil=600$ independent units. The strategic-v1 final,
+$\overline D=19/160\approx0.119$ with radius 0.193, is also inconclusive under
+this bound, although its exact test gave $p=0.0072$. Hoeffding ignores that
+most pairs are concordant. A variance-adaptive or exact
+discordant-pair interval is sharper, and is the right next step.
+\end{example}
+
+Dependence \emph{within} a pair is allowed; independence \emph{across} units is
+required. If both sides of a seed are played, the seed is the unit. If games
+cluster by opponent team, the team is the unit: Section~\ref{sec:evidence}
+re-tests the search result at that level. For $K$ fixed candidates, use
+$\delta/K$ per candidate.
+
+\source{\code{paired_gate}, \code{stage} and \code{promote_ready} in
+\code{ml/promotion.py}; \code{evaluate} in \code{ml/worker.py};
+preregistered panels in \code{scripts/train_opening.py};
+\code{docs/checkpoint-validation.md}.}

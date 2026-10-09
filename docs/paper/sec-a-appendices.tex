@@ -1,0 +1,182 @@
+\section{Notation}
+\small
+\begin{longtable}{p{0.22\linewidth}p{0.71\linewidth}}
+\toprule Symbol & Meaning \\
+\midrule\endhead
+$s_t$, $h_t$ & Latent simulator state; information available before decision $t$. \\
+$r$, $\A(r)$ & A Showdown request and its request-visible candidate choices. \\
+$x_t$, $z_a$ & State vector in $\R^{384}$; action vector in $\R^{192}$. \\
+$q_0$, $f_\theta$, $\ell_\theta$ & Prior (last action coordinate), learned residual, full logit. \\
+$\tau$ & Policy temperature; 0.25 for turns and previews in the deployed checkpoint. \\
+$\pi_\theta$, $V_\theta$ & Tempered masked policy; critic. \\
+$s(a)$, $\kappa$, $g$ & Strategic turn score, pessimism weight, squash $4s/(4+|s|)$. \\
+$Y$, $T$, $G_t$ & Terminal outcome, recorded decision count, discounted return. \\
+$\gamma$, $\lambda$ & Discount 0.99 and GAE parameter 0.95. \\
+$\widehat A_t$, $\widetilde A_t$, $\widehat R_t$ & GAE estimate, standardized advantage, critic target. \\
+$\rho_t$, $\epsilon$, $\omega_t$ & Importance ratio, clip width 0.2, phase weight. \\
+$\widehat{\KL}$ & Per-epoch estimate $(\rho-1)-\log\rho$; stop threshold 0.03. \\
+$W$, $d$ & Admitted simulator workers; GPU duty fraction. \\
+$g$, $\ell$, $d$, $p$ & Paired gains, losses, discordant total, exact sign-test p-value
+(Section~\ref{sec:promotion}; $d$ also denotes duty in Section~\ref{sec:pipeline}). \\
+$n$, $m$ & Games per policy and promotion margin. \\
+$w$, $K$, $M_w$ & Sampled world, world count (6 live), per-world payoff matrix. \\
+$\bar x_w$, $\bar y_w$, $q_w$ & Regret-matching averages; blended opponent model. \\
+$U_w(a)$, $a^*$ & Value of our action in world $w$; chosen action. \\
+$E$, $K_w$, $K_\ell$ & Elo expected score; winner and loser $K$ factors. \\
+$\psi$, $q_\psi$ & Scout parameters and executed-move distribution. \\
+$v$, $\alpha_v$, $\beta_v$, $\mu_v$, $\sigma_v$ & Team version and its Beta posterior summaries. \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{Corrections to the first edition}
+\label{app:errata}
+\small
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.31\linewidth}>{\raggedright\arraybackslash}p{0.62\linewidth}}
+\toprule First edition & This edition \\
+\midrule\endhead
+Snapshot \code{151393d} & A private-history hash absent from the public
+repository. This edition cites public \code{0c00ec2}. \\
+The actor chooses every live decision & Search chooses turns; the actor
+chooses previews greedily (Section~\ref{sec:search}). \\
+Policy $\softmax(\ell)$; example $(0.594,0.343,0.063)$ & The policy is
+$\softmax(\ell/\tau)$ with $\tau=0.25$. The deployed probabilities for the same
+logits are $(0.900,0.100,0.0001)$ (Example~\ref{ex:temperature}). \\
+Prior: power$\times$accuracy$\times$STAB$\times$type, zero at preview & This
+is the legacy prior. The deployed prior is the squashed scenario score, and it
+is nonzero at preview (Section~\ref{sec:strategic}). \\
+Preview ordering always matters & Under the strategic profiles the bench is
+canonicalized: 360 candidates form 180 plans (Proposition~\ref{prop:preview}). \\
+``Not a hypothesis test''; gate $\max(1,\lfloor nm+0.999\rfloor)$ & The gate
+is $\lceil nm\rceil$ plus an exact paired sign test at $p\le0.05$
+(Equation~\eqref{eq:gate}). \\
+The worker promotes, with a 30-minute window & The worker only stages.
+Promotion happens before matchmaking, with no pending ladder recording, a
+matching parent, hash and source generation. \\
+Auxiliary inputs are not frozen & Evaluation freezes content-addressed input
+snapshots. \\
+No mid-game reconstruction after a crash & Pending-episode resume and
+same-rqid resubmission exist (Section~\ref{sec:transport}). \\
+Loss: clipped PPO + value + entropy & Now with phase weights, configurable
+coefficients, collecting-likelihood exclusion, quality exclusions and an
+epoch-level KL stop (Section~\ref{sec:learning}). \\
+Consumed ``once produced and evaluated'' & Consumed when the candidate is
+saved, before evaluation. \\
+Opponents: heuristic plus some random; optional self & The \code{ladder-v1}
+cycle (2/8 self, 3/8 tactical, 2/8 heuristic, 1/8 random); 8\% open sheets;
+64-bit seeds. \\
+Resource rule: load, memory, disk & Adds memory pressure (critical only), the
+swap-out rate, the storage budget, and the split between evaluator and
+collector. \\
+Thompson: ``probability that $v$ has the largest \emph{sampled} parameter'' &
+Circular; corrected to the largest \emph{true} parameter
+(Proposition~\ref{prop:thompson}). \\
+Hashing into $d$ coordinates & Into $d-16$ hashed buckets; 16 are dense
+(Proposition~\ref{prop:hash}). \\
+Training mask uses a finite minimum & Divided by $\tau<1$, the minimum
+overflows to $-\infty$; this is harmless (Section~\ref{sec:network}). \\
+``Not a tree search or equilibrium solver'' & True of the network. False of
+the deployed system, which solves per-world matrix games. \\
+Evidence: two early reports & Section~\ref{sec:evidence}: more than thirty
+gates, the search evaluation and the live record. \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{Implementation defects found during this review}
+\label{app:defects}
+These are reported for transparency. None was changed by this documentation
+update.
+\begin{enumerate}
+  \item \textbf{Both-Mega enumeration drop} (\code{search/engine.cjs},
+    \code{sideChoices}). When both actives on a side can Mega Evolve, every move
+    option carries \code{ mega}. Each move-and-move pair then has two Mega
+    events and is filtered out. Pairs that include a switch survive, so the
+    list is not empty and the repair branch never runs; \code{megaFix} is a
+    no-op. The side is left with only switch-containing actions. This affects
+    opponent worlds in which both sampled actives hold stones, and our own
+    forced-replacement look-ahead before our Mega is spent. The fix is to emit
+    each move with and without \code{ mega} when \code{canMegaEvo}, and let the
+    one-Mega filter choose.
+  \item \textbf{Mega always forced.} Delaying Mega Evolution is never
+    considered, for us or for the opponent model.
+  \item \textbf{Forme lookup.} \code{_our_set} fails for formes whose Mega base
+    name differs (for example Floette-Eternal and Floette-Mega). An arena
+    opponent fell back 12 times for this reason.
+  \item \textbf{Unseeded durations and independent cell seeds.} Rebuilt sleep
+    and confusion durations use \code{Math.random}, and each matrix cell has
+    its own seed, so rows are not compared under common random numbers.
+  \item \textbf{Legacy HP parsing} in the deployed state encoder
+    (Section~\ref{sec:game}).
+  \item \textbf{Floating-point margin.} $\lceil nm\rceil$ can exceed the exact
+    ceiling for some $(n,m)$ (Section~\ref{sec:promotion}).
+  \item \textbf{Dead constant.} The burn penalty in the evaluation table is
+    overridden by the attack-based rule.
+  \item \textbf{Incomplete world state.} Last moves are never sent to the engine,
+    so its last-move restoration (and anything that depends on it, such as
+    Encore targets) is unused. The opponent's PP is never set.
+  \item \textbf{Coarse invalidation.} One rejected matrix cell removes a whole
+    row or column of the world's game.
+\end{enumerate}
+
+\section{Source-to-claim map}
+\label{app:map}
+\small
+\begin{longtable}{>{\raggedright\arraybackslash}p{0.3\linewidth}p{0.63\linewidth}}
+\toprule Source & Claim or object \\
+\midrule\endhead
+\code{ps_mcp_server.py}, \code{ps_client.py}, \code{harness.py} & 41 MCP
+tools; login and transport; team CRUD; legacy loop. \\
+\code{battle_state.py} & \code{observe}; \code{legal_choices}; joint
+predicates; HP parsers. \\
+\code{ml/features.py} & Dimensions 384/192; signed hashing; profiles;
+bench canonicalization; prior placement and squash. \\
+\code{ml/strategy.py}, \code{ml/tactics.py}, \code{ml/opening.py} & Scenario
+hypotheses; deterministic resolution; risk aggregate; damage; preview score. \\
+\code{ml/model.py} & 97{,}826-parameter network; temperature; GAE;
+likelihood validation; PPO, BC and KL stop; duty cycle. \\
+\code{ml/brain.py}, \code{ml/recording.py}, \code{ml/postgame.py} &
+Decisions, steps, snapshots, terminal records, resume. \\
+\code{ml/data_quality.py} & Trajectory exclusion rules. \\
+\code{ml/storage.py}, \code{ml/input_snapshot.py}, \code{ml/data_budget.py} &
+Schema, fingerprints, collected checkpoints, frozen inputs, budget. \\
+\code{ml/pipeline.py}, \code{ml/worker.py} & Supervisor; lanes; collection
+curriculum; learner; evaluator. \\
+\code{ml/resources.py}, \code{ml/batching.py}, \code{ml/reload.py} &
+Admission and guards; MPS backend; tensor cache; source generation. \\
+\code{ml/promotion.py} & Paired gate; sign test; staging; promotion. \\
+\code{ml/scout.py}, \code{ml/teams.py}, \code{ml/research.py} & Scout;
+Beta/Thompson team choice; research prior. \\
+\code{search/agent.py}, \code{search/engine.cjs}, \code{search/priors.py},
+\code{search/tracker.py} & Worlds; enumeration; screening; regret matching;
+blend; decision; evaluation. \\
+\code{ml/browser.py}, \code{scripts/browser_play.py}, \code{scripts/live_watch.py} &
+Browser turn; guards; recovery; viewer. \\
+\code{simulator.cjs}, \code{ml/simulator.py} & Official simulation and
+validation; player streams; local opponents. \\
+\code{experiments/}, \code{notebooks/} & Offline PPO matrix and analysis. \\
+\bottomrule
+\end{longtable}
+\normalsize
+
+\section{Reproduction and build}
+Build from \code{docs/paper/} with \code{tectonic main.tex} (or
+\code{latexmk -pdf main.tex}). The figures are TikZ and pgfplots, with no
+external images. To reproduce an experiment, record at least:
+\begin{enumerate}
+  \item repository and simulator revisions, format, dependency versions,
+    feature profile, temperatures, device and seeds;
+  \item exact teams with their order and generated-spread flags, learner side,
+    opponent policy and revision;
+  \item frozen input snapshots, collection mode and terminal, unfinished and
+    rejected counts;
+  \item for search: worlds, engines, screening sizes, the usage month and
+    cutoff, $\alpha$, $\tau_o$, iterations and the seed;
+  \item the evaluation unit (game, seed or opponent team), the panel's
+    independence from development, and the multiplicity plan.
+\end{enumerate}
+Use an isolated data root for experiments, because the ordinary root is live
+learning state. The offline test suite checks the implemented contracts
+(enumeration, masking, collection modes, likelihoods, terminal recording,
+reloads, scout non-anticipation, promotion predicates). Passing it is not a
+measurement of playing strength.

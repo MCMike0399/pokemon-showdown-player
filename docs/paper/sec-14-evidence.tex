@@ -1,0 +1,282 @@
+\section{Evidence}
+\label{sec:evidence}
+
+This section collects every quantitative result the project has recorded,
+recomputes the exact statistics, and states what each one does and does not
+show. Paired tests use the exact one-sided sign test of
+Section~\ref{sec:promotion}; all p-values below were recomputed and match the
+validation documents. Unless marked otherwise, sources are the repository's
+\code{docs/*-validation.md}, \code{docs/opening-policy.md},
+\code{docs/post-campaign-learning.md} and \code{docs/search-agent.md}.
+
+\subsection{Paired candidate evaluations}
+Figure~\ref{fig:forest} shows the paired experiments on one scale: the
+candidate's win rate minus the incumbent's, on the same seeds. Different rows
+use different panels, opponents and incumbents, so their totals are not
+comparable. Only the direction and the uncertainty of each row are.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.56\linewidth, height=11.2cm, scale only axis=false,
+  y dir=reverse, ytick={1,...,14}, ymin=0.4, ymax=14.6,
+  yticklabels={
+    {Turn temperature 0.25, final (200)},
+    {\code{strategic-v1}, development (64)},
+    {\code{strategic-v1}, independent final (160)},
+    {\code{matchup-v1}, development (96)},
+    {\code{matchup-v1}, independent final (200)},
+    {\code{opening-v1}, development (96)},
+    {\code{opening-v2}, development (96)},
+    {Pooled ladder PPO (96)},
+    {Focused rain PPO (100)},
+    {Mega-focused control (192)},
+    {\code{strategic-v4} after updates (192)},
+    {\code{strategic-v4} fresh confirmation (200)},
+    {Production PPO gate, 1 pass of 129 (60)},
+    {Search vs.\ policy, real teams (45)}},
+  yticklabel style={font=\scriptsize,text=ink},
+  xmin=-0.2, xmax=0.45, xtick={-0.2,-0.1,0,0.1,0.2,0.3,0.4},
+  xticklabel style={font=\scriptsize,text=muted,/pgf/number format/fixed},
+  xlabel={\small candidate minus incumbent win rate (paired)},
+  xmajorgrids, grid style={draw=gridgray,thin},
+  axis line style={draw=muted}, tick style={draw=muted},
+  clip=false]
+  \draw[draw=ink,thin] (axis cs:0,0.4) -- (axis cs:0,14.6);
+  % passed (filled)
+  \addplot[only marks,mark=*,mark size=2.6pt,color=seriesA,
+    error bars/.cd,x dir=both,x explicit,error bar style={color=seriesA,line width=1pt}]
+    coordinates {(0.170,1) +- (0.067,0) (0.172,2) +- (0.119,0) (0.119,3) +- (0.089,0)
+                 (0.156,4) +- (0.113,0) (0.133,13) +- (0.098,0)};
+  % failed (hollow)
+  \addplot[only marks,mark=o,mark size=2.6pt,color=seriesA,line width=1pt,
+    error bars/.cd,x dir=both,x explicit,error bar style={color=seriesA!60,line width=1pt}]
+    coordinates {(0.000,5) +- (0.075,0) (0.000,7) +- (0.096,0) (0.000,8) +- (0.058,0)
+                 (0.010,9) +- (0.034,0) (-0.083,10) +- (0.077,0) (0.099,11) +- (0.076,0)
+                 (0.015,12) +- (0.070,0)};
+  \addplot[only marks,mark=o,mark size=2.6pt,color=seriesA,line width=1pt] coordinates {(0.052,6)};
+  % search (orange, labelled)
+  \addplot[only marks,mark=diamond*,mark size=3.4pt,color=seriesB,
+    error bars/.cd,x dir=both,x explicit,error bar style={color=seriesB,line width=1pt}]
+    coordinates {(0.244,14) +- (0.165,0)};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,1) {$p\approx10^{-6}$};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,2) {.0064};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,3) {.0072};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,4) {.0068};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,5) {.55};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,6) {n/a};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,7) {.58};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,8) {.64};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,9) {.50};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,10) {.99};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,11) {.0082\,*};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,12) {.39};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,13) {.011\,\dag};
+  \node[font=\scriptsize,text=muted,anchor=west] at (axis cs:0.452,14) {.0064};
+  \node[font=\scriptsize\bfseries,text=ink,anchor=west] at (axis cs:0.452,0.0) {$p$};
+\end{axis}
+\end{tikzpicture}
+\caption{Paired evaluations. Filled markers passed their gate and hollow
+markers failed. The orange diamond is the search agent, compared with the
+learned policy on the same 45 seeds. Bars are approximate 95\% intervals for a
+paired difference, $\pm1.96\sqrt{[(g+\ell)/n-((g-\ell)/n)^2]/n}$. The
+\code{opening-v1} panel did not report its discordant counts. $^*$ Met $p\le0.05$
+but missed the then-required 10-point minimum by one win. $^\dag$ One pass
+among 129 gates; see Proposition~\ref{prop:multiplicity}.}
+\label{fig:forest}
+\end{figure}
+
+Three patterns stand out.
+\begin{itemize}
+  \item \textbf{Inference-time changes passed; learned weights mostly did not.}
+    The large, independently confirmed gains came from the turn temperature
+    (same weights, $\tau=0.25$: 95 $\to$ 129 of 200) and from the strategic
+    prior (125 vs.\ 106 of 160 on an untouched final). These are changes to
+    how the network's scores are used, not to its learned residual.
+  \item \textbf{Development wins regress.} \code{matchup-v1} (development
+    $p=0.0068$, final tie) and \code{strategic-v4} ($p=0.0082$, then +1.5
+    points on fresh seeds) are textbook winner's curses
+    (Section~\ref{sec:multiplicity}). Strata of the v4 confirmation show the
+    tactical-opponent group \emph{regressing}, from 45 to 38 wins of 55.
+  \item \textbf{Search is the largest single effect.} The search agent's paired
+    improvement, $+24$ points, is larger than any learned candidate's, with an
+    interval that excludes zero.
+\end{itemize}
+
+\subsection{The search agent offline}
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.38\linewidth} X}
+\toprule
+Test & Result \\
+\midrule
+Rain mirror, head to head, 40 games, sides alternated & Search 26--14 (65\%);
+exact binomial one-sided $p=0.040$. \\
+Real teams, paired: same 45 seeds, sides and opponent teams; the
+opponent is search-piloted & Policy 19/45 (42\%), search 30/45 (67\%); 14
+gains, 3 losses; McNemar one-sided $p=0.0064$ (two-sided 0.013). \\
+Same, clustered by opponent team (23 teams, each from both sides, one once) &
+13 teams favour search, 2 the policy, 8 tie; sign test $p=0.0037$; exact
+sign-flip permutation $p=0.012$. \\
+Calibration: policy vs.\ search-piloted real teams & 69/140 (49.3\%), Wilson
+95\% [41.1\%, 57.5\%]; close to the live 41\%. \\
+Synthetic usage-sampled teams & Policy wins 9--1: \emph{not} a valid proxy for
+the ladder. \\
+\bottomrule
+\end{tabularx}
+\caption{Offline search evidence, with open team sheets off. The run ledgers
+were recomputed for this report. \code{docs/search-agent.md} describes the
+paired panel as ``45 real human teams''; it contains 45 games over 23 distinct
+teams. The team-level re-test shows that the effect survives this
+clustering.}
+\label{tab:searchoffline}
+\end{table}
+
+The opponent in the paired test is the search agent itself, piloting teams
+that real opponents brought, so the comparison is search against search
+versus policy against search. Two incumbent-arm games had a degraded opponent
+(12 fallbacks from a forme lookup error, Appendix~\ref{app:defects}). They
+were losses in both arms, so they do not change the discordant counts. The
+search configuration used for these runs was not recorded in the run files,
+which limits exact reproduction.
+
+\subsection{Why raw ladder win rate is not a strength measure}
+\label{sec:elo}
+Showdown's ladder uses an Elo rating with a floor of 1000 and a rating-dependent
+$K$ \citep{showdownladder}. A player of rating $R$ facing $R_o$ has expected
+score $E=1/(1+10^{(R_o-R)/400})$ \citep{elo}. A win adds $K_w(1-E)$ and a loss
+subtracts $K_\ell E$. Above 1300, $K_w=K_\ell=40$; from 1100 to 1299 both are 50.
+At 1000 the winner gains with $K_w=80$ and the loser loses with $K_\ell=20$,
+and these interpolate linearly up to 1100.
+
+\begin{proposition}[Stationary win rate under asymmetric $K$]
+\label{prop:elo}
+Suppose a player keeps a constant true win probability $p$ against opponents
+with expected score $E$, so that its expected rating drift is zero. Then
+\[
+  p=\frac{K_\ell E}{K_w(1-E)+K_\ell E}.
+\]
+For evenly matched opponents ($E=\tfrac12$), this is $K_\ell/(K_w+K_\ell)$:
+0.20 just above the floor, about 0.35 near 1050, and 0.50 from 1100 upward.
+The formula assumes no clamp, $R-K_\ell E\ge1000$. At the floor itself a
+loss costs nothing, so the stationary $p$ is lower still.
+\end{proposition}
+\begin{proof}
+The expected change is $pK_w(1-E)-(1-p)K_\ell E$. Setting it to zero and
+solving for $p$ gives the formula. Substituting $E=\tfrac12$ gives the special
+case.
+\end{proof}
+
+\intuition{A player who is stable in the 1000--1100 band wins at most 50\%,
+and as little as 20\% or less near the floor, simply because of the asymmetric
+$K$ and the clamp. The 847-game campaign's
+41.1\% is consistent with a policy that hovered in that band. A live goal of
+``50\% win rate'' is therefore partly a statement about the rating band. A
+steadily rising rating above 1100 is the more informative signal. GXE or a
+fixed-rating evaluation pool would be better still.}
+
+\subsection{Live record}
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{llrr}
+\toprule
+Games & Decision system & Record & Win rate \\
+\midrule
+1--100 & Legacy actor; temperature promoted before game 69 & 33--67 & 33\% \\
+101--375 & Turn-temperature actor (overnight campaign) & 113--162 & 41\% \\
+376--500 & Same actor; corrected rain team & 50--75 & 40\% \\
+433--532 & Last 100 before \code{strategic-v1} & 36--64 & 36\% \\
+533--632 & \code{strategic-v1}, first 100 & 49--51 & 49\% \\
+1--847 & All three generations & 348--499 & 41\% [38, 44] \\
+\midrule
+41 games, 9 Oct & Search turns; greedy actor preview & 27--14 & 66\% [51, 78] \\
+\bottomrule
+\end{tabular}
+\caption{Live ladder records with Wilson 95\% intervals. These periods are
+not randomized comparisons. Team, rating band, opponent pool and transport all
+changed between them. The search row counts each battle room once (as of
+20:07\,UTC). It includes two losses in which no search decision was submitted,
+because of transport or team-validation incidents. Two battles abandoned to
+the timer during earlier transport crashes are not in this ledger; counting
+them gives 27--16.}
+\label{tab:live}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+  width=0.84\linewidth, height=6.4cm,
+  xmin=0, xmax=42, ymin=1050, ymax=1520,
+  xlabel={\small search game (chronological)}, ylabel={\small Elo rating},
+  xtick={0,5,...,40}, ytick={1100,1200,1300,1400,1500},
+  ticklabel style={font=\scriptsize,text=muted},
+  ymajorgrids, grid style={draw=gridgray,thin},
+  axis line style={draw=muted}, tick style={draw=muted},
+  unbounded coords=jump, legend style={font=\scriptsize,draw=none,fill=none,at={(0.02,0.98)},anchor=north west},
+  legend cell align=left, clip=false]
+  \addplot[color=seriesB,only marks,mark=*,mark size=1.6pt,opacity=.85] coordinates {
+    (1,1100)(2,1264)(3,1290)(4,1211)(5,1298)(6,1338)(7,1233)(8,1339)(9,1326)(10,1319)
+    (11,1188)(12,1169)(13,1221)(14,1282)(15,1235)(16,1377)(17,1300)(18,1328)(19,1424)(20,1385)
+    (21,1363)(22,1346)(23,1327)(24,1487)(25,1346)(26,1327)(27,1303)(28,1347)(29,1456)(30,1402)
+    (31,1304)(32,1363)(33,1364)(34,1408)(35,1414)(36,1353)(37,1375)(38,1438)(39,1454)(40,1410)(41,1389)};
+  \addlegendentry{opponent rating at game start}
+  \addplot[color=seriesA,line width=2pt,mark=none] coordinates {
+    (0,1182)(1,1201)(2,1230)(3,1281)(4,1251)(5,1229)(6,1262)(7,1285)(8,1264)(9,1243)(10,1223)
+    (11,1195)(12,1218)(13,1243)(14,1271)(15,1293)(16,1324)(17,1343)(18,1322)(19,1308)(20,1332)
+    (21,1354)(22,1374)(23,1391)(24,1416)(25,1392)(26,1368)(27,1384)(28,1362)(29,1387)
+    (30,nan)(31,nan)(32,nan)(33,1440)(34,1458)(35,nan)(36,1448)(37,1424)(38,1405)(39,1428)(40,1447)(41,1464)};
+  \addlegendentry{our rating after the game}
+  \node[font=\scriptsize,text=ink,anchor=west] at (axis cs:41.6,1470) {1464};
+\end{axis}
+\end{tikzpicture}
+\caption{Live rating under the search agent on 9 October 2026. Gaps are games
+whose terminal log lacked our rating line. The climb from 1182 to 1464 took
+place in the symmetric-$K$ region, where Proposition~\ref{prop:elo} predicts
+no drift for a player of stable strength.}
+\label{fig:rating}
+\end{figure}
+
+\paragraph{Testing the live search record against Elo.} Over the 37 search
+games whose logs give both players' pre-game ratings, Elo predicts
+$\sum_iE_i=18.4$ wins, with variance $\sum_iE_i(1-E_i)=8.97$. We observed 23 wins,
+$z=1.53$. The exact Poisson--binomial upper tail is
+$\Prob(X\ge23)=0.086$. Taken alone, the live sample is suggestive but not
+significant at 0.05. With the rating climb and the offline paired result, it
+is consistent with a real gain. It is \emph{not} an independent confirmation
+of the offline effect size. A pre-specified live sample of a few hundred games,
+or rating trajectories compared over equal game counts, would settle it.
+
+\subsection{Offline PPO hyperparameter matrix}
+Seven settings (learning rate, entropy, collection size, minibatch, epochs and
+entropy decay) were trained with three seeds and five updates each. Each was
+evaluated against random and tactical opponents, with a sign test, a
+conditional bootstrap, and Holm correction over 14 development and 12
+final-versus-control hypotheses \citep{holm}. No arm passed after correction.
+Two features of the design limit what it shows. The initial heuristic policy
+was already strong against random play, and arms with larger collections also
+took far fewer optimizer steps, which confounds data size with optimization
+exposure. The production hyperparameters were retained
+(\code{docs/offline-ppo-followup.md}).
+
+\subsection{Negative results and defects found along the way}
+An honest record includes what went wrong. The following were found and
+fixed, or are still open, during 7--9 October:
+\begin{itemize}
+  \item \textbf{Label errors.} Five early wins were stored as losses after an
+    identity change (corrected). A coloured public HP string parsed as full HP,
+    which is still live in the deployed profile's state encoder
+    (Section~\ref{sec:game}). Weather Ball was encoded as a 50-power Normal move
+    in rain. A generated Garchomp spread boosted the wrong attacking stat.
+  \item \textbf{Design errors.} Simulator seeds were truncated to 16 bits. The
+    opponent schedule was confounded with team index. Fourteen orphaned scout
+    labels were found. A score cap flattened 288 of 360 preview choices.
+    Postgame feedback was silently dropped by the immutable-write rule.
+  \item \textbf{Behavioural limits.} Preview entropy was 97.9\% of uniform. The
+    preferred four changed in only 4 of 100 cases when the opponent's six
+    changed. The pressure curriculum never exercised its intended setup move.
+  \item \textbf{Search defects} (Appendix~\ref{app:defects}): a both-Mega
+    enumeration drop, a forme lookup failure, unseeded sleep and confusion
+    durations, and no common random numbers.
+\end{itemize}

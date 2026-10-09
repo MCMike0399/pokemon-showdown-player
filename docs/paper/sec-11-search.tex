@@ -1,0 +1,317 @@
+\section{Decision-time search}
+\label{sec:search}
+
+The learned actor's prior looks one turn ahead against a handful of guessed
+opponent moves. The search agent replaces that guess with the official
+simulator. It samples complete hypothetical opposing teams, plays every
+pairing of our and the opponent's joint actions for one turn, and solves the
+resulting matrix game. Figure~\ref{fig:search} shows the procedure.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \node[box,text width=34mm] (trk) at (0,0) {Public tracker\\HP, status, boosts,\\revealed sets, field};
+  \node[box,text width=34mm] (use) at (0,-2.2) {Usage prior\\Smogon chaos table,\\September 2026};
+  \node[warmbox,text width=27mm] (smp) at (4.3,-1.1) {Sample $K=6$\\worlds $w$\\(our sets exact)};
+  \node[note,anchor=north] at (4.3,-1.95) {3 Node engines,\\2 worlds each};
+  \foreach \k in {3,2,1}{
+    \draw[draw=ink,fill=pale,rounded corners=2pt] (6.6+0.12*\k,-0.2-0.12*\k) rectangle (10.4+0.12*\k,-2.5-0.12*\k);
+  }
+  \node[font=\scriptsize,anchor=south] at (8.6,-0.15) {world $w$: a rebuilt simulator \code{Battle}};
+  \foreach \i in {0,...,5}{ \foreach \j in {0,...,6}{
+     \pgfmathsetmacro{\shade}{mod(7*\i+3*\j,9)*8+10}
+     \fill[seriesA!\shade!white] (7.7+0.3*\j,-0.95-0.22*\i) rectangle (8.0+0.3*\j,-1.17-0.22*\i);
+  }}
+  \node[note] at (8.75,-0.72) {theirs $b$};
+  \node[note,rotate=90] at (7.35,-1.6) {ours $a$};
+  \node[font=\scriptsize,anchor=north] at (8.6,-2.75) {$M_w[a,b]$: value after one simulated turn};
+  \node[warmbox,text width=29mm] (rm) at (13.3,-0.3) {Regret matching\\2000 iterations\\$\to(\bar x_w,\bar y_w)$};
+  \node[warmbox,text width=29mm] (bl) at (13.3,-2.3) {Opponent model\\$q_w=\tfrac12\bar y_w+\tfrac12g_w$};
+  \node[box,text width=58mm] (avg) at (7.6,-4.3) {$\displaystyle a^*=\arg\max_a\frac1{|W_a|}\sum_{w\in W_a}M_w[a,\cdot]\,q_w$};
+  \node[box,text width=26mm] (out) at (13.3,-4.3) {click $a^*$\\median 2.3\,s};
+  \draw[arr] (trk) -- (smp); \draw[arr] (use) -- (smp);
+  \draw[arr] (smp) -- (6.65,-1.1);
+  \draw[arr] (10.9,-0.6) -- (rm.west);
+  \draw[arr] (rm) -- (bl);
+  \draw[arr] (bl.south) -- ++(0,-0.5) -| ([xshift=10mm]avg.north);
+  \draw[arr] (avg) -- (out);
+\end{tikzpicture}}
+\caption{The search agent. Each world fixes complete hypothetical opposing
+sets and copies all public state. Screening keeps at most 24 of our joint
+actions and 20 of the opponent's. The payoff matrix of a world therefore needs
+at most 480 one-turn simulations, plus up to $4|\B|+4|\A|$ for screening. Team preview is delegated to the learned actor.}
+\label{fig:search}
+\end{figure}
+
+\subsection{Public tracker}
+\code{search/tracker.py} reads only our own player stream. For each
+Pok\'{e}mon it tracks:
+\begin{itemize}
+  \item HP fraction (exact HP when the denominator is not 100), status, sleep
+    and toxic counters, boosts and volatiles;
+  \item revealed moves, item (or its loss) and ability;
+  \item Mega state, last move, and the turn it switched in.
+\end{itemize}
+For the field it tracks weather, terrain, pseudo-weather and side conditions,
+each with its start turn. A condition's remaining duration is estimated as
+the base duration minus elapsed turns. If that would be non-positive, the
+extended duration is assumed. Open team sheets are parsed from
+\code{|showteam|} lines.
+
+\subsection{Sampling hidden sets from usage statistics}
+\label{sec:prior}
+The prior is Smogon's monthly \emph{chaos} usage table for the format
+(September 2026, all ratings, about 1.6 million battles)
+\citep{smogonstats}. For each usage entry $e$, which is a species or a Mega
+forme, the table gives a raw count $c_e$ and normalized frequencies
+$P_e(\cdot)$ that sum to one over each category. The categories are moves,
+items, abilities and the 60 most common nature-and-stat-point spreads.
+
+\begin{lemma}[Forme posterior under conditional independence]
+\label{lem:forme}
+Suppose an opposing Pok\'{e}mon's entry is $e$ with prior probability
+proportional to $c_e$. Suppose also that, given $e$, the event ``move $m$ is in
+the moveset'' has probability $\pi_e(m)$ independently across moves. Then
+after observing the revealed set $R$, $\Prob(e\mid R)\propto
+c_e\prod_{m\in R}\pi_e(m)$. If, moreover, $\pi_e(m)=c\,P_e(m)$ for a constant
+$c$ shared by all entries (with four move slots, $c\approx4$), then
+\begin{equation}
+  \Prob(e\mid R)\propto c_e\prod_{m\in R}P_e(m).
+  \label{eq:forme}
+\end{equation}
+\end{lemma}
+\begin{proof}
+The first statement is Bayes' rule with the likelihood factorized by the
+independence assumption. Under the proportionality assumption, the product
+becomes $c^{|R|}\prod_{m\in R}P_e(m)$. The factor $c^{|R|}$ is the same for every
+entry, so it cancels in the normalization.
+\end{proof}
+
+The implementation follows Equation~\eqref{eq:forme}, with three adjustments:
+\begin{itemize}
+  \item unseen moves get a floor of 0.002 on the share scale, so a surprising
+    reveal cannot zero out every entry;
+  \item an observed non-stone item, or a spent Mega, removes the Mega entries;
+  \item an observed Mega keeps only matching Mega entries.
+\end{itemize}
+Given $e$, the unrevealed moves are drawn without replacement in proportion
+to $P_e$. Item, ability and spread are each drawn from their own marginals. A
+Mega entry takes its most common item (assumed to be the stone) and the base
+forme's abilities. Unseen previewed Pok\'{e}mon fill the remaining slots,
+drawn without replacement in proportion to species usage. When open sheets
+were exchanged, species, item, ability, moves and nature are copied exactly,
+and only stat points are sampled.
+
+\caveat{Lemma~\ref{lem:forme} is exact only under its independence
+assumption. Real movesets have four slots, so move inclusions are negatively
+dependent. Item, ability and spread are correlated in real sets, and the
+\code{Teammates} table is loaded but unused. The Item Clause is not enforced
+across a sampled team. The result is a tractable proposal distribution, not a
+calibrated posterior over the opponent's team.}
+
+\subsection{Rebuilding a world}
+Each world becomes a fresh simulator \code{Battle} built from both packed
+teams. Public state is then written onto it:
+\begin{itemize}
+  \item formes, abilities, items, exact HP for us and $\mathrm{round}(h\cdot
+    \mathrm{maxHP})$ for them, statuses with their counters, and our own PP;
+  \item a whitelist of volatiles, such as Protect's stall counter, Substitute,
+    Taunt, Encore, Disable and choice lock. The agent does not send last
+    moves, so the engine's last-move restoration is unused, and the opponent's
+    PP is never set;
+  \item weather, terrain and side conditions with their estimated durations.
+\end{itemize}
+If a side has used its Mega, Mega Evolution is disabled for the whole side.
+Our side uses exact sets, HP and PP from our request.
+
+\subsection{The one-turn game in each world}
+Our candidates are the Python-legal choices $\A(r)$, pruned in two ways.
+Damaging moves at our partner are removed, and when a Mega is available only
+Mega-containing choices are kept. Each surviving choice is rewritten by move
+\emph{identifier}, because a locked request lists only one move and slot
+numbers differ in the rebuilt battle. The opponent's set $\B$ comes from the
+engine's own enumeration (Section~\ref{sec:actions}).
+
+\paragraph{Screening.} If $|\B|>20$ or $|\A|>24$, the engine takes four
+evenly spaced probe actions $P\subset\A$. It keeps the 20 opponent actions
+with the lowest mean value against $P$, which are the best for the opponent.
+It then keeps the 24 of our actions with the highest mean value against the
+first four kept replies.
+
+\paragraph{Payoffs.} For each remaining pair, the engine restores the world
+state, gives the cell its own seed, submits both choices, runs exactly one
+turn and evaluates the result:
+\begin{equation}
+  M_w[a,b]=V\big(\mathrm{Turn}(B_w;a,b;\xi_{w,a,b})\big).
+\end{equation}
+If the simulator rejects any cell, that cell's whole row (our action) or
+column (their action) is removed.
+
+\paragraph{Evaluation function.} A finished battle scores $\pm30$, or 0 for a
+tie. Otherwise
+$V=S(\text{us})-S(\text{them})+\mathrm{TR}$, where
+\begin{equation}
+  S=\sum_{\text{alive }p}\big[1+1.2h_p-\mathrm{pen}(p)+\mathbf 1_{\text{active}}\,\beta(p)\big]
+   +0.10\cdot\text{Tailwind turns}+0.06\sum\text{screen turns}.
+\end{equation}
+Status penalties are: paralysis 0.30, freeze 0.50, poison 0.12, toxic 0.25,
+sleep $0.45\min(1,\text{turns}/2)$, and burn 0.45 if Attack exceeds Special
+Attack, else 0.12. The active-Pok\'{e}mon term $\beta$ rewards offensive,
+defensive and speed boosts and a Substitute. It penalizes Perish counts,
+confusion, Taunt, Encore, Yawn and Leech Seed. TR is the Trick Room term: it
+adds $0.10\cdot\text{turns}\cdot2\clip((\bar v_{\text{them}}-\bar v_{\text{us}})/40,-1,1)$,
+where $\bar v$ is each side's mean Speed, so slower teams gain value under Trick Room.
+
+\subsection{Solving the matrix game}
+The engine runs simultaneous regret matching on the zero-sum game in which we
+maximize $M$ \citep{hartmascolell}. With cumulative regrets $R_t$ for us and
+$C_t$ for the opponent,
+\begin{align}
+  x_t(i)&\propto[R_t(i)]^+,\qquad y_t(j)\propto[C_t(j)]^+\quad(\text{uniform if all}\le0),\\
+  R_{t+1}(i)&=R_t(i)+(My_t)_i-x_t^\top My_t,\qquad
+  C_{t+1}(j)=C_t(j)+x_t^\top My_t-(x_t^\top M)_j,
+\end{align}
+for $T=2000$ iterations. It returns the average strategies $\bar x$ and $\bar y$.
+
+\begin{proposition}[Average regret gives an approximate equilibrium]
+\label{prop:rm}
+Let $\varepsilon_1$ and $\varepsilon_2$ be the two players' average external
+regrets after $T$ rounds. Then $(\bar x,\bar y)$ is an
+$(\varepsilon_1+\varepsilon_2)$-equilibrium:
+$\max_i(M\bar y)_i-\min_j(\bar x^\top M)_j\le\varepsilon_1+\varepsilon_2$.
+For regret matching with payoff range $\Delta$,
+$\varepsilon_1\le\Delta\sqrt{|\A|/T}$ and $\varepsilon_2\le\Delta\sqrt{|\B|/T}$.
+\end{proposition}
+\begin{proof}
+Let $\bar v=T^{-1}\sum_tx_t^\top My_t$. By linearity,
+$T^{-1}\sum_t(My_t)_i=(M\bar y)_i$, so our average regret is
+$\max_i(M\bar y)_i-\bar v\le\varepsilon_1$. Likewise the opponent's is
+$\bar v-\min_j(\bar x^\top M)_j\le\varepsilon_2$. Adding the two gives the
+claim. Because
+$\min_j(\bar x^\top M)_j\le\bar x^\top M\bar y\le\max_i(M\bar y)_i$, neither
+player can gain more than $\varepsilon_1+\varepsilon_2$ by deviating. The
+regret rates are the standard bounds for regret matching
+\citep{hartmascolell,zinkevich2007}.
+\end{proof}
+
+\intuition{With $|\A|=24$, $|\B|=20$ and $T=2000$, the worst-case gap is
+$\Delta(\sqrt{24}+\sqrt{20})/\sqrt{2000}\approx0.21\Delta$. When a terminal
+$\pm30$ is reachable, $\Delta$ can be 60, which makes the bound loose. In
+practice regret matching usually converges much faster than its worst case.
+The bound justifies $\bar y$ only as an approximate equilibrium, and only of
+this one-turn surrogate game.}
+
+\subsection{The opponent model and the decision rule}
+The agent does \emph{not} play $\bar x$. It treats the opponent as a mixture of
+two types:
+\begin{equation}
+  q_w=\alpha\,\bar y_w+(1-\alpha)\,g_w,\qquad
+  g_w(b)\propto\exp\!\big(-(c_b-\min_{b'}c_{b'})/\tau_o\big),\qquad
+  c_b=\frac1{|\A|}\sum_aM_w[a,b],
+\end{equation}
+with $\alpha=\tfrac12$ and $\tau_o=1$. One type plays the equilibrium. The
+other is a soft best response to our playing uniformly, a level-1 quantal
+response in the sense of \citet{mckelvey1995}. Each world then gives our action
+values $U_w(a)=(M_wq_w)_a$. Let $W_a$ be the worlds in which $a$ was valid, and
+$W_{\mathrm{ok}}$ the worlds that produced any result. The decision is
+\begin{equation}
+  a^*=\arg\max_a\Big[\frac1{|W_a|}\sum_{w\in W_a}U_w(a)-0.5\,\mathbf 1\{|W_a|<|W_{\mathrm{ok}}|\}\Big].
+  \label{eq:decision}
+\end{equation}
+
+\begin{proposition}[Guarantee and exploitability of a best response]
+\label{prop:br}
+Let $v^*$ be the value of a world's matrix game. For any opponent mixture $y$,
+a best response $a^*\in\arg\max_a(My)_a$ satisfies $(My)_{a^*}\ge v^*$. Its
+worst case, $\min_bM[a^*,b]$, can still be strictly below $v^*$.
+\end{proposition}
+\begin{proof}
+By the minimax theorem, $v^*=\min_{y'}\max_a(My')_a\le\max_a(My)_a$. For the
+second claim take matching pennies, $M=\bigl(\begin{smallmatrix}1&-1\\-1&1\end{smallmatrix}\bigr)$,
+with $v^*=0$ and $y=(\tfrac12,\tfrac12)$. Every pure action is a best response,
+and each loses 1 to some reply.
+\end{proof}
+
+\intuition{Against the \emph{modelled} opponent the pure choice is never worse
+than the game's value. Against an opponent who anticipates it, a deterministic
+best response can be exploited, whereas $\bar x$ could not be. The design bets
+that ladder opponents neither compute this matrix nor exploit its argmax. The
+level-1 component also assumes they reason one step about our options. These
+are modelling choices, and the live evidence in Section~\ref{sec:evidence} is
+too small to test them separately.}
+
+\subsection{Determinization and strategy fusion}
+\label{sec:fusion}
+Sampling worlds and solving each with full knowledge is \emph{perfect-information
+Monte Carlo} (PIMC). It is known to suffer from \emph{strategy fusion}, which
+means acting as if one could choose differently in worlds one cannot tell
+apart, and from \emph{non-locality} \citep{frankbasin1998}. Yet PIMC often
+plays well in practice \citep{long2010}. Information-set search avoids fusion
+at a higher cost \citep{cowling2012}. Here the turn decision avoids fusion at
+the root: Equation~\eqref{eq:decision} commits to one $a$ for all worlds.
+Fusion does enter forced-replacement scoring, which takes
+$\frac1K\sum_w\max_aU_w(a)$.
+
+\begin{proposition}[Forced-replacement scores are optimistic]
+\label{prop:fusion}
+For any values $U_w(a)$,
+\[
+  \frac1K\sum_w\max_aU_w(a)\ \ge\ \max_a\frac1K\sum_wU_w(a),
+\]
+with equality if and only if some single action maximizes $U_w$ in every world.
+\end{proposition}
+\begin{proof}
+For each $a'$ and $w$, $\max_aU_w(a)\ge U_w(a')$. Averaging over $w$ and then
+maximizing over $a'$ gives the inequality. If $a'$ maximizes in every world,
+the two sides coincide. Conversely, if no action does, then for every $a'$
+some world has a strict gap, so the average on the left exceeds every
+right-hand average.
+\end{proof}
+
+\intuition{A replacement whose best follow-up depends on the hidden world is
+scored as if we will learn the world before moving. That inflates its value,
+so the rule favours flexible-looking replacements whose flexibility is not
+real. Within each world both simulated sides also know each other's sets,
+even when sheets were not shared, so the opponent model is omniscient about
+us.}
+
+\subsection{Monte Carlo error}
+Each cell uses one stochastic sample of accuracy, damage rolls and critical
+hits. Each cell has its own seed, so two of our actions are not compared under
+common random numbers. With $K=6$ worlds, the averaged difference between two
+actions has world-sampling noise plus within-cell chance noise.
+
+\begin{proposition}[Ranking two actions]
+\label{prop:mc}
+Suppose the per-world differences $D_w=U_w(a)-U_w(a')$ are independent, lie in
+an interval of width $2\Delta$, and have mean $\gamma>0$. Then the average
+over $K$ worlds ranks $a'$ above $a$ with probability at most
+$\exp(-K\gamma^2/(2\Delta^2))$.
+\end{proposition}
+\begin{proof}
+This is Hoeffding's inequality applied to the event $\overline D\le0$ with
+deviation $\gamma$ \citep{hoeffding}.
+\end{proof}
+
+With $K=6$, the bound is useful only when the gap $\gamma$ is a large fraction
+of $\Delta$. Small value differences are effectively ranked at random. Common
+random numbers across rows, more seeds per cell, or adaptive allocation of
+worlds to close decisions would all reduce this noise.
+
+\subsection{Preview, Mega and the learned value}
+Team preview is chosen by the actor, greedily. A value-based preview mode
+(score 90 plans by the position after preview, averaged over 6 worlds and 3
+sampled opposing bring-fours) exists but is untested. Mega Evolution is always
+taken when available, for us and for the opponent model, so the agent never
+considers saving it. A small value network can replace $V$: 14 features per
+Pok\'{e}mon plus field and matchup features, a $128\to128\to1$ ReLU MLP,
+trained by binary cross-entropy on omniscient self-play. It blends in as
+$(1-\beta)V+\beta\cdot8\tanh(z/2)$, but the deployment uses $\beta=0$, and the
+network is neither trained to completion nor gated.
+
+\source{\code{search/agent.py} (worlds, pruning, move-id rewriting, decision
+rule, forced replacements), \code{search/engine.cjs} (rebuild, enumeration,
+screening, payoffs, regret matching, evaluation), \code{search/priors.py},
+\code{search/tracker.py}, \code{search/valuefeat.cjs}, \code{search/train_value.py};
+\code{docs/search-agent.md}.}

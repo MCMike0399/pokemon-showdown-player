@@ -1,0 +1,115 @@
+\section{The battle as a partially observed stochastic game}
+\label{sec:game}
+
+\subsection{State, actions and observations}
+Let $s_t$ be the complete battle state at a decision boundary. It includes
+both teams' hidden sets, current HP, statuses, field conditions, pending
+mechanics and the simulator's random-number state. Player~1 chooses a complete
+action $a_t$ and player~2 chooses $b_t$ simultaneously. Chance $\xi_t$ affects
+the transition:
+\begin{equation}
+  s_{t+1}\sim P(\cdot\mid s_t,a_t,b_t),\qquad
+  o^i_{t+1}\sim O_i(\cdot\mid s_{t+1}),\quad i\in\{1,2\}.
+  \label{eq:posg}
+\end{equation}
+A real trace also contains team preview, forced replacements and waiting
+requests. In the learner, the index $t$ counts \emph{recorded actionable
+requests}, not battle turns. Holding the opponent's strategy fixed reduces the
+game to a single-agent partially observed control process. If the opponent's
+behaviour depends on its own history, that history must be part of the latent
+state.
+
+Write $h_t$ for the information available to our player before decision $t$:
+the public protocol prefix, our own private requests and our past actions. An
+exact Bayesian belief is $\beta_t(s)=\Prob(s_t=s\mid h_t)$. For a fixed
+opponent with joint kernel $\bar P$ and observation kernel $O$, it updates by
+\begin{equation}
+  \beta_{t+1}(s')
+  =\frac{O(o_{t+1}\mid s')\sum_s\bar P(s'\mid s,a_t)\beta_t(s)}
+  {\sum_u O(o_{t+1}\mid u)\sum_s\bar P(u\mid s,a_t)\beta_t(s)},
+\label{eq:belief}
+\end{equation}
+whenever the denominator is positive \citep{kaelbling,smallwood1973}. Nothing
+in the repository computes Equation~\eqref{eq:belief}. The neural policy
+compresses $h_t$ into a feature vector $x_t=\phi(h_t)$
+(Section~\ref{sec:features}). The search agent replaces the belief with a
+\emph{sampling distribution} over opposing sets, built from ladder usage
+statistics and conditioned on what has been revealed
+(Section~\ref{sec:search}). Both are approximations to $\beta_t$, and neither
+is calibrated.
+
+\subsection{What the format reveals}
+Champions M-C makes some hidden information public. Team preview reveals all
+six opposing species. When open team sheets are exchanged, the opposing
+species, items, abilities, moves and natures become known. Stat-point
+allocations stay hidden, and IVs are unused in this format. The audit in
+\code{docs/match-data-collection.md} found this pattern directly. Over 50
+audited games, our own nature and stat points were stored in all 50. The
+opponent's nature was disclosed in 2, and its stat points in none. Open sheets
+are therefore informative but not complete. Only the damage-relevant stat
+spread remains latent once sheets are shown, but that spread alone moves
+damage rolls across KO thresholds.
+
+\intuition{An opposing Pok\'{e}mon at 50\% HP is an observation. Its
+unrevealed item is a latent variable. A predicted Protect is a learned
+forecast. A sampled stat spread is one hypothesis drawn from a population
+model. None of these is a recovered hidden state.}
+
+\subsection{Non-anticipation}
+Both decision procedures read only the request and the public prefix. This
+can be stated precisely.
+
+\begin{proposition}[Conditional non-anticipation]
+\label{prop:information}
+Fix the auxiliary inputs: the encoder and its feature profile, the cached dex,
+the checkpoint (including its embedded \code{strategy_knowledge}), the frozen
+research and scout snapshots, our own team sets and, for search, the usage
+table and random seed. Suppose the request and protocol prefix supplied at
+decision $t$ contain only information available to our player by $t$. Then
+the neural features and the search agent's sampled worlds are measurable
+functions of $h_t$ and those inputs. Two calls with the same request, prefix
+and inputs produce the same features, and the same distribution over sampled
+worlds, whatever happens later and whatever remains unrevealed.
+\end{proposition}
+\begin{proof}
+\code{observe} and \code{Tracker.feed} scan only the supplied prefix and merge
+only the supplied own request. Neither queries the opponent's private stream
+or any later log suffix. Feature construction is deterministic in the
+observation, the candidate string and the fixed inputs. The scout is a fixed
+function of a filtered public prefix. The search agent samples worlds from a
+distribution that depends on the tracker state, the usage table and the seed.
+Composition of measurable maps proves the claim.
+\end{proof}
+
+The premise matters. Passing an omniscient log to \code{observe} would
+invalidate it. The local simulator bridge therefore observes through the
+separate \code{getPlayerStreams().p1/p2} streams; its omniscient stream only
+drives the simulator \citep{simprotocol,battlestream}. The proposition also
+does not certify an experiment's chronology. The checkpoint's
+\code{strategy_knowledge} and the scout are trained on earlier games, and a
+held-out evaluation must not include games those earlier models were fitted
+on.
+
+\caveat{Inside each sampled world the search engine is \emph{omniscient}
+about that world. Both players' sets are fixed and known to both simulated
+sides. Non-anticipation holds for the world-sampling step. The per-world
+matrix game, however, is a perfect-information model of an imperfect-information
+game. Section~\ref{sec:fusion} analyses the bias this introduces.}
+
+\subsection{How faithful the observation is}
+The parser covers a selected subset of protocol events. Missing condition data
+maps to full HP. Under the deployed \code{strategic-v1} profile, the state
+encoder still uses the \emph{legacy} HP parser. A coloured public HP string
+such as \code{50/100y} fails to parse and becomes 1.0. The bug was fixed only
+for the \code{tactics-v1}, \code{rain-v1} and \code{opening-v1} profiles. In
+the last 60 ladder games, 16 of 2{,}509 opposing condition entries carried a
+colour suffix, affecting 8 of 523 decisions. The strategic prior itself uses
+the corrected parser, so the defect reaches the network's learned residual
+but not its prior. Historical observed opponent moves are stored as
+\code{moves_known} and used by the planner; \code{Features._mon} encodes
+\code{moves}. Perspective correctness therefore does not imply a sufficient
+representation.
+
+\source{\code{observe}, \code{hp_fraction} and \code{legacy_hp_fraction} in
+\code{battle_state.py}; \code{Features} in \code{ml/features.py};
+\code{search/tracker.py}; \code{simulator.cjs}.}

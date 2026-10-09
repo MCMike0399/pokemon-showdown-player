@@ -1,0 +1,153 @@
+\section{System overview}
+\label{sec:system}
+
+\subsection{Components and responsibilities}
+Figure~\ref{fig:architecture} shows the deployed system. It has three
+columns. The \emph{play} column talks to Showdown. The \emph{decide} column
+chooses actions. The \emph{learn} column turns recorded games into candidate
+models and decides whether to deploy them. The arrows that cross columns are
+narrow on purpose. A decision procedure receives a context built from public
+information and the player's own request, and returns one complete choice
+string. A learner receives completed, validated records and returns a
+checkpoint file. Deployment is one atomic file replacement made at a
+matchmaking boundary.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \tikzset{col/.style={box,text width=42mm}}
+  \node[font=\small\bfseries,text=ink] at (0,1.0) {Play};
+  \node[font=\small\bfseries,text=ink] at (6.4,1.0) {Decide};
+  \node[font=\small\bfseries,text=ink] at (12.8,1.0) {Learn};
+  \node[col] (server) at (0,0) {Showdown server\\ladder, rqid, timer};
+  \node[col] (client) at (0,-2) {Official web client\\Chromium via Playwright};
+  \node[col] (player) at (0,-4) {Browser player\\rqid guards, clicks};
+  \node[col] (viewer) at (0,-6.4) {Live viewer\\SSE deltas, tailnet};
+  \node[col,dashed] (mcp) at (6.4,0) {OpenClaw + MCP server\\optional supervised path};
+  \node[col,fill=paleink] (actor) at (6.4,-2) {Actor--critic\\team preview (greedy)};
+  \node[col,fill=warm,draw=seriesB!70!black] (search) at (6.4,-4) {Search agent\\tracker, usage worlds};
+  \node[col,fill=warm,draw=seriesB!70!black] (engines) at (6.4,-6.4) {Node engine pool ($\times3$)\\official \code{Battle}};
+  \node[col] (store) at (12.8,0) {SQLite store (WAL)\\episodes, jobs, logs};
+  \node[col] (lanes) at (12.8,-2) {Supervisor; lanes:\\collector (CPU), learner (MPS),\\evaluator (CPU)};
+  \node[col] (ready) at (12.8,-4) {Ready slot\\paired gate passed};
+  \node[col] (sim) at (12.8,-6.4) {Local simulator\\\code{simulator.cjs}};
+  \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (server) -- node[note,right]{WebSocket} (client);
+  \draw[arr] ([xshift=6mm]client.south) -- node[note,right]{request, log} ([xshift=6mm]player.north);
+  \draw[arr] ([xshift=-6mm]player.north) -- node[note,left]{clicks} ([xshift=-6mm]client.south);
+  \draw[arr] ([xshift=-6mm]player.south) -- node[note,left]{frames} ([xshift=-6mm]viewer.north);
+  \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (player) -- node[note,above]{context / choice} (search);
+  \draw[arr] (player.north east) -- node[note,above left,pos=.75]{preview} (actor.west);
+  \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (search) -- node[note,left,pos=.2]{JSON lines} (engines);
+  \draw[arr] ([xshift=6mm]player.south) |- node[note,below,pos=.62]{public log at game end} (10.3,-5.3)
+     -- (10.3,-0.2) -- ([yshift=-2mm]store.west);
+  \draw[darr] (mcp.west) -- node[note,above]{PSClient} (server.east);
+  \draw[darr] (mcp.east) -- node[note,above]{records} ([yshift=2mm]store.west);
+  \draw[arr] (store) -- (lanes);
+  \draw[arr] (lanes) -- (ready);
+  \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (lanes.east) -- ++(0.35,0) |- node[note,right,pos=.25]{self-play} (sim.east);
+  \draw[darr] (ready.west) -- node[note,left,pos=.5,align=center]{promote\\between games} (actor.east);
+\end{tikzpicture}}
+\caption{Deployed responsibilities on 9 October 2026. Orange boxes are the
+decision-time search. The learned actor chooses only the team preview live,
+but it generates all training data in self-play. The dashed promotion path
+replaces the actor between games, after a candidate has passed the paired gate
+and integrity checks. The dashed MCP path supports agent-supervised play and
+recording; it is not used by the browser runner.}
+\label{fig:architecture}
+\end{figure}
+
+\subsection{Processes, devices and cadence}
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.2\linewidth}
+  >{\raggedright\arraybackslash}p{0.13\linewidth} X}
+\toprule
+Process & Device & Role and cadence \\
+\midrule
+Browser runner & CPU & One account lock. Plays ladder games through the
+official client, with a 30-second gap between games. Calls promotion before
+each matchmaking search. \\
+Search engines & CPU (3 Node) & Long-lived simulator processes. Each turn they
+receive 2 of the 6 sampled worlds; median decision 2.3\,s. \\
+Supervisor & CPU & launchd \code{KeepAlive}. Polls every 15\,s, samples host
+resources, and runs at most one child per lane. \\
+Collector lane & CPU & Self-play in spawned one-thread processes, each driving
+a Node simulator. Writes complete sampled episodes. \\
+Learner lane & MPS GPU & PPO on validated episodes; at most 12\% of recommended
+Metal memory; falls back to CPU on device errors. Then a scout update. \\
+Evaluator lane & CPU & Paired incumbent and candidate panels with frozen
+inputs; the exact sign-test gate; staging. \\
+Live viewer & CPU & Publishes filtered public frames every 0.2\,s over SSE. \\
+Cold archiver & CPU & Every 900\,s, gzip-archives completed inference inputs
+with SHA-256 verification. \\
+\bottomrule
+\end{tabularx}
+\caption{Long-running processes on the always-on Apple~M5 host (10 cores,
+16\,GB unified memory). The lanes are described in Section~\ref{sec:pipeline}.}
+\label{tab:processes}
+\end{table}
+
+\subsection{Project timeline}
+Figure~\ref{fig:timeline} places the changes analysed in this report in
+time. The dates explain an important feature of the evidence. The 847-game
+live record spans three actor generations and two transports, so it is not
+a measurement of any single policy.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=1cm,y=0.78cm]
+  \draw[very thick,draw=gridgray] (0,0.4) -- (0,-12.1);
+  \foreach \y/\d/\t in {
+    0/{7 Oct}/{First edition; MCP harness; 100-game campaign (33--67)},
+    -1.05/{7 Oct}/{Paired sign-test gate; turn temperature 0.25 promoted (95$\to$129 of 200, $p\approx10^{-6}$)},
+    -2.1/{7 Oct}/{Recorder snapshots; feature profiles; colored-HP fix (new profiles only)},
+    -3.15/{8 Oct}/{Integrity pass: likelihood check, recorder~3, 64-bit seeds, \code{ladder-v1} curriculum},
+    -4.2/{8 Oct}/{Three-lane CPU/MPS pipeline; source-generation reloads},
+    -5.25/{8 Oct}/{375 games (146--229); opening, Mega and matchup candidates rejected},
+    -6.3/{8 Oct}/{\code{strategic-v1} prior promoted (final 125 vs.\ 106 of 160)},
+    -7.35/{9 Oct}/{\code{strategic-v2..v4} rejected; v4 fails a fresh confirmation},
+    -8.4/{9 Oct}/{Old campaign stopped at 847 games (348--499); browser transport},
+    -9.45/{9 Oct}/{Search agent deployed (offline 30 vs.\ 19 of 45)},
+    -10.5/{9 Oct}/{PPO update passes the 60-game gate (38$\to$46); 150\,GB storage budget},
+    -11.55/{9 Oct}/{Offline PPO matrix: no arm significant after Holm correction}}
+  {
+    \fill[accent] (0,\y) circle (2.2pt);
+    \node[anchor=east,font=\small\bfseries,text=ink] at (-0.3,\y) {\d};
+    \node[anchor=west,font=\small,text width=13.2cm] at (0.3,\y) {\t};
+  }
+\end{tikzpicture}
+\caption{Chronology of the public commits from \code{153e3db} to
+\code{0c00ec2} (7--9 October 2026). The results are recomputed in
+Section~\ref{sec:evidence}.}
+\label{fig:timeline}
+\end{figure}
+
+\subsection{Two transports, one decision contract}
+The repository keeps two ways to reach Showdown. Both obey the same contract:
+a decision is one complete choice string for one actionable request, and it is
+taken from the request-visible candidate list $\A(r)$ of
+Section~\ref{sec:actions}.
+\begin{itemize}
+  \item \textbf{MCP harness.} \code{ps_mcp_server.py} registers 41 tools.
+    The groups are connection, teams, play, model, learning and research. A
+    single \code{PSClient} WebSocket logs in with a challenge-string
+    assertion and sends \code{ROOMID|/choose CHOICE}
+    \citep{mcptools,mcptransport,showdownprotocol}. OpenClaw's native registry
+    exposes the tools as \code{pokemonshowdown__ps_*}. A retained session keeps
+    the server process across turns; a detached one-shot run retires it
+    \citep{openclawregistry}. This path still records decisions and can resume
+    one pending episode after a disconnect.
+  \item \textbf{Browser runner.} \code{scripts/browser_play.py} drives the
+    official client with Playwright. It reads \code{app.rooms[id]} and clicks
+    visible controls. Decisions come from local inference or search; no
+    language model is in the turn loop (Section~\ref{sec:transport}).
+\end{itemize}
+The two paths have different recording rules. MCP play can record sampled PPO
+data. A browser game played with \code{--search} is never a PPO sample,
+because its actions do not come from the actor's distribution. It contributes
+only its public log to the scout corpus (Section~\ref{sec:scout}).
+
+\source{\code{ps_mcp_server.py}, \code{ps_client.py}, \code{harness.py},
+\code{ml/live.py}, \code{ml/browser.py}, \code{scripts/browser_play.py},
+\code{scripts/browser_service.py}, \code{scripts/learning_service.py}.}

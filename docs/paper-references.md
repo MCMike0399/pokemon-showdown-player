@@ -1,5 +1,62 @@
 # Primary sources and proof boundaries for the technical paper
 
+## Second edition (2026-10-09)
+
+The paper was rewritten against public source `0c00ec2`. Where the first-edition
+notes below disagree with the current code, the paper's Appendix B is
+authoritative. In particular:
+
+- **Promotion.** The gate is `ceil(n*m)` plus an exact one-sided paired sign test
+  at p <= .05, not a margin alone.
+- **Temperature.** The policy uses a temperature, and the deployed value is 0.25.
+- **Prior.** The deployed prior is the squashed `strategic-v1` scenario score.
+- **Live turns.** These are decided by search.
+
+The new sources were checked as follows:
+
+- **Search and games.**
+  - [Perfect-information Monte Carlo](https://ojs.aaai.org/index.php/AAAI/article/view/7562)
+    (Long et al., AAAI 2010) explains when determinized search succeeds.
+  - [Strategy fusion](https://www.dai.ed.ac.uk/daidb/papers/documents/rp780.html)
+    (Frank and Basin, *Artificial Intelligence* 100, 1998) is the classical
+    critique.
+  - [Information-set MCTS](https://eprints.whiterose.ac.uk/75048/)
+    (Cowling et al., IEEE TCIAIG 2012) is the alternative that avoids fusion.
+  - [Regret matching](https://doi.org/10.1111/1468-0262.00153)
+    (Hart and Mas-Colell, *Econometrica* 68(5), 2000) and the
+    [regret bound used for equilibrium approximation](https://proceedings.neurips.cc/paper/2007/hash/08d98638c6fcd194a4b1e6992063e944-Abstract.html)
+    (Zinkevich et al., NeurIPS 2007) support Proposition 11.2. Only the
+    equilibrium folk argument is proved in the paper.
+  - [Quantal response](https://resolver.caltech.edu/CaltechAUTHORS:20171128-164515991)
+    (McKelvey and Palfrey, *GEB* 10, 1995) motivates the soft-response half of
+    the opponent model.
+- **Statistics.**
+  - [McNemar (1947)](https://link.springer.com/article/10.1007/BF02295996)
+    covers the exact conditional sign test used by the gate.
+  - [Holm (1979)](https://www.jstor.org/stable/4615733) is the correction used
+    by the offline matrix.
+  - The k3 KL estimator is from
+    [Schulman (2020)](http://joschu.net/blog/kl-approx.html). Its unbiasedness
+    and non-negativity are proved in the paper (Proposition 8.8).
+- **Ladder.** The [official ladder page](https://pokemonshowdown.com/pages/ladderhelp)
+  gives the Elo floor of 1000 and the asymmetric K below 1100 (80/20 at the
+  floor, interpolated to 50/50 at 1100; 40 from 1300). These are the inputs to
+  Proposition 14.1.
+- **Usage data.** [Smogon usage statistics](https://www.smogon.com/stats/):
+  September 2026 chaos JSON for `gen9championsvgc2026regmc`, 1,631,943 battles
+  (from the file's `info` block).
+- **Platform.**
+  [`torch.mps.set_per_process_memory_fraction`](https://pytorch.org/docs/stable/generated/torch.mps.set_per_process_memory_fraction)
+  limits allocations relative to Metal's recommended working-set size. Also
+  checked: [server-sent events](https://html.spec.whatwg.org/multipage/server-sent-events.html)
+  and [Playwright](https://playwright.dev/).
+- **Related agents.**
+  [PokéChamp](https://proceedings.mlr.press/v267/karten25a.html) (ICML 2025)
+  and [Metamon](https://arxiv.org/abs/2504.04395) (RLJ/RLC 2025). They are
+  cited as directions, not as comparable measurements.
+
+The first-edition notes follow unchanged, for provenance.
+
 Checked 2026-10-07 against repository source and the primary sources below. This is an editorial research note, not a new runtime implementation or an experimental result.
 
 ## Exact implementation facts that change the mathematics

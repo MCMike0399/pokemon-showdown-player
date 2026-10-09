@@ -1,0 +1,128 @@
+\section{One live turn: browser transport, guards and viewer}
+\label{sec:transport}
+
+\subsection{The sequence}
+Figure~\ref{fig:liveturn} follows one turn from the server's request to the
+viewer's animation. The browser runner holds an account lock, so only one
+controller can drive the account. It reads the official client's state through
+\code{app.rooms[id]}, using the request, \code{battle.stepQueue}, the choice
+state and the preview order, and acts only by clicking visible controls. It
+opens no protocol socket of its own.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \def\H{-11.2}
+  \foreach \x/\n in {0/{Showdown\\server},3.1/{Client page\\(Chromium)},6.2/{Browser\\player},9.3/{Search agent\\+ 3 engines},12.4/{Ledger and\\viewer}}{
+    \node[box,text width=22mm,minimum height=10mm] at (\x,0) {\n};
+    \draw[draw=gridgray,thick,dashed] (\x,-0.55) -- (\x,\H);
+  }
+  \newcommand{\msg}[5]{\draw[arr,#5] (#1,#3) -- node[font=\scriptsize,above,align=center]{#4} (#2,#3);}
+  \msg{0}{3.1}{-1.0}{1 request (rqid), log}{}
+  \msg{3.1}{6.2}{-1.8}{2 poll 0.25\,s: actionable?}{}
+  \node[font=\scriptsize,align=left,anchor=west,fill=white] at (6.3,-2.45) {3 \code{legal_choices}, \code{observe}};
+  \msg{6.2}{9.3}{-3.2}{4 context}{}
+  \node[font=\scriptsize,align=left,anchor=west,fill=white,text width=30mm] at (9.4,-4.05) {5 tracker $\to$ 6 worlds\\$\to$ matrices $\to$ RM\\$\to$ blend $\to$ $a^*$};
+  \msg{9.3}{6.2}{-5.0}{6 choice $a^*$ (median 2.3\,s)}{}
+  \msg{6.2}{12.4}{-5.6}{7 decision event}{}
+  \msg{6.2}{3.1}{-6.4}{8 re-snapshot: same rqid? not waiting? still legal?}{draw=seriesB}
+  \msg{6.2}{3.1}{-7.2}{9 install click guard; click controls}{}
+  \msg{3.1}{0}{-8.0}{10 \code{/choose ...}}{}
+  \msg{3.1}{6.2}{-8.8}{11 waiting, or rqid changed}{dashed}
+  \msg{0}{3.1}{-9.6}{12 turn resolves; protocol}{}
+  \msg{3.1}{12.4}{-10.4}{13 filtered frame (0.2\,s) $\to$ SSE delta}{}
+\end{tikzpicture}
+\caption{One live turn under search. Step 8 is the freshness check after the
+decision. Step 9 installs a capture-phase guard that cancels any click once
+the server's rqid has changed. Preview turns replace steps 4--6 with a greedy
+actor decision. In recorded mode, steps 4--6 are \code{Brain.decide}.}
+\label{fig:liveturn}
+\end{figure}
+
+\subsection{Freshness guards}
+Search takes seconds and the client keeps animating, so the request on screen
+can change while a decision is being computed. Three checks keep a stale
+decision from being clicked:
+\begin{enumerate}
+  \item After deciding, the runner takes a new snapshot. The server rqid must
+    be unchanged, the client must not already be waiting, and the choice must
+    be legal under the new request. Only the rqid is compared, because the
+    client mutates its own copy of the request.
+  \item A capture-phase listener on the document cancels any click in the room
+    if \code{request.rqid} differs from the guarded rqid, or if the client is
+    waiting.
+  \item Before each control the runner re-checks the rqid, and it aborts if
+    the guard has fired.
+\end{enumerate}
+
+\begin{proposition}[Clicks act only on the decided request]
+\label{prop:fresh}
+Assume that the server assigns a fresh rqid to each request, and that the page
+runs JavaScript on a single-threaded event loop. Then every click that
+reaches the client's own handler does so while the displayed request has the
+rqid the decision was computed for, and while the client is not waiting.
+\end{proposition}
+\begin{proof}
+A click event is dispatched to the capture listener and to the client's
+handler within one task of the event loop. A WebSocket message that would
+replace the request is processed in a separate task, so it cannot run between
+the guard's check and the handler. The guard lets the event proceed only if
+the rqid equals the decided one and the client is not waiting. Since rqids are
+fresh, equal rqids identify the same request.
+\end{proof}
+
+\caveat{The proposition protects individual clicks. A multi-click choice
+(Mega checkbox, move, target) can be cut off midway when the request changes,
+leaving a partial choice that the next request supersedes. Server acceptance
+is confirmed separately, by waiting up to 10\,s for the client to show waiting
+or a new rqid. A new \code{|error|}, or an unchanged rqid with a changed
+fingerprint, counts as a rejection. At most three submissions are made per
+rqid, that is, two retries; a third rejection stops the run.}
+
+\subsection{Recovery}
+Two recovery paths exist:
+\begin{itemize}
+  \item \textbf{Recorded browser runs.} A run that restarts mid-game resubmits
+    a saved, unsubmitted proposal only if its stored request equals the
+    current one. If the saved proposal was already submitted, the runner stops
+    rather than guessing, because the server's acknowledgement is ambiguous.
+  \item \textbf{MCP path.} \code{Brain.resume} restores one compatible pending
+    episode after a transport failure, with the same identity, steps and
+    log-probabilities. It refuses ambiguous fragments or schema changes, and
+    resubmits a saved action for the same rqid without resampling, with up to
+    three attempts per room.
+\end{itemize}
+The first edition said that a crash loses the session with no mid-game
+reconstruction. That is no longer true, within these limits.
+
+\begin{proposition}[Scope of submission idempotence]
+\label{prop:idempotent}
+Within one serialized session, a repeated submission for a cached request
+sends no second choice unless rejection handling removed the cache entry.
+Repeated finalization returns the cached terminal result. A complete stored
+episode is never overwritten.
+\end{proposition}
+\begin{proof}
+The choose path checks its cache key before selecting or sending, and finish
+returns an existing terminal result first. The store returns early when the
+stored identifier is already complete.
+\end{proof}
+This is not an exactly-once guarantee across processes. A send completing on
+the socket is not a server acknowledgement, and an external submission can
+still interleave.
+
+\subsection{The live viewer}
+The runner publishes filtered public protocol, with names replaced by ``Your
+agent'' and ``Opponent'', to an atomically replaced relay file every 0.2\,s.
+A small server streams appended lines as server-sent events \citep{sse}. It
+sends a full snapshot on a room change or reconnect, and serves only over the
+tailnet with HTTPS. The client plays each turn in full. With two or more
+turns queued it switches to a faster speed. With four or more it jumps to the
+newest turn. A renderer stuck for 15\,s is skipped forward. The viewer is for
+observation only and plays no part in decisions.
+
+\source{\code{ml/browser.py} (\code{snapshot}, \code{context}, guards,
+\code{submit}, recovery, \code{watch}); \code{scripts/browser_play.py};
+\code{scripts/live_watch.py}; \code{web/live-watch/}; \code{ml/live.py}
+(\code{resume}, transport recovery); \code{docs/browser-play.md};
+\code{docs/live-watch.md}; Playwright \citep{playwright}.}

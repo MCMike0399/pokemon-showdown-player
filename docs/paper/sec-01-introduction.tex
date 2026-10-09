@@ -1,0 +1,112 @@
+\section{Introduction and scope}
+\label{sec:scope}
+
+The practical question behind this repository is simple to state. Can one
+laptop, with no human in the turn loop, play a current VGC format on the
+public Showdown ladder, improve from its own experience, and prove each
+improvement before relying on it? Answering it takes several kinds of
+component, each with its own evidence and failure modes. A transport has to
+deliver legal choices on time. A decision procedure has to choose them. A data
+recorder has to preserve exactly what was known when each choice was made. A
+learner has to turn those records into candidate models. A statistical gate
+has to decide which candidates are better. This report explains each
+component, gives the mathematics it relies on, and states what has been
+measured.
+
+\subsection{What changed since the first edition}
+The first edition (7 October 2026) described a persistent MCP harness in
+which the OpenClaw agent called tools and a local actor--critic chose every
+battle decision. Thirty-three public commits later the deployed system is
+different in five ways that matter mathematically:
+\begin{enumerate}
+  \item \textbf{Turn decisions come from search.} A determinized one-turn
+    simultaneous-move search over the official simulator chooses live turn
+    actions (Section~\ref{sec:search}). The neural actor now chooses only team
+    previews, and it does so greedily.
+  \item \textbf{The neural policy has a temperature and a strategic prior.}
+    Logits are divided by $\tau=0.25$. The additive prior is no longer the
+    legacy power heuristic: it is a squashed one-turn scenario evaluation
+    (Sections~\ref{sec:features} and~\ref{sec:network}).
+  \item \textbf{Promotion is a hypothesis test.} Candidates must pass an exact
+    one-sided paired sign test at $p\le0.05$ as well as a win margin. The worker
+    only stages a candidate; promotion happens later at a matchmaking boundary
+    (Section~\ref{sec:promotion}).
+  \item \textbf{Training is a three-lane pipeline.} CPU collection, PPO on the
+    Apple~MPS GPU and CPU evaluation run as separate bounded processes. Each
+    trajectory is checked against its collecting likelihood, and PPO stops
+    early on a KL criterion (Sections~\ref{sec:learning} and~\ref{sec:pipeline}).
+  \item \textbf{Live play is browser-driven.} Playwright clicks the official
+    client, guarded by the request identifier. OpenClaw and MCP remain available
+    for agent-supervised play but are no longer in the turn loop
+    (Section~\ref{sec:transport}).
+\end{enumerate}
+Appendix~\ref{app:errata} lists every first-edition statement that this
+edition corrects, including one circular proposition and several claims made
+stale by later commits.
+
+\subsection{Three kinds of statement}
+The report keeps three kinds of statement apart:
+\begin{enumerate}
+  \item \textbf{Implemented behaviour}: facts traceable to source functions,
+    such as tensor dimensions, constants and gate predicates. These are
+    followed by an \emph{Implementation} line naming the files.
+  \item \textbf{Conditional mathematical results}: propositions proved under
+    explicit assumptions, followed by an \emph{Interpretation} or
+    \emph{Caveat} that says how far the result transfers to the running system.
+  \item \textbf{Measurements}: results of experiments run by the project,
+    cited to the repository's validation documents or, where marked, to the
+    local run ledger. This paper ran no new games, training or promotion, apart
+    from read-only recomputation of the statistics it reports.
+\end{enumerate}
+
+\subsection{Format and pinned mechanics}
+The main target is \code{gen9championsvgc2026regmc}: doubles, bring six and
+pick four, open team sheets on request, one Mega Evolution per battle, no
+Terastallization, Item and Species Clauses, and Champions stat points instead
+of EVs and IVs \citep{championsrules}. The local simulator dependency is
+pinned to official Showdown commit
+\code{c046106cbe075931b1ff8d8b800ff5be47a85f96} \citep{showdownsource}. A
+format identifier beginning with \code{gen9} does not determine these
+mechanics. Format, simulator revision, feature profile, team fingerprint and
+collecting checkpoint are part of every scientific statement in this report.
+
+\subsection{Summary of measured results}
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.34\linewidth} X}
+\toprule
+Question & Measured answer (details in Section~\ref{sec:evidence}) \\
+\midrule
+Does search beat the learned policy offline? & Same 45 seeds, sides and real
+opponent teams: search 30/45 vs.\ policy 19/45; 14 gains, 3 losses; exact
+McNemar $p=0.0064$. Clustering by opponent team: $p=0.0037$. \\
+Did the learned policy improve over campaigns? & Live record 348--499 (41.1\%)
+over 847 games across three actor generations. One strategic prior passed an
+independent 160-game final (125 vs.\ 106, $p=0.0072$). One PPO update passed
+the 60-game gate out of 129 attempts. \\
+What happened live after search? & Preliminary and observational: 41 games,
+27--14. Rating 1182 $\rightarrow$ 1464. Elo-expected 18.4 wins in 37 rated
+games; observed 23 (exact $p=0.086$). \\
+What failed? & More than thirty candidates: PPO variants, preview models, a
+matchup architecture that passed development and then tied its final, and an
+offline hyperparameter matrix with no significant arm after Holm correction. \\
+\bottomrule
+\end{tabularx}
+\caption{Headline evidence. Ladder results depend on the opponent pool and on
+rating-based matchmaking; Section~\ref{sec:elo} explains why a raw win rate is
+not a stable strength measure.}
+\label{tab:headline}
+\end{table}
+
+\subsection{How to read this report}
+Section~\ref{sec:system} gives the system map and project timeline.
+Sections~\ref{sec:game}--\ref{sec:network} formalize the game, the candidate
+actions, the features and the neural policy. Section~\ref{sec:data} describes
+the record kept for every match. Sections~\ref{sec:learning}--\ref{sec:promotion}
+cover learning, the CPU/MPS pipeline and promotion statistics.
+Section~\ref{sec:search} analyses the search agent and
+Section~\ref{sec:transport} the live turn. Section~\ref{sec:scout} covers
+opponent-move scouting and team selection. Section~\ref{sec:evidence} collects
+all evidence and Section~\ref{sec:limits} its limits. The appendices provide a
+glossary, the corrections to the first edition, defects found during review, a
+source map and reproduction notes.
