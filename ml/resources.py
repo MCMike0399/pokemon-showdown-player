@@ -55,6 +55,7 @@ class BackgroundGuard:
 class ResourcePolicy:
     reserve_cores: int = 3
     max_workers: int = 4
+    evaluation_workers: int | None = None
     training_threads: int = 2
     min_available_gb: float = 2.0
     max_system_cpu_percent: float = 75.0
@@ -70,6 +71,10 @@ class ResourcePolicy:
             raise ValueError("backend must be auto, cpu or mps")
         if not 1 <= self.max_workers <= 8 or not 1 <= self.training_threads <= 4:
             raise ValueError("workers must be 1..8 and training threads 1..4")
+        if self.evaluation_workers is not None and (
+                type(self.evaluation_workers) is not int or
+                not 1 <= self.evaluation_workers <= max(1, self.max_workers-1)):
+            raise ValueError('evaluation workers must leave a collector slot when capacity permits')
         if not 0.01 <= self.gpu_fraction <= 0.25 or not 0.05 <= self.gpu_duty_fraction <= 1:
             raise ValueError("GPU memory fraction must be .01..25 and duty fraction .05..1")
         if self.reserve_cores < 1 or self.min_available_gb < 1 or not 10 <= self.max_system_cpu_percent <= 90:
@@ -77,6 +82,14 @@ class ResourcePolicy:
         if self.worker_memory_mb < 100 or self.max_disk_gb < 1 or self.max_swapout_mb_per_second <= 0:
             raise ValueError('worker memory >=100 MB, disk budget >=1 GB and positive swap-out limit required')
         self._swap_sample = None
+
+    def simulator_workers(self, lane: str) -> int:
+        evaluation = self.evaluation_workers or max(1, self.max_workers // 2)
+        if lane == 'evaluator':
+            return evaluation
+        if lane == 'collector':
+            return max(1, self.max_workers-evaluation)
+        return self.max_workers
 
     def sample(self, resident_workers: int = 0):
         memory = psutil.virtual_memory()
@@ -109,7 +122,7 @@ class ResourcePolicy:
                 'swapout_mb_per_second': round(swapout_rate, 2), 'training_allowed': healthy,
                 "deferred": workers == 0, "policy": asdict(self)}
 
-    def apply_background(self):
+    def apply_background(self, enable_mps: bool = True):
         # Changes affect this worker process and its children, never other services.
         if os.name == "posix":
             try:
@@ -121,7 +134,7 @@ class ResourcePolicy:
         os.environ["PS_TORCH_THREADS"] = str(self.training_threads)
         import torch
         torch.set_num_threads(self.training_threads)
-        if torch.backends.mps.is_available():
+        if enable_mps and self.backend != 'cpu' and torch.backends.mps.is_available():
             torch.mps.set_per_process_memory_fraction(self.gpu_fraction)
 
 

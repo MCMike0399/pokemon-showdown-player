@@ -213,3 +213,13 @@ Model architecture, feature meanings, storage schema or dependency changes need
 an explicit compatible version/migration and validation. Merely editing them
 cannot guarantee that old weights or histories will load, or that playing
 strength improves. This reload mechanism does not provide automatic code rollback.
+
+## Calibrated compute controls
+
+`evaluation_workers` optionally assigns more of `max_workers` to CPU evaluation,
+leaving the remainder for collection. Both roles still use shared simulator
+slots and headroom checks. CPU roles skip Metal allocator setup and seed only
+the CPU generator. One MPS learner can use full duty when the measured workload
+benefits, with its nonzero memory limit and host guards retained. Configure these
+settings in the ignored `autopilot.json`; host-specific timings belong in local
+artifacts. See [the offline follow-up](offline-ppo-followup.md).

@@ -49,7 +49,9 @@ def rollout(task: dict):
     model = Model(Path(task["checkpoint_root"]), task["format"])
     brain.models[task["format"]] = model
     opponent_model = Model(Path(task['opponent_checkpoint_root']), task['format']) if task.get('opponent_checkpoint_root') else None
-    torch.manual_seed(task["seed"])
+    # These actors sample only on CPU. Seed its generator directly instead of
+    # touching accelerator generators through the global manual_seed API.
+    torch.random.default_generator.manual_seed(task["seed"])
     try:
         return asyncio.run(play_local(brain, task["format"], task["team1"], task["team2"],
                                      opponent=task.get("opponent", "heuristic"), seed=task["seed"],
@@ -450,19 +452,23 @@ async def learn(store: Store, job: dict, config: LearningConfig, policy: Resourc
         if resources_checkpoint:
             resources_checkpoint()
     try:
-        training = candidate.train(episodes, epochs=job["payload"].get("epochs", 4),
+        training = candidate.train(episodes, epochs=job["payload"].get("epochs", config.training_epochs),
                                    imitation=job["payload"].get("imitation", False),
                                    duty_fraction=policy.gpu_duty_fraction if backend == "mps" else 1,
-                                   deadline=deadline, checkpoint=checkpoint)
+                                   deadline=deadline, checkpoint=checkpoint,
+                                   learning_rate=config.learning_rate, entropy_coef=config.entropy_coef,
+                                   minibatch_size=config.minibatch_size, target_kl=config.target_kl)
     except RuntimeError as error:
         if backend != "mps":
             raise
         # Restart from the same incumbent if a Metal kernel/budget is unavailable.
         snapshot(incumbent.path, candidate_root, fmt)
         candidate = Model(candidate_root, fmt)
-        training = candidate.train(episodes, epochs=job['payload'].get('epochs', 4),
+        training = candidate.train(episodes, epochs=job['payload'].get('epochs', config.training_epochs),
                                    imitation=job['payload'].get('imitation', False), deadline=deadline,
-                                   checkpoint=checkpoint)
+                                   checkpoint=checkpoint, learning_rate=config.learning_rate,
+                                   entropy_coef=config.entropy_coef, minibatch_size=config.minibatch_size,
+                                   target_kl=config.target_kl)
         training["mps_fallback"] = str(error)[:200]
         backend = "cpu"
     if not training.get("trained"):
@@ -545,7 +551,7 @@ async def run(root: Path, once: bool = True, schedule: bool = False, lane: str =
         if lane != 'all':
             # Two pools together retain at most max_workers processes; their
             # active waves also obey the shared slot cap and host headroom.
-            policy._simulator_cap = max(1, policy.max_workers // 2)
+            policy._simulator_cap = policy.simulator_workers(lane)
             policy._pipeline_lane = lane
         if schedule:
             queue_daily(store, config)
@@ -557,7 +563,7 @@ async def run(root: Path, once: bool = True, schedule: bool = False, lane: str =
         if not disk['background_allowed']:
             progress('deferred', reason='learning data root exceeds storage budget')
             return {"deferred": True, "reason": "retained model data reached background storage limit; live reserve protected", "storage": disk}
-        policy.apply_background()
+        policy.apply_background(enable_mps=lane in ('all', 'learner'))
         started = time.monotonic()
         deadline = started + config.max_seconds
         reports = []

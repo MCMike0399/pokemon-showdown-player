@@ -44,8 +44,13 @@ class RolloutBatcher:
         if self.resident is not None:
             indices = torch.tensor(positions, device=self.device)
             self.hits += len(positions)
-            selected = tuple(t.index_select(0, indices) for t in self.resident)
-            return selected[0], selected[1][:, :columns], selected[2][:, :columns], selected[3]
+            states, actions, mask, choices = self.resident
+            # Slice the immutable source before gathering. A battle minibatch
+            # need not copy the wide team-preview padding into a new tensor.
+            return (states.index_select(0, indices),
+                    actions[:, :columns].index_select(0, indices),
+                    mask[:, :columns].index_select(0, indices),
+                    choices.index_select(0, indices))
         # Large histories avoid a global padded GPU allocation. Cache packed
         # per-transition CPU tensors with eviction, then transfer one minibatch.
         encoded = []

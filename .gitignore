@@ -19,3 +19,4 @@ data/
 .pytest_cache/
 artifacts/
 .DS_Store
+.ipynb_checkpoints/

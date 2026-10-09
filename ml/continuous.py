@@ -33,6 +33,11 @@ class LearningConfig:
     open_team_sheet_probability: float = .08
     max_training_backlog_steps: int = 1024
     max_inflight_candidates: int = 2
+    learning_rate: float = 3e-4
+    entropy_coef: float = .01
+    minibatch_size: int = 32
+    training_epochs: int = 4
+    target_kl: float = .03
 
     def __post_init__(self):
         from battle_state import to_id
@@ -51,6 +56,12 @@ class LearningConfig:
             raise ValueError('training backlog must be at least the minimum batch and at most 16384 steps')
         if type(self.max_inflight_candidates) is not int or not 1 <= self.max_inflight_candidates <= 4:
             raise ValueError('inflight candidates must be 1..4')
+        if not 0 < self.learning_rate <= 1 or not 0 <= self.entropy_coef <= 1 or not 0 < self.target_kl <= 1:
+            raise ValueError('invalid PPO learning rate, entropy coefficient or target KL')
+        if type(self.minibatch_size) is not int or not 1 <= self.minibatch_size <= 4096:
+            raise ValueError('PPO minibatch size must be 1..4096')
+        if type(self.training_epochs) is not int or not 1 <= self.training_epochs <= 30:
+            raise ValueError('PPO epochs must be 1..30')
         from ml.feeds import ARCHIVES
         if any(name not in ARCHIVES for name in self.archives):
             raise ValueError("archive must be an approved pinned source")

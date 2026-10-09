@@ -55,7 +55,9 @@ def job_summary(result: dict) -> dict:
         'staged_for_between_game_promotion', 'partial', 'steps', 'required_steps') if key in result}
     if result.get('training'):
         summary['training'] = {key: result['training'][key] for key in ('trained', 'episodes', 'steps', 'revision',
-            'previous_revision', 'device', 'optimizer_steps', 'training_seconds', 'maximum_collecting_logprob_error')
+            'previous_revision', 'device', 'optimizer_steps', 'training_seconds', 'maximum_collecting_logprob_error',
+            'learning_rate', 'entropy_coef', 'minibatch_size', 'mean_entropy', 'epochs_completed',
+            'target_kl', 'kl_history', 'clip_fraction_history')
             if key in result['training']}
     if result.get('evaluation'):
         summary['evaluation'] = result['evaluation']

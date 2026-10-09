@@ -95,3 +95,11 @@ For battles, PSClient.battle_summary() and current_requests() give the state you
 `ps_team_list/get/create/update/delete/packed`, `ps_ladder`, `ps_choices`, `ps_result`
 (plus the connection tools above). So an agent can: create a team -> ladder -> read `ps_waiting`,
 -> `ps_choices` -> `ps_choose` -> `ps_result`, entirely through MCP.
+
+### Offline PPO notebook
+
+Run `./scripts/run_notebook.sh` and open `notebooks/01_offline_ppo.ipynb` with the
+**Pokemon Offline (M5 Pro)** kernel. It compares learning-rate and entropy
+settings, completed-episode rewards, CPU/Metal throughput, and replay-trained
+scouting in isolated offline runs. See [setup and operation](docs/offline-ppo-notebook.md)
+and [experiment sources](docs/offline-ppo-experiments-research.md).

@@ -177,11 +177,19 @@ class Model:
 
     def train(self, episodes: list[dict], epochs: int = 4, imitation: bool = False,
               duty_fraction: float = 1.0, deadline: float | None = None,
-              target_kl: float = 0.03, checkpoint=None) -> dict:
+              target_kl: float = 0.03, checkpoint=None, *,
+              learning_rate: float | None = None, entropy_coef: float = 0.01,
+              minibatch_size: int = 32, shuffle_seed: int = 0) -> dict:
         if not 1 <= epochs <= 30:
             raise ValueError("epochs must be between 1 and 30")
         if not 0 < target_kl <= 1:
             raise ValueError("target KL must be positive and at most 1")
+        if learning_rate is not None and not 0 < learning_rate <= 1:
+            raise ValueError('learning rate must be positive and at most 1')
+        if not np.isfinite(entropy_coef) or not 0 <= entropy_coef <= 1:
+            raise ValueError('entropy coefficient must be finite and between 0 and 1')
+        if not isinstance(minibatch_size, int) or not 1 <= minibatch_size <= 4096:
+            raise ValueError('minibatch size must be an integer between 1 and 4096')
         training_started = time.perf_counter()
         samples = []
         if checkpoint:
@@ -256,22 +264,26 @@ class Model:
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
         for sample, advantage in zip(samples, advantages):
             sample["advantage"] = float(advantage)
-        rng = np.random.default_rng(0)
+        if learning_rate is not None:
+            for group in self.optimizer.param_groups:
+                group['lr'] = learning_rate
+        rng = np.random.default_rng(shuffle_seed)
         losses = []
+        entropies = []
         kl_history = []
         clip_fractions = []
         self.net.train()
         device = next(self.net.parameters()).device
         for _ in range(epochs):
             order = rng.permutation(len(samples))
-            for start in range(0, len(samples), 32):
+            for start in range(0, len(samples), minibatch_size):
                 if checkpoint:
                     checkpoint()
                 if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError("training budget expired before saving candidate")
                 started = time.monotonic()
-                batch = [samples[i] for i in order[start:start + 32]]
-                states, actions, mask, indices = batcher.batch(order[start:start + 32])
+                batch = [samples[i] for i in order[start:start + minibatch_size]]
+                states, actions, mask, indices = batcher.batch(order[start:start + minibatch_size])
                 logits, values = self.net(states, actions, mask)
                 logits = self.training_logits(logits, batch)
                 dist = Categorical(logits=logits)
@@ -287,14 +299,17 @@ class Model:
                     returns = torch.tensor([s["return"] for s in batch], device=device)
                     ratio = (logprobs - old).exp()
                     policy = -torch.minimum(ratio * adv, ratio.clamp(0.8, 1.2) * adv)
-                    loss = ((policy + 0.5 * (values - returns).square() - 0.01 * dist.entropy()) * phase_weights).mean()
+                    loss = ((policy + 0.5 * (values - returns).square() - entropy_coef * dist.entropy()) * phase_weights).mean()
                 if not torch.isfinite(loss):
                     raise RuntimeError("non-finite training loss; checkpoint has not been saved")
                 self.optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(self.net.parameters(), 0.5)
                 self.optimizer.step()
-                losses.append(float(loss.detach()))
+                # Keep diagnostics on device until reporting; scalar reads
+                # otherwise synchronize Metal after every optimizer step.
+                losses.append(loss.detach())
+                entropies.append(dist.entropy().detach().mean())
                 if device.type == "mps" and duty_fraction < 1:
                     torch.mps.synchronize()
                     time.sleep((time.monotonic() - started) * (1 / duty_fraction - 1))
@@ -313,8 +328,12 @@ class Model:
                         old = torch.tensor([s['logprob'] for s in batch], device=device)
                         change = Categorical(logits=logits).log_prob(indices) - old
                         ratio = change.exp()
-                        divergences.extend(((ratio - 1) - change).tolist())
-                        clipped.extend(((ratio - 1).abs() > .2).float().tolist())
+                        divergences.append(((ratio - 1) - change).detach())
+                        clipped.append(((ratio - 1).abs() > .2).float())
+                # Preserve the old per-sample order and Python double-precision
+                # summation, including the exact whole-batch KL stop rule.
+                divergences = torch.cat(divergences).cpu().tolist()
+                clipped = torch.cat(clipped).cpu().tolist()
                 kl_history.append(sum(divergences) / len(divergences))
                 clip_fractions.append(sum(clipped) / len(clipped))
                 if kl_history[-1] > target_kl:
@@ -322,6 +341,9 @@ class Model:
         old_revision = self.revision
         if checkpoint:
             checkpoint()
+        diagnostics = torch.stack((torch.stack(losses), torch.stack(entropies)), dim=1).cpu().tolist()
+        losses = [row[0] for row in diagnostics]
+        entropies = [row[1] for row in diagnostics]
         self.revision = uuid.uuid4().hex
         self.updates += 1
         self.save()
@@ -336,6 +358,8 @@ class Model:
                 'excluded_episodes': excluded, 'maximum_collecting_logprob_error': maximum_logprob_error,
                 'batch_cache': batcher.stats(),
                 'optimizer_steps': len(losses), 'training_seconds': round(time.perf_counter() - training_started, 3),
+                'learning_rate': self.optimizer.param_groups[0]['lr'], 'entropy_coef': entropy_coef,
+                'minibatch_size': minibatch_size, 'mean_entropy': sum(entropies) / len(entropies),
                 'device': device.type, 'duty_fraction': duty_fraction,
                 'source_steps': {source: sum(s['_source'] == source for s in samples)
                                  for source in sorted({s['_source'] for s in samples})}}
