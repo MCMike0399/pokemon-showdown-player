@@ -136,7 +136,8 @@ const context = vm.createContext({
   setTimeout() {},
   EventSource: class {addEventListener() {} close() {}},
   Battle: class {
-    constructor(options) {events.push(['create', options.paused]);}
+    constructor(options) {this.stepQueue=[]; this.currentStep=0; this.scene={updateAcceleration() {}};
+      events.push(['create', options.paused]);}
     setViewpoint(side) {events.push(['viewpoint', side]);}
     addBatch(lines) {events.push(['append', lines]);}
     seekTurn() {events.push(['seek']);}
@@ -173,11 +174,7 @@ vm.runInContext('shown = data.room', context);
     assert events[events.index(["destroy"]) - 1] == ["pause"]
 
 
-def test_reconnect_catches_up_and_replays_ignore_other_rooms():
-    node = shutil.which('node')
-    if not node:
-        pytest.skip('viewer checks require Node')
-    script = r"""
+PACING_HARNESS = r"""
 const fs = require('node:fs'), vm = require('node:vm');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const events = [];
@@ -187,18 +184,42 @@ const context = vm.createContext({
   Dex: {getSpriteData() {}}, BattleSound: {setMute() {}}, jQuery: () => ({empty() {}}),
   EventSource: class {addEventListener() {} close() {}},
   Battle: class {
-    constructor() {this.turn=1; this.stepQueue=[]; this.currentStep=0; events.push('create');}
-    setViewpoint() {} addBatch() {} seekTurn() {events.push('seek');}
+    constructor() {this.turn=1; this.stepQueue=[]; this.currentStep=0; this.atQueueEnd=false;
+      this.scene={updateAcceleration() {}}; events.push('create');}
+    setViewpoint() {}
+    addBatch(lines) {
+      this.stepQueue.push(...lines);
+      for (const line of lines) if (line.startsWith('|turn|')) this.lastTurn = Number(line.slice(6));
+    }
+    seekTurn(turn) {
+      events.push(turn === Infinity ? 'seek' : 'seek:' + turn);
+      this.turn = turn === Infinity ? this.lastTurn : turn;
+    }
     play() {events.push('play');} pause() {} destroy() {}
   },
 });
 vm.runInContext(fs.readFileSync(input.viewer, 'utf8'), context);
+const fade = () => vm.runInContext('battle.messageFadeTime', context);
+"""
+
+
+def run_pacing(body):
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('viewer checks require Node')
+    result = subprocess.run([node, '-e', PACING_HARNESS + body], input=json.dumps({'viewer': str(VIEWER)}),
+                            text=True, capture_output=True, check=True)
+    return json.loads(result.stdout)
+
+
+def test_reconnect_catches_up_and_replays_ignore_other_rooms():
+    data = run_pacing(r"""
 context.data = {room:'battle-test-1', side:'p2', live:true, turn:1, log:['|turn|1']};
 vm.runInContext('shown=data.room; applyBattle(data)', context);
 vm.runInContext('applyBattle(data)', context); // Unchanged state does not start another animation loop.
 vm.runInContext('connect(); applyBattle(data)', context); // Reconnecting catches up even with the same log.
 context.data = {...context.data, turn:5, log:['|turn|1','|turn|5']};
-vm.runInContext('applyBattle(data)', context); // A large turn backlog must be skipped.
+vm.runInContext('applyBattle(data)', context); // A large backlog jumps to the newest turn's start.
 context.data = {...context.data, log:['|turn|2','|turn|5']};
 vm.runInContext('applyBattle(data)', context); // Same-length changed prefix rebuilds instead of duplicating.
 const liveEvents = [...events];
@@ -207,13 +228,43 @@ const replayEvents = events.slice(liveEvents.length);
 context.data = {...context.data, room:'battle-test-2'};
 vm.runInContext('applyBattle(data)', context);
 process.stdout.write(JSON.stringify({liveEvents, replayEvents, events}));
-"""
-    result = subprocess.run([node, '-e', script], input=json.dumps({'viewer': str(VIEWER)}),
-                            text=True, capture_output=True, check=True)
-    data = json.loads(result.stdout)
-    assert data['liveEvents'] == ['create', 'seek', 'play', 'seek', 'seek', 'create', 'seek', 'play']
+""")
+    assert data['liveEvents'] == ['create', 'seek', 'play', 'seek', 'seek:4', 'create', 'seek', 'play']
     assert data['replayEvents'] == ['create', 'play']
     assert data['events'] == data['liveEvents'] + data['replayEvents']
+
+
+def test_live_turns_play_out_and_backlog_speeds_up_before_skipping():
+    data = run_pacing(r"""
+const steps = [];
+const frame = (turn, live=true) => {
+  context.data = {room:'battle-test-1', side:'p1', live, turn,
+    log:[...Array(turn).keys()].flatMap(n => ['|move|p1a: A|Tackle|p2a: B', '|turn|' + (n + 1)])};
+  vm.runInContext('applyBattle(data)', context);
+};
+vm.runInContext("shown='battle-test-1'", context);
+frame(1);
+const entry = events.length;
+frame(2); steps.push({events: events.slice(entry), fade: fade()});   // the next turn animates in full
+frame(3); steps.push({events: events.slice(entry), fade: fade()});   // one more queued: hyperfast, no skip
+vm.runInContext('battle.turn = 3', context);
+vm.runInContext("playbackState('turn')", context);
+steps.push({events: events.slice(entry), fade: fade()});             // caught up: normal speed again
+frame(4, false); steps.push({events: events.slice(entry), fade: fade()}); // the final turn is not cut
+frame(8); steps.push({events: events.slice(entry), fade: fade()});   // a long backlog jumps to turn 7
+process.stdout.write(JSON.stringify(steps));
+""")
+    assert [step['events'] for step in data[:4]] == [[], [], [], []]
+    assert [step['fade'] for step in data] == [100, 40, 100, 100, 100]
+    assert data[4]['events'] == ['seek:7']  # ...where the newest turn animates at normal speed.
+
+
+def test_animations_are_never_skipped_on_a_timer():
+    source = VIEWER.read_text()
+    timer = source[source.index('liveTimer = window.setInterval'):]
+    timer = timer[:timer.index('}, 1000);')]
+    assert 'stalled' in timer and '15000' in timer  # Only a renderer that stops advancing.
+    assert source.count('battle.seekTurn(') == 1    # Every skip goes through logged catchUp().
 
 
 def test_http_503_retries_one_stream_and_cancels_old_retry():

@@ -3,13 +3,62 @@ const $id = id => document.getElementById(id);
 let follow = true, shown = null, latest = null, battle = null, stream = null;
 let catchUpNext = true, replay = false, relayLog = [], recentSignature = null;
 let retryTimer = null, liveTimer = null;
-let relayReceivedAt = 0, streamBattle = null;
+let streamBattle = null;
 let alternateArtwork = new Set();
 const roomPattern = /^battle-[a-z0-9]+-[0-9]+(?:-[a-z0-9]+)?$/;
 const battleURL = room => 'https://play.pokemonshowdown.com/' + room;
 Dex.resourcePrefix = 'https://play.pokemonshowdown.com/';
 Dex.fxPrefix = Dex.resourcePrefix + 'fx/';
 BattleSound.setMute(true);
+
+// Playback diagnostics: a bounded in-page ring (window.viewerDiag) plus batched
+// reports to /api/diag, which the server appends to live-watch-client.jsonl.
+// ?debug=1 also shows the counters over the arena.
+const debugView = /[?&]debug(?:[=&]|$)/.test(globalThis.location?.search || '');
+const diagStart = Date.now();
+const diagSession = Math.random().toString(36).slice(2, 10);
+const diagEvents = [], diagOutbox = [];
+const diagCounts = {frames: 0, seeks: 0, skippedSteps: 0, resets: 0, jank: 0, reconnects: 0};
+window.viewerDiag = {session: diagSession, events: diagEvents, counts: diagCounts};
+function diag(event, data = {}) {
+  const record = {t: Date.now() - diagStart, event, room: shown, turn: battle?.turn, ...data};
+  diagEvents.push(record);
+  if (diagEvents.length > 400) diagEvents.shift();
+  if (diagOutbox.length < 300) diagOutbox.push(record);
+}
+function flushDiag() {
+  if (!diagOutbox.length || !window.fetch) return;
+  fetch('/api/diag', {method: 'POST', keepalive: true, headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({session: diagSession, events: diagOutbox.splice(0)})}).catch(() => {});
+}
+window.setInterval?.(flushDiag, 5000);
+// Main-thread stalls show up as long gaps between animation frames.
+let lastFrame = 0;
+function watchFrames(now) {
+  if (lastFrame && !document.hidden && now - lastFrame > 120) {
+    diagCounts.jank++;
+    diag('jank', {gap: Math.round(now - lastFrame), animating: !!battle && !battle.atQueueEnd});
+  }
+  lastFrame = document.hidden ? 0 : now;
+  window.requestAnimationFrame(watchFrames);
+}
+window.requestAnimationFrame?.(watchFrames);
+if (debugView) {
+  const overlay = document.createElement('pre');
+  overlay.id = 'diag-overlay';
+  overlay.style.cssText = 'position:absolute;left:6px;bottom:6px;z-index:50;margin:0;padding:6px 8px;' +
+    'font:11px/1.35 ui-monospace,monospace;background:rgba(0,0,0,.72);color:#9fe;border-radius:6px;' +
+    'pointer-events:none;max-width:calc(100% - 12px);white-space:pre-wrap';
+  $id('arena-wrap').append(overlay);
+  window.setInterval(() => {
+    const pending = battle ? battle.stepQueue.length - battle.currentStep : 0;
+    const last = diagEvents.filter(e => e.event === 'drained').slice(-1)[0];
+    overlay.textContent = 'turn ' + (battle?.turn ?? '—') + ' / live ' + (relayLast?.turn ?? '—') +
+      '  pending ' + pending + '  speed ' + (battle?.scene?.acceleration ?? '—') + 'x\n' +
+      Object.entries(diagCounts).map(([k, v]) => k + ' ' + v).join('  ') +
+      (last ? '\nlast turn played in ' + (last.ms / 1000).toFixed(1) + 's' : '');
+  }, 250);
+}
 
 function noteAlternateArtwork(species) {
   alternateArtwork.add(species);
@@ -62,11 +111,12 @@ function newBattle(room, side) {
   alternateArtwork.clear();
   $id('sprite-notice').classList.add('hidden');
   battle = new Battle({id: room, $frame: jQuery('#battle'), $logFrame: jQuery('#battle-log'), paused: true,
-    subscription: updateViewerStatus});
+    subscription: playbackState});
   battle.roomid = room;
   battle.joinButtons = false;
   // Showdown's own fast animation mode retains move effects at twice the pace.
-  battle.messageFadeTime = 100;
+  battle.messageFadeTime = baseFadeTime;
+  hurrying = false;
   if (side) battle.setViewpoint(side);
   resizeBattle();
 }
@@ -97,34 +147,85 @@ function applyBattle(data) {
   const reset = relayRoom !== data.room || log.length < relayCount ||
     relayLog.some((line, index) => line !== log[index]);
   if (reset) {
+    const first = relayLog.findIndex((line, index) => line !== log[index]);
+    if (battle) diagCounts.resets++;
+    diag('reset', {reason: relayRoom !== data.room ? 'room' : log.length < relayCount ? 'shrink' : 'rewrite',
+      at: first, lines: log.length});
     newBattle(data.room, data.side);
     relayCount = 0; relayRoom = data.room;
   }
   if (log.length > relayCount) {
-    relayReceivedAt = Date.now();
+    diagCounts.frames++;
+    drainSince ??= Date.now();
+    diag('frame', {appended: log.length - relayCount, liveTurn: data.turn, live: data.live,
+      pending: battle.stepQueue.length - battle.currentStep});
     battle.addBatch(log.slice(relayCount));
   }
   relayCount = log.length; relayLog = log; relayLast = data;
-  const liveView = !replay;
-  const lag = Number(data.turn || 0) - battle.turn;
-  const pending = (battle.stepQueue?.length || 0) - (battle.currentStep || 0);
-  if (liveView && (reset || catchUpNext || document.hidden || lag > 1 || pending > 80 || !data.live && pending > 0)) {
-    battle.seekTurn(Infinity);
-  }
+  // Entering or reconnecting shows the current position instantly; after that,
+  // live turns play out in full and pace() only speeds up or skips real backlog.
+  if (!replay && (reset || catchUpNext)) catchUp(reset ? 'reset' : 'connect');
   // addBatch resumes playback itself. Starting a second loop causes scene errors.
   if (reset) battle.play();
   catchUpNext = false;
+  pace();
   updateViewerStatus();
+}
+
+// Live pacing. A frame normally carries one turn (its actions end with the next
+// |turn| line), so the renderer is one turn behind while it animates. Queued
+// turns play at hyperfast speed; only with four or more queued does it jump to
+// the start of the newest turn, which still animates.
+const baseFadeTime = 100, hurryFadeTime = 40;
+let hurrying = false;
+function pace() {
+  if (!battle || replay || !relayLast) return setHurry(false);
+  const behind = () => Number(relayLast.turn || 0) - Math.max(battle.turn, 0);
+  if (behind() >= 4 && !document.hidden) catchUp('backlog', relayLast.turn - 1);
+  setHurry(behind() >= 2);
+}
+function setHurry(on) {
+  if (!battle || hurrying === on) return;
+  hurrying = on;
+  battle.messageFadeTime = on ? hurryFadeTime : baseFadeTime;
+  battle.scene.updateAcceleration?.(); // Applies to the animation in progress too.
+  diag('speed', {hurry: on});
+}
+
+// Time from a frame's arrival until its animations finish playing.
+let drainSince = null;
+function playbackState(state) {
+  if (state === 'atqueueend' && drainSince !== null && battle?.seeking === null) {
+    diag('drained', {ms: Date.now() - drainSince});
+    drainSince = null;
+  }
+  if (state === 'turn' || state === 'atqueueend') pace();
+  updateViewerStatus();
+}
+
+// The only path that skips animations; every skip is logged with its reason.
+// A target turn stops the skip at that |turn| line and animates from there.
+function catchUp(reason, turn = Infinity) {
+  if (turn <= battle.turn) return; // Seeking backwards would rebuild the whole battle.
+  const from = battle.currentStep, active = !battle.atQueueEnd;
+  battle.seekTurn(turn);
+  const skipped = battle.currentStep - from;
+  if (active && skipped > 0) {
+    // Entering/reconnecting shows the current position; only later skips are cuts.
+    const entry = reason === 'reset' || reason === 'connect';
+    if (!entry) { diagCounts.seeks++; diagCounts.skippedSteps += skipped; }
+    diag(entry ? 'enter' : 'seek', {reason, skipped, to: turn === Infinity ? 'end' : turn});
+  }
 }
 
 function updateViewerStatus() {
   if (!relayLast || !battle) return;
-  if (latest?.feed_stale) {
+  if (latest?.feed_stale && !replay) {
     $id('viewer-status').textContent = 'Player feed interrupted · Last received turn ' + (relayLast.turn || 0);
     return;
   }
   const turn = Math.max(0, battle.turn || 0);
-  const lagging = relayLast.live && turn < (relayLast.turn || 0);
+  const lagging = relayLast.live && turn < (relayLast.turn || 0) - 1;
   $id('viewer-status').textContent = relayLast.live
     ? lagging ? 'Catching up · Turn ' + turn + ' → ' + relayLast.turn
       : relayLast.turn ? 'Live · Turn ' + relayLast.turn : 'Live · Team preview'
@@ -160,6 +261,8 @@ function connect() {
   });
   stream.onerror = () => {
     if (stream !== current) return;
+    diagCounts.reconnects++;
+    diag('stream-error', {state: current.readyState});
     catchUpNext = true;
     connectionInterrupted('Connection interrupted. Reconnecting to the live feed…');
     // EventSource retries dropped sockets itself, but an HTTP 503 can close it
@@ -213,7 +316,7 @@ $id('catchup').onclick = () => {
     if (latest?.room) show(latest.room, latest.game);
     connect();
   } else if (battle) {
-    battle.seekTurn(Infinity);
+    catchUp('jump-button');
   }
 };
 $id('reconnect').onclick = connect;
@@ -222,18 +325,21 @@ window.addEventListener('beforeunload', () => {
   if (stream) stream.close();
   if (liveTimer) clearInterval(liveTimer);
 });
-// A turn can contain enough animations to fall behind without another relay
-// arriving. Bound that delay even when the latest server turn has not changed.
+// Animations always finish on their own; only a renderer that stops advancing
+// (e.g. a scene error) is skipped forward, after a generous wait.
+let stallStep = -1, stallSince = 0;
 liveTimer = window.setInterval?.(() => {
-  if (!replay && battle && relayLast?.live && !document.hidden &&
-      battle.currentStep < battle.stepQueue.length && Date.now() - relayReceivedAt > 1800) {
-    battle.seekTurn(Infinity);
+  if (replay || !battle || !relayLast?.live || document.hidden || battle.atQueueEnd ||
+      battle.currentStep !== stallStep) {
+    stallStep = battle ? battle.currentStep : -1; stallSince = Date.now();
+  } else if (Date.now() - stallSince > 15000) {
+    catchUp('stalled');
   }
-}, 500);
+}, 1000);
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {
-    catchUpNext = true;
-    if (relayLast && !replay && battle) battle.seekTurn(Infinity);
+    // Background tabs barely run animations; drop the backlog, keep the newest turn.
+    if (relayLast && !replay && battle) pace();
   }
 });
 

@@ -15,6 +15,7 @@ from urllib.parse import urlsplit, parse_qs
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 HERE = PROJECT / "web/live-watch"
+LOGS = PROJECT / "data/ml/logs"
 ROOM = re.compile(r"^battle-[a-z0-9]+-[0-9]+(?:-[a-z0-9]+)?$")
 
 
@@ -258,6 +259,44 @@ def stream_payload(payload, previous):
     return payload
 
 
+class TriageLog:
+    """Bounded JSONL log for playback triage; one rotated generation is kept."""
+
+    def __init__(self, path, limit=5 * 1024 * 1024):
+        self.path, self.limit, self.lock = Path(path), limit, threading.Lock()
+
+    def write(self, record):
+        line = json.dumps({"at": round(time.time(), 3), **record}, separators=(",", ":")) + "\n"
+        with self.lock:
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                if self.path.exists() and self.path.stat().st_size + len(line) > self.limit:
+                    self.path.replace(self.path.with_name(self.path.stem + ".1.jsonl"))
+                with self.path.open("a") as handle:
+                    handle.write(line)
+            except OSError:
+                pass  # Diagnostics must never interrupt the live feed.
+
+
+def frame_change(previous, frame):
+    """Describe how the published battle frame moved; None when the log is unchanged."""
+    old, log = previous.get("log", []), frame.get("log", [])
+    if frame.get("room") == previous.get("room") and old == log:
+        return None
+    common = min(len(old), len(log))
+    common = next((index for index in range(common) if old[index] != log[index]), common)
+    kind = ("room" if frame.get("room") != previous.get("room") else
+            "append" if common == len(old) else "rewrite")
+    record = {"event": "frame", "kind": kind, "room": frame.get("room"), "lines": len(log),
+              "appended": len(log) - common, "turn": frame.get("turn"), "live": frame.get("live"),
+              "source": frame.get("source")}
+    if kind == "rewrite":
+        record.update(first_diff=common, removed=len(old) - common,
+                      was=old[common][:120] if common < len(old) else None,
+                      now=log[common][:120] if common < len(log) else None)
+    return record
+
+
 class StateHub:
     """One read-only publisher; every connection starts with the latest full state.
 
@@ -273,6 +312,8 @@ class StateHub:
         self.payload = {"status": {"phase": "waiting", "score": [0, 0, 0], "recent": []},
                         "battle": {"room": None, "log": [], "live": False}, "error": None}
         self.signature = None
+        self.frames = None  # Optional TriageLog of published battle-frame changes.
+        self.frame_at = None
 
     def publish(self, payload):
         # checked_at is a health timestamp, not a change in campaign state.
@@ -283,6 +324,13 @@ class StateHub:
             if signature == self.signature:
                 return
             self.signature = signature
+            change = frame_change(self.payload["battle"], payload["battle"]) if self.frames else None
+            if change:
+                now = time.monotonic()
+                if self.frame_at is not None:
+                    change["since_previous_ms"] = round((now - self.frame_at) * 1000)
+                self.frame_at = now
+                self.frames.write(change)
             self.payload = payload
             self.version += 1
             self.condition.notify_all()
@@ -314,6 +362,29 @@ class StateHub:
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
+    def do_POST(self):
+        """Accept batched playback diagnostics from viewer pages (see viewer.js diag)."""
+        code = 204
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            if urlsplit(self.path).path != "/api/diag":
+                code = 404
+            elif not 0 < length <= 65536:
+                code = 413
+            else:
+                report = json.loads(self.rfile.read(length))
+                session = str(report.get("session", ""))[:32]
+                events = report.get("events", [])
+                for event in events[:300] if isinstance(events, list) else []:
+                    if isinstance(event, dict):
+                        self.server.client_log.write({"session": session, **event})
+        except (ValueError, AttributeError):
+            code = 400
+        self.close_connection = code != 204  # A rejected body may be unread.
+        self.send_response(code)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         route = urlsplit(self.path)
         room = parse_qs(route.query).get("room", [None])[0]
@@ -330,13 +401,13 @@ class Handler(BaseHTTPRequestHandler):
             except (OSError, sqlite3.Error, ValueError):
                 body = b'{"error":"Campaign status is temporarily unavailable"}'
                 content_type, code = "application/json", 503
-        elif self.path in ("/", "/index.html"):
+        elif route.path in ("/", "/index.html"):
             body = (HERE / "index.html").read_bytes()
             content_type, code = "text/html; charset=utf-8", 200
-        elif self.path == "/viewer.js":
+        elif route.path == "/viewer.js":
             body = (HERE / "viewer.js").read_bytes()
             content_type, code = "text/javascript; charset=utf-8", 200
-        elif self.path == "/favicon.ico":
+        elif route.path == "/favicon.ico":
             body, content_type, code = b"", "image/x-icon", 204
         else:
             body, content_type, code = b"Not found", "text/plain", 404
@@ -399,10 +470,12 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=18489)
     args = parser.parse_args()
     hub = StateHub()
+    hub.frames = TriageLog(LOGS / "live-watch-frames.jsonl")
     publisher = threading.Thread(target=hub.run, daemon=True)
     publisher.start()
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     server.hub = hub
+    server.client_log = TriageLog(LOGS / "live-watch-client.jsonl")
     try:
         server.serve_forever()
     finally:

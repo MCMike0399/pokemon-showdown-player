@@ -26,12 +26,31 @@ Scores are checked every 500 ms, relay frames every 100 ms. The browser player
 observes its existing page every 200 ms during model inference and control waits;
 it publishes changed frames atomically without a second Showdown connection.
 
-Live entry, reconnection and returning to a background tab seek to the current
-match position. Normal new events use Showdown's faster animation mode, with
-automatic catch-up if the renderer falls more than a turn behind, accumulates
-over 80 events, or is still animating 1.8 seconds after the latest event batch
-(checked every 500 ms). The displayed turn distinguishes catching up from live
-state. Terminal live updates catch up immediately; selected replays animate.
+Live entry and reconnection show the current match position instantly. After
+that every turn, including the final one, plays out in full in Showdown's fast
+animation mode; animations are never cut on a timer. A frame normally carries one
+turn, so the renderer is one turn behind while it animates. With a second turn
+queued it switches to hyperfast mode until caught up; only with four or more
+queued (or after returning to a background tab that far behind) does it jump to
+the start of the newest turn, which still animates. A renderer that stops
+advancing for 15 seconds is skipped forward. **Jump to live** skips on demand.
+Selected replays animate from the start.
+
+Playback triage. Add `?debug=1` to show live counters over the arena (displayed
+vs. live turn, pending steps, speed, skips, resets, main-thread stalls,
+reconnects, last turn's play time). Every page also reports these events in
+batches to `POST /api/diag`, appended to `data/ml/logs/live-watch-client.jsonl`
+(`seek` = a skip during playback with reason and skipped steps, `enter`, `reset`
+with reason `room|shrink|rewrite`, `speed`, `jank`, `drained`, `stream-error`).
+The server logs each published battle-frame change to
+`data/ml/logs/live-watch-frames.jsonl` (`append`, `room`, or `rewrite` with the
+first differing line). Both logs keep 5 MB plus one rotated generation. To
+reproduce playback without a player, replay a recorded game at its real turn
+pace on another port:
+
+    .venv/bin/python scripts/live_watch_sim.py --events data/ml/browser-runs/<run>/events.jsonl [--speed 3] [--loop]
+    open 'http://127.0.0.1:18490/?debug=1'
+
 An observation heartbeat marks a stale player feed after ten seconds. Sound stays muted by
 default. Select a recent game for playback; **Jump to live** returns to auto-follow.
 **Reconnect** replaces the viewer's stream, without touching the player connection.

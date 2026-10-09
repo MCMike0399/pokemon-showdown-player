@@ -274,3 +274,54 @@ def test_relay_turn_comes_from_log_when_older_publisher_omits_summary(campaign):
         'room': 'battle-test-2', 'turn': None, 'side': 'p2', 'live': True,
         'log': ['|turn|2', '|move|p1a: Pikachu|Thunderbolt', '|turn|8']}))
     assert live_watch.battle_log('battle-test-2')['turn'] == 8
+
+
+def test_frame_log_classifies_appends_rewrites_and_new_rooms(tmp_path):
+    hub = live_watch.StateHub()
+    hub.frames = live_watch.TriageLog(tmp_path / 'frames.jsonl')
+    battle = {'room': 'battle-test-1', 'log': ['|turn|1'], 'live': True, 'turn': 1}
+    for frame in (battle, {**battle, 'log': ['|turn|1', '|turn|2']}, {**battle, 'log': ['|turn|1', '|turn|3']},
+                  {**battle, 'room': 'battle-test-2'}):
+        hub.publish({'status': {'score': [0, 0, 0]}, 'battle': frame, 'error': None})
+    # Score-only changes do not log a frame.
+    hub.publish({'status': {'score': [1, 0, 0]}, 'battle': {**battle, 'room': 'battle-test-2'}, 'error': None})
+    records = [json.loads(line) for line in (tmp_path / 'frames.jsonl').read_text().splitlines()]
+    assert [record['kind'] for record in records] == ['room', 'append', 'rewrite', 'room']
+    assert records[1]['appended'] == 1
+    assert records[2]['first_diff'] == 1 and records[2]['was'] == '|turn|2' and records[2]['now'] == '|turn|3'
+
+
+def test_triage_log_rotates_one_generation(tmp_path):
+    log = live_watch.TriageLog(tmp_path / 'client.jsonl', limit=200)
+    for index in range(10):
+        log.write({'event': 'frame', 'index': index})
+    assert (tmp_path / 'client.1.jsonl').exists()
+    assert (tmp_path / 'client.jsonl').stat().st_size <= 200
+
+
+def test_viewer_diagnostics_are_accepted_and_debug_query_serves_the_page(tmp_path):
+    server = ThreadingHTTPServer(('127.0.0.1', 0), live_watch.Handler)
+    server.hub = live_watch.StateHub()
+    server.client_log = live_watch.TriageLog(tmp_path / 'client.jsonl')
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        def call(method, path, body=None):
+            client = http.client.HTTPConnection('127.0.0.1', server.server_port, timeout=2)
+            client.request(method, path, body=body, headers={'Content-Type': 'application/json'})
+            response = client.getresponse()
+            response.read()
+            client.close()
+            return response.status
+        report = {'session': 'abc', 'events': [{'t': 5, 'event': 'seek', 'reason': 'backlog'}, 'junk']}
+        assert call('POST', '/api/diag', json.dumps(report)) == 204
+        assert call('POST', '/api/diag', 'not json') == 400
+        assert call('POST', '/api/other', '{}') == 404
+        assert call('POST', '/api/diag', 'x' * 70000) == 413
+        assert call('GET', '/?debug=1') == 200
+        records = [json.loads(line) for line in (tmp_path / 'client.jsonl').read_text().splitlines()]
+        assert len(records) == 1 and records[0]['session'] == 'abc' and records[0]['reason'] == 'backlog'
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
