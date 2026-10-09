@@ -31,11 +31,20 @@ SNAPSHOT = r"""(id) => {
 }"""
 
 
-CONTROLS_SHOWN = r"""id => {
-    const r = app.rooms[id];
-    const b = r && r.el.querySelector('button[name="chooseMove"]');
-    return !!(b && b.offsetParent);
+# Read-only view of why move buttons may be absent; tolerates a reloading page.
+CONTROLS_STATE = r"""id => {
+    const r = window.app && app.rooms && app.rooms[id];
+    if (!r || !r.battle) return {missing: true};
+    const b = r.el.querySelector('button[name="chooseMove"]');
+    return {shown: !!(b && b.offsetParent), ended: !!r.battle.ended,
+        rqid: r.request ? r.request.rqid : null, waiting: !!(r.choice && r.choice.waiting),
+        seeking: r.battle.seeking, atQueueEnd: !!r.battle.atQueueEnd};
 }"""
+# A wedged client animation queue never renders controls (it hid them for
+# minutes in game 42 until the run crashed). Rejoin the room early enough to
+# answer within the turn timer; give up only well after that.
+CONTROLS_RELOAD_AFTER = 12
+CONTROLS_GIVE_UP = 75
 
 
 def request_key(snapshot):
@@ -280,6 +289,13 @@ class BrowserPlayer:
             await button.click()
 
     async def submit(self, snapshot, choice):
+        await self._install_guard(snapshot)
+        try:
+            await self._submit(snapshot, choice)
+        finally:
+            await self.page.evaluate('() => {window.__psBrowserClickGuard=null}')
+
+    async def _install_guard(self, snapshot):
         # A locator can wait while a newer request arrives. Cancel the click at
         # DOM dispatch time as well as checking freshness before selecting it.
         await self.page.evaluate(r"""s => {
@@ -298,10 +314,48 @@ class BrowserPlayer:
                 }
             }, true);
         }""", {'room': snapshot['room'], 'request': snapshot['request']})
-        try:
-            await self._submit(snapshot, choice)
-        finally:
-            await self.page.evaluate('() => {window.__psBrowserClickGuard=null}')
+
+    async def _await_controls(self, root, snapshot, *, may_reload):
+        """True once move buttons render for this request; False if it is gone."""
+        room = snapshot['room']
+        key = (snapshot.get('request') or {}).get('rqid')
+        started, reloaded = time.monotonic(), False
+        while True:
+            try:
+                state = await self.page.evaluate(CONTROLS_STATE, room)
+            except Exception:
+                state = {'missing': True}  # Page is navigating.
+            if state.get('shown'):
+                return True
+            if not state.get('missing') and (state['ended'] or state['waiting'] or
+                                              (state['rqid'] is not None and state['rqid'] != key)):
+                self.log('controls_request_gone', room=room, request_id=key, state=state)
+                return False
+            elapsed = time.monotonic() - started
+            skip = root.locator('button[name="goToEnd"]:visible')
+            if await skip.count():
+                with suppress(Exception):
+                    await skip.click(timeout=2000)
+            if may_reload and not reloaded and elapsed > CONTROLS_RELOAD_AFTER:
+                # Rejoining rebuilds the battle from the server and re-sends the
+                # same request; no partial selection exists yet on this turn.
+                reloaded = True
+                self.log('controls_stalled', room=room, request_id=key, state=state)
+                await self.page.goto('https://play.pokemonshowdown.com/' + room, wait_until='domcontentloaded')
+                with suppress(Exception):
+                    await self.page.wait_for_function(
+                        'id => {const r=window.app && app.rooms && app.rooms[id];return !!(r && (r.request || (r.battle && r.battle.ended)));}',
+                        arg=room, timeout=30000)
+                with suppress(Exception):
+                    await self._install_guard(snapshot)
+                continue
+            if elapsed > CONTROLS_GIVE_UP:
+                if self.log_path:
+                    with suppress(Exception):
+                        await self.page.screenshot(path=str(self.log_path.parent / f'controls-stall-{key}.png'))
+                self.log('controls_never_shown', room=room, request_id=key, state=state)
+                raise TimeoutError('move controls never rendered; inspect before resuming')
+            await asyncio.sleep(.25)
 
     async def _submit(self, snapshot, choice):
         room = snapshot['room']
@@ -344,6 +398,7 @@ class BrowserPlayer:
                 position = current['previewOrder'].index(number)
                 await click('chooseTeamPreview', position)
         else:
+            clicked = False
             for slot, command in enumerate(choice.split(', ')):
                 tokens = command.split()
                 if tokens == ['pass']:
@@ -354,6 +409,7 @@ class BrowserPlayer:
                 if (current.get('request') or {}).get('rqid') != key or current.get('waiting'):
                     raise ValueError('request changed during action clicks')
                 if tokens[0] == 'switch':
+                    clicked = True
                     select = root.locator('button[name="selectSwitch"]:visible')
                     if await select.count():
                         await select.click()
@@ -365,13 +421,10 @@ class BrowserPlayer:
                     events = {'mega': 'megaevo', 'megax': 'megaevox', 'megay': 'megaevoy', 'terastallize': 'terastallize'}
                     # Controls (and their evolution checkboxes) appear only after
                     # the turn's animations; wait for this slot's move buttons.
-                    for _ in range(360):
-                        shown = await self.page.evaluate(
-                            CONTROLS_SHOWN,
-                            room)
-                        if shown is not False:
-                            break
-                        await asyncio.sleep(.25)
+                    # Only an untouched turn may rejoin the room to unstick them.
+                    if not await self._await_controls(root, snapshot, may_reload=not clicked):
+                        self.log('submit_abandoned', room=room, request_id=key, choice=choice)
+                        return
                     for flag, name in events.items():
                         checkbox = root.locator(f'input[name="{name}"]:visible')
                         if await checkbox.count():
@@ -382,6 +435,7 @@ class BrowserPlayer:
                     # The UI labels Struggle with zero; requests expose move one.
                     if to_id(snapshot['request']['active'][slot]['moves'][move - 1].get('id', '')) == 'struggle':
                         move = 0
+                    clicked = True
                     await click('chooseMove', move)
                     target = next((t for t in tokens[2:] if t.lstrip('-').isdigit()), None)
                     if target is not None:

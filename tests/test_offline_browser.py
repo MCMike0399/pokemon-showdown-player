@@ -5,7 +5,8 @@ from copy import deepcopy
 
 import pytest
 
-from ml.browser import BrowserPlayer, SNAPSHOT, context, result, team_text
+import ml.browser as browser
+from ml.browser import BrowserPlayer, CONTROLS_STATE, SNAPSHOT, context, result, team_text
 
 FMT = 'gen9championsvgc2026regmc'
 ROOM = 'battle-' + FMT + '-123'
@@ -58,7 +59,11 @@ class Page:
     def __init__(self, state):
         self.state, self.clicked, self.checked, self.done = state, [], [], 0
 
+    controls = {'shown': True}
+
     async def evaluate(self, script, room=None):
+        if script == CONTROLS_STATE:
+            return dict(self.controls)
         return deepcopy(self.state) if script == SNAPSHOT else None
 
     def locator(self, selector):
@@ -276,3 +281,31 @@ def test_search_waits_for_async_team_selection_before_clicking_battle():
     player.imported_team = (fingerprint(team), 'Selected team')
     asyncio.run(player.search(FMT, team))
     assert page.searched
+
+
+def test_wedged_move_controls_rejoin_the_room_then_click(monkeypatch):
+    monkeypatch.setattr(browser, 'CONTROLS_RELOAD_AFTER', 0)
+    page = Page(snapshot())
+    page.controls = {'shown': False, 'ended': False, 'waiting': False, 'rqid': 4, 'seeking': float('inf')}
+    page.visited = []
+
+    async def goto(url, **kwargs):
+        page.visited.append(url)
+        page.controls = {'shown': True}
+
+    async def wait_for_function(script, arg=None, **kwargs):
+        if not isinstance(arg, str):  # Rejoin waits on the room id; submit on the request.
+            page.state['waiting'] = True
+    page.goto, page.wait_for_function = goto, wait_for_function
+    asyncio.run(BrowserPlayer(page).submit(deepcopy(page.state), 'move 1 2, move 1'))
+    assert page.visited == ['https://play.pokemonshowdown.com/' + ROOM]
+    assert page.clicked[-3:] == ['button[name="chooseMove"][value="1"]',
+                                 'button[name="chooseMoveTarget"][value="2"]',
+                                 'button[name="chooseMove"][value="1"]']
+
+
+def test_battle_ending_while_controls_are_hidden_submits_nothing():
+    page = Page(snapshot())
+    page.controls = {'shown': False, 'ended': True, 'waiting': False, 'rqid': 4}
+    asyncio.run(BrowserPlayer(page).submit(deepcopy(page.state), 'move 1 1, move 1'))
+    assert not any('chooseMove' in selector for selector in page.clicked)
