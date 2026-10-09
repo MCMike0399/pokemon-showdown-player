@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Private read-only companion for watching a running campaign."""
 import json
+import math
+import os
 import re
 import sqlite3
 import sys
@@ -43,7 +45,7 @@ def browser_history():
                 if cached and cached[0] == signature:
                     runs.append(cached[1])
                     continue
-                run = {'directory': str(path.parent), 'first': None, 'search': False,
+                run = {'directory': str(path.parent), 'first': None, 'search': False, 'model': {},
                        'room': None, 'phase': 'waiting', 'records': {}}
                 for line in path.read_text().splitlines():
                     try:
@@ -56,6 +58,7 @@ def browser_history():
                     run['first'] = run['first'] or event.get('time')
                     if kind == 'search_agent':
                         run['search'] = True
+                        run['model'].update(mode='search', worlds=event.get('worlds'), engines=event.get('engines'))
                     elif kind == 'decision':
                         room = event.get('room')
                         if not isinstance(room, str) or not ROOM.fullmatch(room):
@@ -63,6 +66,20 @@ def browser_history():
                         row = run['records'].setdefault(room, {'room': room, 'choices': 0})
                         row['choices'] += 1
                         row['side'] = (event.get('request') or {}).get('side', {}).get('id')
+                        decision = event.get('decision') or {}
+                        row['revision'] = decision.get('revision')
+                        row['updates'] = decision.get('updates')
+                        row['last_decision_at'] = event.get('time')
+                        ms = decision.get('inference_ms')
+                        row['last_inference_ms'] = ms if isinstance(ms, (int, float)) and math.isfinite(ms) and ms >= 0 else None
+                        if row['last_inference_ms'] is not None:
+                            row['inference_total_ms'] = row.get('inference_total_ms', 0) + ms
+                            row['timed_decisions'] = row.get('timed_decisions', 0) + 1
+                        run['model'].update(mode='search' if run['search'] else 'policy', **{
+                            key: row.get(key) for key in ('revision', 'updates', 'last_decision_at', 'last_inference_ms')},
+                            room=room, decisions=row['choices'],
+                            mean_inference_ms=(row.get('inference_total_ms', 0) / row['timed_decisions']
+                                               if row.get('timed_decisions') else None))
                         run['room'], run['phase'] = room, 'playing'
                     elif kind == 'terminal':
                         room = event.get('result', {}).get('room')
@@ -114,7 +131,7 @@ def viewer_run():
             continue
         fmt = next(iter(records)).split('-')[1]
         return ({'directory': run['directory'], 'started_at': started, 'transport': 'browser'},
-                {'active_room': run['room'], 'phase': run['phase']}, {'format': fmt}, {}, list(records.values()))
+                {'active_room': run['room'], 'phase': run['phase'], 'model': run['model']}, {'format': fmt}, {}, list(records.values()))
     directory = latest.get('directory')
     if not directory:
         return latest, {}, {}, {}, []
@@ -129,6 +146,23 @@ def viewer_run():
     except OSError:
         pass
     return latest, read(campaign / 'status.json'), read(campaign / 'manifest.json'), read(campaign / 'control.json'), records
+
+
+def worker_status(lane):
+    """Export only a worker's reported phase; saved job payloads stay private."""
+    state = read(PROJECT / 'data/ml' / ('pipeline-' + lane + '.json'))
+    if not state:
+        return 'unavailable'
+    pid = state.get('pid')
+    if not isinstance(pid, int) or pid <= 0:
+        return 'unavailable'
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return 'stopped'
+    except (PermissionError, OverflowError):
+        return 'unavailable'
+    return state.get('phase', 'unavailable')
 
 
 def status():
@@ -149,10 +183,11 @@ def status():
         rooms = sorted(known)
         placeholders = ','.join('?' for _ in rooms) or "NULL"
         rows = [dict(row) for row in database.execute(f"""
-            SELECT status,outcome,created,json_extract(data,'$.room') room,
+            SELECT status,outcome,created,revision,json_extract(data,'$.room') room,
                    CASE WHEN json_extract(data,'$.room')=? AND status!='complete'
                         THEN json_array_length(json_extract(data,'$.steps')) ELSE 0 END choices,
-                   json_extract(data,'$.side') side
+                   json_extract(data,'$.side') side,
+                   json_extract(data,'$.steps[#-1].inference_ms') last_inference_ms
             FROM episodes INDEXED BY episodes_room_side WHERE source='ladder' AND format=?
                 AND json_extract(data,'$.room') IN ({placeholders})
                 AND julianday(created)>=julianday(?) ORDER BY created
@@ -179,6 +214,10 @@ def status():
             break
     health = read(PROJECT / 'data/ml/live-watch/health.json')
     stale = bool(room and health.get('room') == room and time.time() - health.get('observed_at', 0) > 10)
+    model = state.get('model') or {}
+    if not model and live:
+        model = {'mode': 'policy', 'room': room, 'revision': live[-1].get('revision'),
+                 'last_inference_ms': live[-1].get('last_inference_ms'), 'decisions': live[-1]['choices']}
     return {"campaign": campaign.name, "room": room, "phase": state.get("phase", "waiting"),
             "feed_stale": stale or state.get('phase') == 'interrupted',
             "score": score, "completed": len(complete),
@@ -187,6 +226,8 @@ def status():
             "side": live[-1].get("side") if live else None,
             "updates": observer.get("actor", {}).get("updates"),
             "scout_samples": observer.get("scout", {}).get("samples"),
+            "model": model,
+            "system": {"learner": worker_status('learner'), "evaluator": worker_status('evaluator')},
             "recent": recent, "checked_at": datetime.now(timezone.utc).isoformat()}
 
 

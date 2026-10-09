@@ -11,13 +11,13 @@ VIEWER = Path(__file__).resolve().parents[1] / "web/live-watch/viewer.js"
 
 
 @pytest.mark.parametrize("score,results,expected", [
-    ([0, 0, 0], [], [None, None, '—']),
+    ([0, 0, 0], [], [None, '—']),
     ([202, 321, 0], ['Loss', 'Loss', 'Win', 'Loss', 'Loss', 'Loss', 'Loss', 'Win'],
-     [202 / 523 * 100, 25, '2 losses']),
-    ([1, 1, 2], ['Tie', 'Tie', 'Loss', 'Win'], [25, 25, '2 ties']),
-    ([12, 0, 0], ['Win'] * 8, [100, 100, '≥8 wins']),
-    ([8, 0, 0], ['Win'] * 8, [100, 100, '8 wins']),
-    ([1, 0, 0], ['Win'], [100, 100, '1 win']),
+     [202 / 523 * 100, '2 losses']),
+    ([1, 1, 2], ['Tie', 'Tie', 'Loss', 'Win'], [25, '2 ties']),
+    ([12, 0, 0], ['Win'] * 8, [100, '≥8 wins']),
+    ([8, 0, 0], ['Win'] * 8, [100, '8 wins']),
+    ([1, 0, 0], ['Win'], [100, '1 win']),
 ])
 def test_performance_rates_and_streaks_use_verified_results(score, results, expected):
     node = shutil.which('node')
@@ -49,10 +49,53 @@ process.stdout.write(JSON.stringify({stats, signal:element('signal').textContent
     response = subprocess.run([node, '-e', script], text=True, capture_output=True, check=True,
                               input=json.dumps({'viewer': str(VIEWER), 'score': score, 'results': results}))
     data = json.loads(response.stdout)
-    assert [data['stats'][key] for key in ('rate', 'recentRate', 'streakText')] == expected
+    assert [data['stats'][key] for key in ('rate', 'streakText')] == expected
     assert data['signal'] == 'Between games'  # Passing the old cap never ends an open run.
     assert ' of ' not in data['completed']
     assert 'NaN' not in data['note']
+
+
+def test_model_pulse_clears_search_data_and_handles_missing_measurements():
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('viewer checks require Node')
+    script = r"""
+const fs = require('node:fs'), vm = require('node:vm');
+const nodes = new Map();
+const element = id => {
+  if (!nodes.has(id)) {
+    const classes = new Set();
+    nodes.set(id, {classList:{toggle(name, enabled){enabled ? classes.add(name) : classes.delete(name);},
+      contains(name){return classes.has(name);}}});
+  }
+  return nodes.get(id);
+};
+const context = vm.createContext({document:{getElementById:element, addEventListener(){}},
+  window:{addEventListener(){}}, ResizeObserver:class {observe(){}}, Dex:{getSpriteData(){}},
+  BattleSound:{setMute(){}}, EventSource:class {addEventListener(){} close(){}}});
+vm.runInContext(fs.readFileSync(process.argv[1], 'utf8'), context);
+context.data = {room:'battle-test-1', model:{mode:'search', room:'battle-test-1', worlds:6, engines:3,
+  revision:'abcdef123456', last_inference_ms:2313.3, mean_inference_ms:0, decisions:8}};
+vm.runInContext('applyModelPulse(data)', context);
+const search = {last:element('inference-last').textContent, mean:element('inference-mean').textContent,
+  revision:element('model-revision').textContent, fullRevision:element('model-revision').title,
+  worldsVisible:!element('search-worlds-row').classList.contains('hidden')};
+context.data = {model:{mode:'policy', updates:0}, system:{learner:'training', evaluator:'stopped'}};
+vm.runInContext('applyModelPulse(data)', context);
+const policy = {worldsHidden:element('search-worlds-row').classList.contains('hidden'),
+  updatesVisible:!element('policy-updates-row').classList.contains('hidden'),
+  revision:element('model-revision').textContent, last:element('inference-last').textContent,
+  updates:element('updates').textContent, learner:element('learner-state').textContent};
+vm.runInContext('applyModelPulse({})', context);
+process.stdout.write(JSON.stringify({search, policy, missing:element('learner-state').textContent}));
+"""
+    result = subprocess.run([node, '-e', script, str(VIEWER)], text=True, capture_output=True, check=True)
+    data = json.loads(result.stdout)
+    assert data['search'] == {'last': '2.3 s', 'mean': '0 ms', 'revision': 'abcdef12',
+                             'fullRevision': 'abcdef123456', 'worldsVisible': True}
+    assert data['policy'] == {'worldsHidden': True, 'updatesVisible': True, 'revision': 'Not reported',
+                             'last': '—', 'updates': '0', 'learner': 'Training'}
+    assert data['missing'] == 'Not reported'
 
 
 PREVIEW = [
@@ -277,7 +320,7 @@ const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const sources = [], timers = new Map();
 let nextTimer = 1;
 const context = vm.createContext({
-  document: {getElementById: () => ({classList:{add(){}}}), addEventListener() {}},
+  document: {getElementById: () => ({classList:{add(){},toggle(){}}}), addEventListener() {}},
   window: {addEventListener() {}}, ResizeObserver: class {observe() {}},
   Dex: {getSpriteData() {}}, BattleSound: {setMute() {}},
   EventSource: class {

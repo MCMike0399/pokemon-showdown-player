@@ -275,7 +275,8 @@ function connectionInterrupted(message) {
   $id('signal').textContent = 'Reconnecting'; $id('dot').classList.add('wait');
   $id('viewer-status').textContent = message;
   $id('note').classList.add('error');
-  $id('note').textContent = 'The match keeps running. Live insights will refresh when the feed reconnects.';
+  setPulseState('player-state', 'Reconnecting', 'warn');
+  $id('note').textContent = 'Showing the last received state. Data will refresh when the viewer reconnects.';
 }
 
 function show(room, game) {
@@ -346,24 +347,67 @@ function performanceSummary(data) {
   const total = wins + losses + ties;
   const rate = total ? wins / total * 100 : null;
   const recent = (data.recent || []).filter(row => ['Win', 'Loss', 'Tie'].includes(row.result));
-  const recentWins = recent.filter(row => row.result === 'Win').length;
-  const recentRate = recent.length ? recentWins / recent.length * 100 : null;
   const streak = recent.findIndex(row => row.result !== recent[0].result);
   const streakLength = streak < 0 ? recent.length : streak;
   const streakText = !recent.length ? '—' : (streak < 0 && total > recent.length ? '≥' : '') +
     streakLength + ' ' + ({Win:'win', Loss:'loss', Tie:'tie'}[recent[0].result]) +
     (streakLength === 1 ? '' : recent[0].result === 'Loss' ? 'es' : 's');
-  let insight = 'Insights appear as verified games finish.';
-  if (recent.length) {
-    const gap = recentRate - rate;
-    insight = recentWins + (recentWins === 1 ? ' win' : ' wins') + ' in the last ' + recent.length +
-      (recent.length === 1 ? ' game. ' : ' games. ');
-    insight += total === recent.length ? 'Building the first performance baseline.' :
-      Math.abs(gap) < 0.05 ? 'Recent win rate matches the full-run average.' :
-      'Recent win rate is ' + Math.abs(gap).toFixed(1) + ' percentage points ' +
-        (gap > 0 ? 'above' : 'below') + ' the full-run average.';
+  return {total, rate, recent, streakText};
+}
+
+function decisionTime(ms) {
+  if (!Number.isFinite(ms) || ms < 0) return '—';
+  return ms >= 1000 ? (ms / 1000).toFixed(1) + ' s' : Math.round(ms).toLocaleString() + ' ms';
+}
+
+function setPulseState(id, text, tone) {
+  const node = $id(id);
+  node.textContent = text;
+  node.classList.toggle('state-ok', tone === 'ok');
+  node.classList.toggle('state-warn', tone === 'warn');
+}
+
+function applyModelPulse(data) {
+  const model = data.model || {}, system = data.system || {};
+  const search = model.mode === 'search', policy = model.mode === 'policy';
+  $id('model-name').textContent = search ? 'Simulator search' : policy ? 'Learned policy' : 'Awaiting model data';
+  $id('model-description').textContent = search ?
+    'Simulated turns. Learned team preview.' : policy ?
+    'A learned policy ranks legal actions.' : 'Details appear after the player records a decision.';
+  $id('inference-last').textContent = decisionTime(model.last_inference_ms);
+  $id('inference-mean').textContent = decisionTime(model.mean_inference_ms);
+  $id('revision-label').textContent = search ? 'Preview checkpoint' : 'Checkpoint';
+  $id('model-revision').textContent = typeof model.revision === 'string' ? model.revision.slice(0, 8) : 'Not reported';
+  $id('model-revision').title = model.revision || 'No recorded checkpoint identity';
+  for (const [id, value] of [['search-worlds', model.worlds], ['search-engines', model.engines]]) {
+    $id(id + '-row').classList.toggle('hidden', !search);
+    $id(id).textContent = Number.isFinite(value) ? value.toLocaleString() : 'Not reported';
   }
-  return {total, rate, recent, recentRate, streakText, insight};
+  $id('search-worlds').title = 'Opponent team configurations sampled per search decision';
+  $id('search-engines').title = 'Configured parallel simulator processes';
+  $id('policy-updates-row').classList.toggle('hidden', !policy || model.updates == null);
+  $id('updates').textContent = model.updates?.toLocaleString() ?? '—';
+  $id('choices-label').textContent = data.room && (!model.room || model.room === data.room) ? 'Decisions this game' : 'Decisions last game';
+  $id('choices').textContent = model.decisions?.toLocaleString() ?? data.choices?.toLocaleString() ?? '—';
+  const at = Number.isFinite(model.last_decision_at) ? new Date(model.last_decision_at * 1000) : null;
+  $id('model-recorded').textContent = at && Number.isFinite(at.getTime()) ?
+    'Last recorded at ' + at.toLocaleTimeString([], {hour:'2-digit', minute:'2-digit', second:'2-digit'}) : 'No decision timestamp reported.';
+  $id('model-recorded').title = at && Number.isFinite(at.getTime()) ? at.toISOString() : '';
+  const stopped = ['complete', 'ladder_target_complete', 'deadline_reached', 'stopped'].includes(data.phase);
+  const paused = ['paused', 'blocked', 'paused_for_adjustments'].includes(data.phase);
+  setPulseState('player-state', data.feed_stale || data.phase === 'interrupted' ? 'Interrupted' :
+    stopped ? 'Stopped' : paused ? 'Paused' : data.room ? 'Receiving' : 'Between games',
+    data.feed_stale || data.phase === 'interrupted' || paused ? 'warn' : stopped ? null : 'ok');
+  const phases = {idle:'Idle', training:'Training', learning:'Learning', evaluating:'Evaluating',
+    collecting:'Collecting', scout_training:'Training scout', preparing:'Preparing', job_complete:'Job complete',
+    error:'Error', deferred:'Deferred', source_reload_requested:'Reload pending',
+    stopped:'Stopped', unavailable:'Not reported'};
+  for (const lane of ['learner', 'evaluator']) {
+    const phase = system[lane] || 'unavailable';
+    setPulseState(lane + '-state', phases[phase] || 'Not reported',
+      ['training', 'learning', 'evaluating', 'collecting', 'scout_training'].includes(phase) ? 'ok' :
+        ['error', 'deferred', 'source_reload_requested'].includes(phase) ? 'warn' : null);
+  }
 }
 
 function applyStatus(data) {
@@ -372,14 +416,11 @@ function applyStatus(data) {
     ['wins', 'losses', 'ties'].forEach((id, i) => { $id(id).textContent = data.score[i]; });
     $id('completed').textContent = stats.total.toLocaleString() + (stats.total === 1 ? ' verified game' : ' verified games');
     $id('win-rate').textContent = stats.rate === null ? '—' : stats.rate.toFixed(1) + '%';
-    $id('recent-label').textContent = stats.recent.length ? 'Win rate · last ' + stats.recent.length : 'Recent win rate';
-    $id('recent-rate').textContent = stats.recentRate === null ? '—' : stats.recentRate.toFixed(1) + '%';
     $id('streak').textContent = stats.streakText;
-    $id('updates').textContent = data.updates ?? '—'; $id('choices').textContent = data.choices ?? '—';
-    $id('samples').textContent = data.scout_samples?.toLocaleString() ?? '—';
+    applyModelPulse(data);
     $id('signal').textContent = data.feed_stale ? 'Player feed interrupted' : data.room ? 'Live game' : data.phase==='paused_for_adjustments' ? 'Adjustment checkpoint' :
       ['blocked', 'paused'].includes(data.phase) ? 'Run paused' :
-      ['complete', 'ladder_target_complete', 'deadline_reached'].includes(data.phase) ? 'Run stopped' : 'Between games';
+      ['complete', 'ladder_target_complete', 'deadline_reached', 'stopped'].includes(data.phase) ? 'Run stopped' : 'Between games';
     $id('dot').classList.toggle('wait', !data.room || data.feed_stale);
     if (follow && data.room) show(data.room, data.game);
     if (!shown && data.recent?.length) show(data.recent[0].room, data.recent[0].game);
@@ -411,6 +452,8 @@ function applyStatus(data) {
     }
     }
     $id('note').classList.remove('error');
-    $id('note').textContent = stats.insight;
+    $id('note').textContent = data.feed_stale ? 'Player feed interrupted. Showing the last recorded model activity.' :
+      replay ? 'Watching a replay. Model and system data describe the latest player session.' :
+      'Model and system data describe the latest player session, including while watching replays.';
 }
 connect();

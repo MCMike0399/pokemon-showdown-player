@@ -1,6 +1,7 @@
 """Read-only retained stream behavior with temporary campaign recordings."""
 import http.client
 import json
+import os
 import sqlite3
 import threading
 from http.server import ThreadingHTTPServer
@@ -123,6 +124,57 @@ def test_search_run_tracks_verified_games_across_restarts_without_ppo_episodes(c
     assert [row['result'] for row in info['recent']] == ['Loss', 'Win']
     replay = live_watch.battle_log('battle-test-42')
     assert not replay['live'] and replay['log'][-1] == '|win|Opponent'
+
+
+def test_model_pulse_uses_latest_run_config_and_measured_game_timings(campaign):
+    root = live_watch.PROJECT / 'data/ml/browser-runs'
+    for stamp, worlds, engines, times in [('20261009T120000Z', 2, 1, [100]),
+                                         ('20261009T120100Z', 6, 3, [0, 1800, None, -1])]:
+        folder = root / stamp
+        folder.mkdir(parents=True)
+        events = [{'kind': 'search_agent', 'time': 1791547200, 'worlds': worlds, 'engines': engines}]
+        for index, ms in enumerate(times):
+            events.append({'kind': 'decision', 'time': 1791547201 + index, 'room': 'battle-test-43',
+                           'request': {'side': {'id': 'p2'}, 'private': 'secret request'},
+                           'decision': {'revision': 'recorded-revision', 'inference_ms': ms,
+                                        'choice': 'private choice'}})
+        (folder / 'events.jsonl').write_text('\n'.join(map(json.dumps, events)))
+    info = live_watch.status()
+    model = info['model']
+    assert model['mode'] == 'search'
+    assert (model['worlds'], model['engines']) == (6, 3)
+    assert model['revision'] == 'recorded-revision'
+    assert model['mean_inference_ms'] == 900  # Zero is valid; missing/negative measurements are excluded.
+    assert model['last_inference_ms'] is None
+    assert model['decisions'] == 4
+    assert model['last_decision_at'] == 1791547204
+    assert 'private' not in json.dumps(info)
+
+
+def test_model_pulse_does_not_reuse_search_settings_for_policy_run(campaign):
+    folder = live_watch.PROJECT / 'data/ml/browser-runs/20261009T120000Z'
+    folder.mkdir(parents=True)
+    events = [{'kind': 'decision', 'time': 1791547200, 'room': 'battle-test-43',
+               'decision': {'revision': 'policy-revision', 'updates': 0, 'inference_ms': 12}}]
+    (folder / 'events.jsonl').write_text('\n'.join(map(json.dumps, events)))
+    model = live_watch.status()['model']
+    assert model['mode'] == 'policy' and model['updates'] == 0
+    assert 'worlds' not in model and 'engines' not in model
+
+
+def test_system_pulse_handles_missing_running_and_stopped_workers(campaign, monkeypatch):
+    root = live_watch.PROJECT / 'data/ml'
+    assert live_watch.worker_status('learner') == 'unavailable'
+    path = root / 'pipeline-learner.json'
+    path.write_text(json.dumps({'pid': os.getpid(), 'phase': 'training', 'job': 'private-job'}))
+    assert live_watch.worker_status('learner') == 'training'
+    assert live_watch.status()['system']['learner'] == 'training'
+    def stopped(pid, signal):
+        raise ProcessLookupError
+    monkeypatch.setattr(live_watch.os, 'kill', stopped)
+    assert live_watch.worker_status('learner') == 'stopped'
+    path.write_text(json.dumps({'pid': -1, 'phase': 'training'}))
+    assert live_watch.worker_status('learner') == 'unavailable'
 
 
 def test_browser_snapshots_publish_live_and_terminal_frames_atomically(tmp_path):
