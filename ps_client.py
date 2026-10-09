@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import os
 import time
 from collections import deque
@@ -18,6 +19,7 @@ from typing import Any, Deque, Dict, List, Optional
 
 import httpx
 import websockets
+from websockets.exceptions import ConnectionClosed
 
 WS_URL = os.environ.get("PS_WS_URL", "wss://sim3.psim.us/showdown/websocket")
 LOGIN_URL = os.environ.get("PS_LOGIN_URL", "https://play.pokemonshowdown.com/api/login")
@@ -52,12 +54,16 @@ class PSClient:
         self.connected = False
         self.last_error: Optional[str] = None
         self._ready = asyncio.Event()
+        self._identity_ready = asyncio.Event()
 
     # ---------------- connection ----------------
     async def connect(self, timeout: float = 15.0) -> str:
         if self.connected:
             return self.challstr or ""
         self._ready.clear()
+        self.challstr = None
+        self.user, self.logged_in = None, False
+        self._identity_ready.clear()
         self.ws = await websockets.connect(
             WS_URL, additional_headers=HEADERS, ping_interval=25, max_size=2 ** 24
         )
@@ -73,6 +79,7 @@ class PSClient:
         room = ""
         try:
             async for raw in self.ws:  # type: ignore[union-attr]
+                room = ""
                 for line in str(raw).split("\n"):
                     if line.startswith(">"):
                         room = line[1:].strip()
@@ -102,9 +109,10 @@ class PSClient:
             parts = line.split("|")
             # |updateuser|name|named|avatar|settings
             name = parts[2] if len(parts) > 2 else ""
-            if name and not name.startswith("Guest"):
-                self.user = name.strip()
-                self.logged_in = True
+            self.user = name.strip() or None
+            self.logged_in = bool(self.user and not self.user.startswith("Guest") and
+                                  len(parts) > 3 and parts[3] == "1")
+            self._identity_ready.set()
         elif line.startswith("|init|battle") and room:
             self.battles.setdefault(room, {})["started"] = True
         elif line.startswith("|title|") and room:
@@ -132,19 +140,28 @@ class PSClient:
         assertion = json.loads(body[1:]).get("assertion")
         if not assertion:
             raise RuntimeError(f"no assertion in login response: {body[:200]}")
+        self._identity_ready.clear()
+        self.user, self.logged_in = None, False
         await self.send(f"|/trn {username},0,{assertion}")
-        for _ in range(80):
-            if self.user and not self.user.startswith("Guest"):
-                break
-            await asyncio.sleep(0.25)
-        ok = bool(self.user and not self.user.startswith("Guest"))
+        try:
+            await asyncio.wait_for(self._identity_ready.wait(), timeout=20)
+        except asyncio.TimeoutError:
+            pass
+        normalize = lambda value: re.sub(r"[^a-z0-9]", "", value.lower())
+        ok = bool(self.logged_in and normalize(self.user or "") == normalize(username))
         self.logged_in = ok
         return {"loggedIn": ok, "user": self.user, "challstr": bool(self.challstr)}
 
     async def close(self) -> None:
         if self.task:
-            self.task.cancel()
+            reader = self.task
             self.task = None
+            reader.cancel()
+            if reader is not asyncio.current_task():
+                try:
+                    await reader
+                except asyncio.CancelledError:
+                    pass
         if self.ws:
             await self.ws.close()
         self.connected = False
@@ -155,7 +172,11 @@ class PSClient:
         """Send a raw client->server message ('ROOMID|TEXT' or '|/cmd')."""
         if not self.connected or not self.ws:
             await self.connect()
-        await self.ws.send(message)  # type: ignore[union-attr]
+        try:
+            await self.ws.send(message)  # type: ignore[union-attr]
+        except ConnectionClosed as error:
+            self.connected = self.logged_in = False
+            raise ConnectionError('Showdown socket closed during submission') from error
         return "sent"
 
     async def chat(self, room: str, text: str) -> str:
@@ -172,7 +193,16 @@ class PSClient:
     # ---------------- battles ----------------
     async def choose(self, room: str, choice: str) -> str:
         """choice examples: 'move 1', 'move 1, move 2', 'switch 2', 'team 123456'."""
-        return await self.send(f"{room}|/choose {choice}")
+        if not self.connected or not self.logged_in:
+            raise ConnectionError('playing connection lost; reauthenticate the configured account before choosing')
+        try:
+            # A reader can observe disconnection after the checks above. Never
+            # let send() create an anonymous replacement socket for an action.
+            await self.ws.send(f"{room}|/choose {choice}")
+            return 'sent'
+        except ConnectionClosed as error:
+            self.connected = self.logged_in = False
+            raise ConnectionError('playing socket closed during submission') from error
 
     def battle_summary(self, room: str) -> Dict[str, Any]:
         log = self.battles.get(room, {}).get("log", [])
@@ -220,6 +250,8 @@ class PSClient:
             try:
                 r = json.loads(reqs[-1][len("|request|"):])
             except Exception:  # noqa: BLE001
+                continue
+            if not isinstance(r, dict):
                 continue
             if r.get("wait"):
                 continue

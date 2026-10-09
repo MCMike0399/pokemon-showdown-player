@@ -29,7 +29,8 @@ def parser():
         s.add_argument("--team2", type=Path)
         s.add_argument("--games", type=int, default=10)
         s.add_argument("--seed", type=int, default=0)
-        s.add_argument("--opponent", choices=("heuristic", "random", "self"), default="heuristic")
+        s.add_argument("--opponent", choices=("heuristic", "random", "self", "tactical"), default="heuristic")
+        s.add_argument('--closed-team-sheets', action='store_true')
         s.add_argument("--alternate-sides", action="store_true")
     s = sub.add_parser("train")
     s.add_argument("--format", required=True)
@@ -152,7 +153,8 @@ async def main(args):
             for i in range(args.games):
                 result = await play_local(brain, args.format, team1, team2, args.opponent,
                                           args.seed + i, training=training, teacher=teacher, opponent_model=opponent_model,
-                                          learner_side="p2" if args.alternate_sides and i % 2 else "p1")
+                                          learner_side="p2" if args.alternate_sides and i % 2 else "p1",
+                                          open_team_sheets=not args.closed_team_sheets)
                 record["games"].append(result)
                 bucket = "unfinished" if result.get("unfinished") else "ties" if result.get("tie") else "wins" if result.get("winner") == "LocalBrain" else "losses"
                 record[bucket] += 1

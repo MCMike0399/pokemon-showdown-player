@@ -47,3 +47,54 @@ def test_real_champions_game_records_ppo_and_reload(tmp_path):
         assert len(store.episodes(FMT, untrained=False)) == 1
         store.close()
     asyncio.run(run())
+
+
+
+
+def test_hidden_trap_retries_corrected_request_without_credit(monkeypatch, tmp_path):
+    from test_offline_learning import context
+    from ml.features import Features
+    request = context()['request']
+    request['side']['pokemon'].append({'ident': 'p1: Swampert', 'details': 'Swampert, L50',
+                                       'condition': '100/100', 'active': False})
+    corrected = json.loads(json.dumps(request))
+    corrected['rqid'] = 2
+    corrected['active'][0]['trapped'] = True
+    events = [{'side': 'p1', 'lines': [], 'request': request},
+              {'side': 'p1', 'lines': ["|error|[Unavailable choice] Can't switch: The active Pokémon is trapped"],
+               'request': corrected},
+              {'side': 'p1', 'lines': ['|win|LocalBrain']}]
+    sent = []
+    class Pipe:
+        def write(self, data):
+            sent.append(json.loads(data))
+        async def drain(self):
+            pass
+        async def readline(self):
+            return (json.dumps(events.pop(0)) + '\n').encode()
+    class Process:
+        stdin = Pipe()
+        stdout = Pipe()
+        returncode = None
+        def terminate(self):
+            self.returncode = 0
+        async def wait(self):
+            return 0
+    async def spawn(*args, **kwargs):
+        return Process()
+    monkeypatch.setattr('ml.simulator.asyncio.create_subprocess_exec', spawn)
+    store = Store(tmp_path)
+    brain = Brain(store, Features())
+    original = brain.decide
+    def decide(ctx, **kwargs):
+        choice = 'switch 2' if 'switch 2' in ctx['choices'] else ctx['choices'][0]
+        return original(ctx, demonstration=choice)
+    brain.decide = decide
+    result = asyncio.run(play_local(brain, FMT, seed=12))
+    assert result['winner'] == 'LocalBrain'
+    assert result['unavailable_choices'] == 1
+    assert result['rejected_actions'] == 0
+    steps = store.episodes(FMT)[0]['steps']
+    assert len(steps) == 1 and steps[0]['choice'].startswith('move ')
+    assert [c['choice'] for c in sent if c['type'] == 'choose'][0] == 'switch 2'
+    store.close()

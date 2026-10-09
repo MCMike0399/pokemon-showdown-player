@@ -1,0 +1,7 @@
+-r requirements-ml.txt
+jupyterlab>=4,<5
+ipykernel>=6,<8
+nbclient>=0.10,<1
+matplotlib>=3.9,<4
+pandas>=2.2,<4
+tqdm>=4.66,<5

@@ -264,9 +264,30 @@ async def ps_ml_status(format: str = "") -> str:
         if format:
             model = brain.model(format)
             info["model"] = {"format": format, "revision": model.revision, "updates": model.updates,
+                             "policy_temperature": model.policy_temperature,
+                             "preview_temperature": model.preview_temperature,
+                             "feature_profile": model.feature_profile,
                              "checkpoint": str(model.path), "algorithm": "action-conditioned PPO actor-critic",
                              "strength": "unmeasured; zero updates uses a tactical initialization"}
+            ready = brain.store.root / 'ready' / (format + '.json')
+            staged = json.loads(ready.read_text()) if ready.exists() else None
+            info['staged_candidate'] = ({'parent_revision': staged['parent_revision'],
+                                         'staged_at': staged['staged_at'], 'evaluation': staged['evaluation']}
+                                        if staged else None)
         return json.dumps(info, indent=2)
+
+
+@mcp.tool()
+async def ps_ml_recording(room: str, start: int = 0, limit: int = 3, alternatives: bool = False) -> str:
+    """Inspect saved decision-time requests, observations and named choices.
+    Read-only; no login, action submission or training. Legacy missing snapshots
+    stay unknown. Default returns selected/top-five choices; alternatives=True
+    includes the whole saved mask. Does not include future battle-log events."""
+    async with _ml_lock:
+        from ml.recording import read_archive
+        from ml.storage import DEFAULT_ROOT
+        root = _brain.store.root if _brain is not None else DEFAULT_ROOT
+        return json.dumps(read_archive(root, room, start, limit, alternatives), indent=2)
 
 
 @mcp.tool()
@@ -309,7 +330,8 @@ async def ps_ml_finish(room: str, train: bool = True) -> str:
         output = _ml_session.finish(room)
         experience = output["experience"]
         if train and experience.get("recorded"):
-            output["training"] = {"queued": True, "job": (output.get("background_learning") or {}).get("job")}
+            from ml.continuous import learning_report
+            output["training"] = learning_report(output)
         return json.dumps(output, indent=2)
 
 
@@ -355,23 +377,33 @@ async def ps_team_plan(format: str, base: str = "", explore: bool = False,
 
 
 @mcp.tool()
-async def ps_ml_ladder(format: str, team: str = "", explore_team: bool = False) -> str:
+async def ps_ml_ladder(format: str, team: str = "", explore_team: bool = False,
+                       max_team_candidates: int = 8) -> str:
     """One player operation: select a team with the team model, validate, upload,
     and enter matchmaking on ps_login's existing connection. Explicit team limits
-    selection to that team and its researched variants. Does not log into another account."""
+    selection to that team and its researched variants. With an explicit team,
+    max_team_candidates=1 pins its exact sets for controlled comparisons.
+    Does not log into another account."""
     if not client.logged_in:
         raise ValueError("call ps_login once first")
     from ml.teams import TeamPlanner
     from ml.storage import fingerprint
     async with _ml_lock:
-        plan = await TeamPlanner(_ml().store, teams).plan(format, team, explore_team)
+        brain = _ml()
+        if any(not player.finished(room) for room in player.battles()):
+            raise ValueError("finish the existing battle before another matchmaking operation")
+        from ml.promotion import promote_ready
+        promotion = promote_ready(brain.store, format)
+        plan = await TeamPlanner(brain.store, teams).plan(format, team, explore_team,
+                                                       max_candidates=max_team_candidates)
         selected = plan["selected"]
         name = "ML-"+selected["id"]
         if name not in teams.list():
             teams.create(name, selected["sets"], format)
         _match_context[format] = {"team": name, "sets": selected["sets"]}
         status = await player.ladder(format, selected["packed"])
-    return json.dumps({"status": status, "team": name, "selection": {k:v for k,v in selected.items() if k not in ("packed", "sets")}}, indent=2)
+    return json.dumps({"status": status, "team": name, "promotion": promotion,
+                       "selection": {k:v for k,v in selected.items() if k not in ("packed", "sets")}}, indent=2)
 
 
 @mcp.tool()
@@ -393,6 +425,7 @@ async def ps_learning_status() -> str:
     async with _ml_lock:
         from ml.continuous import LearningConfig
         from ml.resources import ResourcePolicy
+        from ml.pipeline import status as pipeline_status
         brain = _ml()
         config = LearningConfig.load(brain.store.root)
         benchmark_file = brain.store.root/"compute-benchmark.json"
@@ -400,6 +433,7 @@ async def ps_learning_status() -> str:
                            "queue": [dict(r) for r in brain.store.db.execute("SELECT id,kind,format,status,result FROM jobs ORDER BY created DESC LIMIT 10")],
                            "feeds": [dict(r) for r in brain.store.db.execute("SELECT * FROM feed_state")],
                            "compute": json.loads(benchmark_file.read_text()) if benchmark_file.exists() else "not benchmarked",
+                           'pipeline': pipeline_status(brain.store.root),
                            "experience": brain.store.stats()}, indent=2)
 
 
@@ -512,4 +546,6 @@ async def ps_team_variants(name: str) -> str:
         return json.dumps(suggest_variants(_ml().store, teams.get(name)), indent=2)
 
 if __name__ == "__main__":
+    from ml.reload import source_generation, pin_runtime
+    pin_runtime(os.environ.get('PS_SOURCE_GENERATION') or source_generation())
     mcp.run()

@@ -59,9 +59,15 @@ under `cache/dex/<format>/`. Both are gitignored. Keep them to retain learned
 knowledge across OpenClaw/MCP restarts. Use a separate `--root` for experiments;
 do not run multiple learning writers against the same root. Model updates are
 atomic. MCP reloads externally promoted revisions between games and keeps active
-games frozen. An interrupted game remains pending on
-disk without a reward; this version does not reconstruct its in-memory live
-session after a process restart.
+games frozen. An interrupted game remains pending on disk without a reward.
+After reconnecting the configured account to the same room, the recorder can
+restore one compatible pending episode with its original ID, steps and collecting
+log probabilities. Its format, exact team, schema, learning mode and checkpoint
+must still match. An unchanged request resubmits the saved choice without
+resampling. Ambiguous recording fragments or a changed checkpoint stop recovery;
+they are not silently merged. A terminal reconnect finalizes the original episode
+once, including when the final request is null. Proposals whose socket submission
+was interrupted are excluded from terminal learning credit.
 
 ## Train locally
 

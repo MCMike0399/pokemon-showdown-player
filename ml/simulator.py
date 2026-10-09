@@ -15,6 +15,15 @@ from ml.teams import team_id
 BRIDGE = Path(__file__).resolve().parents[1] / "simulator.cjs"
 
 
+def simulator_seed(seed: int, encoding: str = 'legacy') -> list[int]:
+    if encoding == 'legacy':
+        return [seed % 65536, 7, 13, 19]
+    if encoding != 'full-v1' or not isinstance(seed, int) or not 0 <= seed < 2**64:
+        raise ValueError('full-v1 requires an unsigned 64-bit integer seed')
+    return [seed & 65535, ((seed >> 16) & 65535) ^ 7,
+            ((seed >> 32) & 65535) ^ 13, ((seed >> 48) & 65535) ^ 19]
+
+
 async def bridge_query(payload: dict) -> dict:
     process = await asyncio.create_subprocess_exec("node", str(BRIDGE), stdin=asyncio.subprocess.PIPE,
                                                  stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
@@ -48,9 +57,13 @@ async def load_dex(fmt: str) -> Features:
 
 async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: str = "heuristic",
                      seed: int = 0, training: bool = True, max_decisions: int = 1000,
-                     teacher: bool = False, opponent_model=None, learner_side: str = "p1") -> dict:
-    if opponent not in ("heuristic", "random", "self"):
-        raise ValueError("opponent must be heuristic, random or self")
+                     teacher: bool = False, opponent_model=None, learner_side: str = "p1",
+                     sample_actions: bool = False, open_team_sheets: bool = True, seed_encoding: str = 'legacy') -> dict:
+    if opponent not in ("heuristic", "random", "self", "tactical", "pressure"):
+        raise ValueError("opponent must be heuristic, random, self, tactical or pressure")
+    if not isinstance(open_team_sheets, bool):
+        raise ValueError('open_team_sheets must be boolean')
+    seed_words = simulator_seed(seed, seed_encoding)
     if learner_side not in ("p1", "p2"):
         raise ValueError("learner side must be p1 or p2")
     process = await asyncio.create_subprocess_exec("node", str(BRIDGE), stdin=asyncio.subprocess.PIPE,
@@ -61,7 +74,13 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
     result = {"room": room, "ongoing": True}
     decisions = 0
     rejected = 0
+    unavailable = 0
+    consecutive_unavailable = 0
     model = brain.model(fmt)
+    opponent_brain = None
+    if opponent == 'self':
+        opponent_brain = Brain(brain.store, brain.features, inference_store=brain.inference_store)
+        opponent_brain.models[fmt] = opponent_model or model
 
     async def send(payload):
         process.stdin.write((json.dumps(payload) + "\n").encode())
@@ -70,7 +89,7 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
     try:
         await send({"type": "start", "format": fmt, "team1": team1 if learner_side == "p1" else team2,
                     "team2": team2 if learner_side == "p1" else team1, "learnerSide": learner_side,
-                    "seed": [seed % 65536, 7, 13, 19]})
+                    "seed": seed_words, "openTeamSheets": open_team_sheets})
         while decisions < max_decisions:
             line = await asyncio.wait_for(process.stdout.readline(), timeout=30)
             if not line:
@@ -81,14 +100,25 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
                 raise ValueError(event["error"])
             side = event["side"]
             logs[side].extend(event.get("lines", []))
+            errors = [line for line in event.get('lines', []) if line.startswith('|error|')]
+            if not errors:
+                consecutive_unavailable = 0
             for public in event.get("lines", []):
                 if public.startswith("|error|"):
-                    rejected += 1
                     brain.reject(room, side)
+                    # Hidden trapping/disabling is disclosed by the server's
+                    # corrected request. Remove the unexecuted proposal and
+                    # retry that observable mask, just as the live player does.
+                    if (public.startswith('|error|[Unavailable choice]') and
+                            legal_choices(event.get('request')) and consecutive_unavailable < 5):
+                        unavailable += 1
+                        consecutive_unavailable += 1
+                        continue
+                    rejected += 1
                     raise ValueError("simulator rejected generated action: " + public)
                 if public.startswith("|win|"):
                     result = {"room": room, "winner": public.split("|", 2)[2]}
-                elif public == "|tie|":
+                elif public in ('|tie', '|tie|'):
                     result = {"room": room, "winner": None, "tie": True}
             if not result.get("ongoing"):
                 break
@@ -100,17 +130,31 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
             sets = team1 if side == learner_side else team2
             ctx = {"room": room, "format": fmt, "request": request, "state": state, "choices": choices,
                    "source": "local", "team_id": team_id(fmt, sets) if sets else "random-generated",
+                   'team_sets': sets, 'simulation': {'seed': seed, 'learner_side': learner_side,
+                       'seed_encoding': seed_encoding, 'simulator_seed': seed_words,
+                       'opponent': opponent, 'open_team_sheets': open_team_sheets,
+                       'opponent_team': team_id(fmt, team2) if team2 else 'random-generated',
+                       'opponent_revision': opponent_model.revision if opponent_model is not None else None},
                    "public_log": logs[side]}
             if side == learner_side and teacher:
                 choice = max(choices, key=lambda c: brain.features.action(ctx, c)[-1])
                 brain.decide(ctx, demonstration=choice)
             elif side == learner_side:
-                choice = brain.decide(ctx, explore=training, record=training)["choice"]
+                choice = brain.decide(ctx, explore=training or sample_actions, record=training)["choice"]
             elif opponent == "random":
                 choice = rng.choice(choices)
             elif opponent == "self":
-                s, a = brain.features.encode(ctx)
-                choice = choices[(opponent_model or model).predict(s, a, explore=training)["index"]]
+                choice = opponent_brain.decide(ctx, explore=training, record=False)['choice']
+            elif opponent == 'pressure':
+                from ml.pressure import score as pressure_score
+                choice = max(choices, key=lambda c: pressure_score(ctx, c, brain.features))
+            elif opponent == 'tactical':
+                from ml.preview import score as preview_score
+                if request.get('teamPreview'):
+                    choice = max(choices, key=lambda c: preview_score(ctx, c, brain.features))
+                else:
+                    tactical_ctx = {**ctx, 'feature_profile': 'mechanics-v1'}
+                    choice = max(choices, key=lambda c: brain.features.action(tactical_ctx, c)[-1])
             else:
                 # A separate frozen scripted opponent; never updated by training.
                 choice = max(choices, key=lambda c: brain.features.action(ctx, c)[-1])
@@ -119,13 +163,26 @@ async def play_local(brain: Brain, fmt: str, team1=None, team2=None, opponent: s
         if result.get("ongoing"):
             result = {"room": room, "unfinished": True}
         else:
-            brain.finish(room, result, "LocalBrain", learner_side)
+            # A terminal event can arrive first on the other player's stream.
+            # Preserve verified attribution in the learner's public archive;
+            # no hidden request or unobserved move is copied across perspectives.
+            if not any(line.startswith('|win|') or line in ('|tie', '|tie|') for line in logs[learner_side]):
+                logs[learner_side].append('|tie|' if result.get('tie') else '|win|' + result['winner'])
+            brain.finish(room, result, "LocalBrain", learner_side, public_log=logs[learner_side])
             if training or teacher:
                 from ml.scout import ingest_public
                 result["public_experience"] = ingest_public(brain.store, fmt, logs[learner_side], "local-simulation", room,
                                                             features=brain.features)
         result.update({"decisions": decisions, "rejected_actions": rejected, "seed": seed,
                        "opponent": opponent, "learner_side": learner_side, "revision": model.revision})
+        result["policy_mode"] = "sampled" if training or sample_actions else "greedy"
+        result["unavailable_choices"] = unavailable
+        result.update(open_team_sheets=open_team_sheets,
+                      seed_encoding=seed_encoding, simulator_seed=seed_words,
+                      learner_team=team_id(fmt, team1) if team1 else 'random-generated',
+                      opponent_team=team_id(fmt, team2) if team2 else 'random-generated')
+        if opponent_model is not None:
+            result['opponent_revision'] = opponent_model.revision
         return result
     finally:
         # Truncations/errors remain pending in SQLite with no reward. They must

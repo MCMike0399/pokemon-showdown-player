@@ -4,6 +4,16 @@ Use one retained OpenClaw session and one configured Showdown account. The nativ
 server exposes tools as `pokemonshowdown__ps_*`. A detached agent run closes its
 MCP child when the run ends, so complete the whole battle inside that run.
 
+If a process is interrupted, reconnect the configured account and join the exact
+existing room before any new search. One compatible pending recording can resume
+with the original episode ID and collecting log probabilities; use the exact
+previous team and checkpoint. Ambiguous fragments or incompatible revisions stop
+recovery. Supervision keeps a process alive; it does not prove recording recovery.
+
+For an inline read-only view that follows games from another computer, use
+the [live viewer](live-watch.md). It relays the existing player's battle protocol,
+including private rooms, without creating another player connection.
+
 1. `ps_team_plan(format, evidence_source="ladder", save_as="Planned team")`
    asks the learned team-outcome model to select and validate sets. Check its
    citations and generated-spread flag. Use `explore=True` for team experiments.

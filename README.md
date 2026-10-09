@@ -19,6 +19,13 @@ Always-on use: [OpenClaw decision/team workflow](docs/agent-workflow.md) ·
 [Resource-aware CPU/MPS training and daily feeds](docs/continuous-learning.md) ·
 [Data sources and licenses](docs/continuous-learning-research.md).
 
+[Programmatic browser play](docs/browser-play.md) uses Playwright clicks and the
+same local model for decisions, without OpenClaw or per-turn LLM calls.
+
+[Simulator search agent](docs/search-agent.md) (`--search`) decides each turn by
+simulating every action pair in the official engine over opponent sets sampled from
+ladder usage statistics: 30 wins vs the PPO policy's 19 on the same 45 real-team games.
+
 ## What's here
 - `ps_client.py` - async client over wss://sim3.psim.us/showdown/websocket (SockJS).
   Handles challstr, login (assertion), rooms, message buffering and battle state.
@@ -92,3 +99,11 @@ For battles, PSClient.battle_summary() and current_requests() give the state you
 `ps_team_list/get/create/update/delete/packed`, `ps_ladder`, `ps_choices`, `ps_result`
 (plus the connection tools above). So an agent can: create a team -> ladder -> read `ps_waiting`,
 -> `ps_choices` -> `ps_choose` -> `ps_result`, entirely through MCP.
+
+### Offline PPO notebook
+
+Run `./scripts/run_notebook.sh` and open `notebooks/01_offline_ppo.ipynb` with the
+**Pokemon Offline (M5 Pro)** kernel. It compares learning-rate and entropy
+settings, completed-episode rewards, CPU/Metal throughput, and replay-trained
+scouting in isolated offline runs. See [setup and operation](docs/offline-ppo-notebook.md)
+and [experiment sources](docs/offline-ppo-experiments-research.md).

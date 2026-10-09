@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Showdown live</title>
+<link rel="stylesheet" href="https://play.pokemonshowdown.com/style/battle.css">
+<link rel="stylesheet" href="https://play.pokemonshowdown.com/style/sim-types.css">
+<link rel="stylesheet" href="https://play.pokemonshowdown.com/style/utilichart.css">
+<style>
+:root{color-scheme:light;--page:#e8eff4;--ink:#20324a;--navy:#192c49;--blue:#387ac3;--teal:#167b72;--line:#c3d0df;--muted:#526681;--paper:#fff}
+*{box-sizing:border-box}body{margin:0;background:var(--page);color:var(--ink);font:16px/1.5 "Avenir Next",Avenir,"Segoe UI",sans-serif}
+button,a{font:inherit}button{cursor:pointer}a{color:var(--blue)}button:focus-visible,a:focus-visible{outline:3px solid #e3ad37;outline-offset:4px}
+header{background:var(--navy);color:#fff;padding:20px 32px;display:flex;align-items:center;justify-content:space-between;gap:24px}
+h1{font-size:27px;line-height:1.1;margin:0;font-weight:650;letter-spacing:-.8px}header p{margin:5px 0 0;font-size:14px;color:#b8cce6}
+.signal{display:flex;align-items:center;gap:9px;font-size:14px}.dot{width:9px;height:9px;border-radius:50%;background:#71d4bd}.dot.wait{background:#ebbf62}
+main{max-width:1580px;margin:0 auto;padding:24px 32px;display:grid;grid-template-columns:minmax(0,1fr) 260px;gap:24px}
+.stage{min-width:0;background:var(--paper);border:1px solid var(--line);border-radius:10px;overflow:hidden}
+.toolbar{padding:12px 18px;display:flex;align-items:center;justify-content:space-between;gap:12px;border-bottom:1px solid var(--line)}
+.watching{font-weight:650}.controls{display:flex;align-items:center;gap:14px}.controls a{font-size:13px;white-space:nowrap}
+button{border:1px solid var(--line);background:var(--page);color:var(--ink);border-radius:6px;padding:6px 10px;font-size:13px}
+button[aria-pressed=false]{background:var(--navy);color:#fff;border-color:var(--navy)}
+iframe{display:block;width:100%;height:calc(100vh - 192px);min-height:580px;border:0;background:#fff}
+.empty{padding:80px 28px;text-align:center;background:#f4f8fb;min-height:580px}.empty h2{font-size:26px;margin:0 0 12px}.empty p{color:var(--muted);max-width:380px;margin:0 auto}
+.scoreboard{padding:8px 0 18px;border-bottom:1px solid var(--line)}h2{font-size:17px;font-weight:650;margin:0 0 12px}
+.scores{display:flex;justify-content:space-between;gap:12px}.scores strong{font-size:42px;line-height:1.2;font-weight:600;display:block}.scores span{font-size:13px;color:var(--muted)}
+.wins strong{color:var(--teal)}.losses strong{color:#ad5c60}.run-summary{margin-top:18px;font-size:13px;color:var(--muted)}.run-summary p{margin:4px 0}.run-summary strong{color:var(--ink);font-size:20px}.run-mode{display:inline-block;margin-top:8px;padding:2px 8px;border:1px solid var(--line);border-radius:20px;font-size:11px;letter-spacing:.4px}
+.details{padding:20px 0;border-bottom:1px solid var(--line)}.detail{display:flex;justify-content:space-between;gap:12px;margin:8px 0;font-size:14px}.detail span{color:var(--muted)}
+.detail strong{text-align:right}.form{display:flex;gap:6px;margin:12px 0 0}.form span{display:grid;place-items:center;width:24px;height:24px;border:1px solid var(--line);border-radius:5px;font-size:11px;font-weight:650}.form .win{color:var(--teal)}.form .loss{color:#ad5c60}.form-caption{font-size:11px;color:var(--muted);margin:5px 0 0}
+.recent{padding-top:20px}.recent a{display:flex;justify-content:space-between;text-decoration:none;padding:7px 0;border-bottom:1px solid var(--line);font-size:14px}.recent a:hover{text-decoration:underline}
+.insight{margin-top:22px;padding-left:12px;border-left:2px solid var(--teal)}.insight h2{font-size:13px;margin-bottom:6px}.note{font-size:12px;color:var(--muted);margin:0}.error{color:#9b343a}.hidden{display:none!important}
+@media(prefers-color-scheme:dark){:root{color-scheme:dark;--page:#18263c;--ink:#e1eaf6;--navy:#12233e;--blue:#8abbef;--teal:#77d3bc;--line:#3f526c;--muted:#a2b3cb;--paper:#21324c}.empty{background:#21324c}.losses strong,.form .loss{color:#edb1b4}}
+@media(max-width:860px){header{padding:18px 20px}main{grid-template-columns:1fr;padding:18px 16px;gap:18px}aside{display:grid;grid-template-columns:1fr 1fr;gap:20px}.scoreboard{border:0}.details{padding-top:8px;border:0}.recent{grid-column:1/-1;padding:0}.insight{grid-column:1/-1;margin:0}iframe{height:650px}.toolbar{flex-wrap:wrap}.controls{gap:10px}}
+@media(max-width:480px){header{gap:12px}h1{font-size:23px}header p{font-size:12px}.signal{font-size:12px}.toolbar{padding:10px 12px}.controls{width:100%;justify-content:space-between}.scores strong{font-size:34px}aside{grid-template-columns:1fr;gap:18px}.scoreboard,.details{border-bottom:1px solid var(--line)}iframe{height:690px;min-height:550px}}
+#arena-wrap{position:relative;overflow:hidden;background:#d5e9f6;min-height:200px}
+#battle.battle{position:absolute;top:0;left:50%;margin-left:-320px;width:640px;height:360px;transform-origin:top center}
+#battle-log.battle-log{position:relative;inset:auto;height:220px;width:100%;padding:12px 18px;border:0;border-top:1px solid var(--line);color:#20324a;background:#fff;font-size:14px;overflow-y:auto}
+.playback{display:flex;align-items:center;flex-wrap:wrap;gap:10px;padding:12px 18px;border-top:1px solid var(--line)}
+#viewer-status{font-size:12px;color:var(--muted);margin-left:auto}
+#sprite-notice{font-size:12px;color:var(--muted);padding:6px 18px;display:block;border-top:1px solid var(--line)}
+@media(max-width:480px){#viewer-status{width:100%;margin-left:0}.playback{gap:7px;padding:10px}}
+</style>
+<header><div><h1>Showdown live</h1><p>Champions M-C · Your agent’s ladder games</p></div><div class="signal"><i class="dot wait" id="dot"></i><span id="signal">Connecting</span></div></header>
+<main>
+<section class="stage" aria-label="Battle viewer">
+ <div class="toolbar"><span class="watching" id="watching">Waiting for a battle</span><div class="controls"><button id="follow" aria-pressed="true">Auto-follow on</button><a id="open" class="hidden" target="_blank" rel="noopener noreferrer">Open in Showdown</a></div></div>
+ <div class="empty" id="empty"><h2>Waiting for a battle</h2><p>The animated match will appear here automatically.</p></div>
+ <div id="inline-player" class="hidden">
+  <div id="arena-wrap"><div id="battle" class="battle"></div></div>
+  <div class="playback"><button id="sound" aria-pressed="false">Sound off</button><button id="viewpoint">Switch viewpoint</button><button id="catchup">Jump to live</button><button id="reconnect">Reconnect</button><span id="viewer-status">Connecting…</span></div>
+  <span id="sprite-notice" class="hidden"></span>
+  <div id="battle-log" class="battle-log" role="log" aria-label="Battle log"></div>
+ </div>
+</section>
+<aside>
+ <section class="scoreboard"><h2>Ladder record</h2><div class="scores"><div class="wins"><strong id="wins">—</strong><span>Wins</span></div><div class="losses"><strong id="losses">—</strong><span>Losses</span></div><div><strong id="ties">—</strong><span>Ties</span></div></div><div class="run-summary"><p><strong id="win-rate">—</strong> overall win rate</p><p id="completed">Loading verified results</p><span class="run-mode">Open-ended run · No game limit</span></div></section>
+ <section class="details"><h2>Model pulse</h2><div class="detail"><span id="recent-label">Recent win rate</span><strong id="recent-rate">—</strong></div><div class="detail"><span>Current streak</span><strong id="streak">—</strong></div><div class="detail"><span>Policy updates</span><strong id="updates">—</strong></div><div class="detail"><span>Decisions this game</span><strong id="choices">—</strong></div><div class="detail"><span>Opponent samples</span><strong id="samples">—</strong></div><div class="form" id="form" role="img" aria-label="No recent results"></div><p class="form-caption">Recent form · oldest → newest</p></section>
+ <section class="recent"><h2>Recent games</h2><div id="recent">No completed games yet.</div></section>
+ <section class="insight"><h2>Performance readout</h2><p class="note" id="note">Insights appear as verified games finish.</p></section>
+</aside>
+</main>
+<script>var exports=window;window.Config={routes:{client:"play.pokemonshowdown.com",dex:"dex.pokemonshowdown.com"}};</script>
+<script src="https://play.pokemonshowdown.com/js/lib/jquery-2.2.4.min.js"></script>
+<script src="https://play.pokemonshowdown.com/js/lib/html-css-sanitizer-minified.js"></script>
+<script src="https://play.pokemonshowdown.com/js/battle-sound.js"></script>
+<script src="https://play.pokemonshowdown.com/data/text.js"></script>
+<script src="https://play.pokemonshowdown.com/js/battle-text-parser.js"></script>
+<script src="https://play.pokemonshowdown.com/js/battledata.js"></script>
+<script src="https://play.pokemonshowdown.com/data/text/en.js"></script>
+<script src="https://play.pokemonshowdown.com/data/pokedex.js"></script>
+<script src="https://play.pokemonshowdown.com/data/pokedex-mini.js"></script>
+<script src="https://play.pokemonshowdown.com/data/moves.js"></script>
+<script src="https://play.pokemonshowdown.com/data/items.js"></script>
+<script src="https://play.pokemonshowdown.com/data/abilities.js"></script>
+<script src="https://play.pokemonshowdown.com/data/typechart.js"></script>
+<script src="https://play.pokemonshowdown.com/data/graphics.js"></script>
+<script src="https://play.pokemonshowdown.com/js/battle-animations.js"></script>
+<script src="https://play.pokemonshowdown.com/js/battle.js"></script>
+<script src="https://play.pokemonshowdown.com/js/battle-tooltips.js"></script>
+<script src="/viewer.js"></script>
+</html>

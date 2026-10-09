@@ -31,7 +31,7 @@ def public_lines(log: list[str] | str):
     result = []
     for line in lines:
         parts = line.split("|")
-        if len(parts) < 3 or parts[1] not in PUBLIC_KINDS:
+        if len(parts) < 2 or parts[1] not in PUBLIC_KINDS:
             continue
         if parts[1] == "player":
             line = f"|player|{parts[2]}|Player-{parts[2]}"
@@ -64,9 +64,13 @@ def ingest_public(store: Store, fmt: str, log: list[str] | str, source: str, bat
     if fmt != to_id(fmt) or not fmt:
         raise ValueError("exact format id required")
     lines = public_lines(log)
-    if not any(line.startswith(("|win|", "|tie|")) for line in lines):
+    if not any(line.startswith('|win|') or line in ('|tie', '|tie|') for line in lines):
         return {"imported": False, "reason": "public game is not complete"}
     digest = fingerprint(lines)
+    existing = store.db.execute('SELECT format,digest FROM public_battles WHERE id=?', (battle_id,)).fetchone()
+    if existing:
+        return {'imported': False, 'reason': 'battle identity already ingested',
+                'prefix_conflict': existing['format'] != fmt or existing['digest'] != digest}
     if store.db.execute("SELECT 1 FROM public_battles WHERE format=? AND digest=?", (fmt, digest)).fetchone():
         return {"imported": False, "reason": "already ingested"}
     features = features or Features.cached(fmt)
@@ -95,8 +99,10 @@ def ingest_public(store: Store, fmt: str, log: list[str] | str, source: str, bat
                                 json.dumps(scout_vector(features, ctx, actor).tolist()), digest))
         prefix.append(line)
     with store.db:
-        store.db.execute("INSERT OR IGNORE INTO public_battles VALUES (?,?,?,?,?,?)",
-                         (battle_id, fmt, source, now(), digest, json.dumps(lines)))
+        inserted = store.db.execute("INSERT OR IGNORE INTO public_battles VALUES (?,?,?,?,?,?)",
+                                    (battle_id, fmt, source, now(), digest, json.dumps(lines)))
+        if not inserted.rowcount:
+            return {'imported': False, 'reason': 'battle identity or digest concurrently ingested'}
         store.db.executemany("INSERT OR IGNORE INTO scout_samples VALUES (?,?,?,?,?,?)", samples)
     return {"imported": True, "public_battle": battle_id, "samples": len(samples), "format": fmt}
 
@@ -107,8 +113,9 @@ class Scout:
         self.path = store.root / "scouts" / (fmt + ".pt")
         self.moves = sorted(features.dex.get("moves", {}))
         self.index = {move: i for i, move in enumerate(self.moves)}
-        torch.manual_seed(17)
-        self.net = nn.Sequential(nn.Linear(STATE_DIM, 96), nn.Tanh(), nn.Linear(96, max(1, len(self.moves))))
+        with torch.random.fork_rng(devices=[]):
+            torch.random.default_generator.manual_seed(17)
+            self.net = nn.Sequential(nn.Linear(STATE_DIM, 96), nn.Tanh(), nn.Linear(96, max(1, len(self.moves))))
         self.trained_samples = 0
         self.loaded_mtime = None
         self.transfer_source = None
@@ -164,10 +171,18 @@ class Scout:
         return results
 
     def train(self, epochs: int = 3, device: str = "cpu", max_samples: int = 20000,
-              duty_fraction: float = 1.0):
-        rows = list(self.store.db.execute("SELECT * FROM scout_samples WHERE format=? ORDER BY id LIMIT ?", (self.fmt, max_samples)))
+              duty_fraction: float = 1.0, checkpoint=None):
+        if (self.store.root / 'inference-only.json').exists():
+            raise ValueError('inference-only inputs cannot train a scout; use the canonical store')
+        if checkpoint:
+            checkpoint()
+        orphaned = self.store.db.execute('''SELECT COUNT(*) FROM scout_samples s WHERE s.format=?
+            AND NOT EXISTS (SELECT 1 FROM public_battles p WHERE p.format=s.format AND p.digest=s.battle)''', (self.fmt,)).fetchone()[0]
+        rows = list(self.store.db.execute('''SELECT s.* FROM scout_samples s WHERE s.format=?
+            AND EXISTS (SELECT 1 FROM public_battles p WHERE p.format=s.format AND p.digest=s.battle)
+            ORDER BY s.id LIMIT ?''', (self.fmt, max_samples)))
         if len(rows) < 8 or not self.moves:
-            return {"trained": False, "reason": "need at least 8 usable public-move samples"}
+            return {"trained": False, "reason": "need at least 8 usable public-move samples", 'orphaned_samples_excluded': orphaned}
         train, heldout = [], []
         for row in rows:
             if row["move"] not in self.index or not row["battle"]:
@@ -190,6 +205,8 @@ class Scout:
         before = validation_loss()
         for _ in range(epochs):
             for start in range(0, len(train), 128):
+                if checkpoint:
+                    checkpoint()
                 import time
                 started = time.monotonic()
                 x, y = tensors(train[start:start+128])
@@ -200,13 +217,15 @@ class Scout:
                 optimizer.step()
                 if device == "mps" and duty_fraction < 1:
                     torch.mps.synchronize()
-                    time.sleep(min(0.1, (time.monotonic()-started) * (1/duty_fraction - 1)))
+                    time.sleep((time.monotonic()-started) * (1/duty_fraction - 1))
         after = validation_loss()
+        if checkpoint:
+            checkpoint()
         self.net.cpu()
         promoted = len(heldout) >= 8 and after <= before
         result = {"trained": True, "samples": len(rows), "heldout": len(heldout),
                   "validation_loss_before": before, "validation_loss_after": after, "promoted": promoted, "device": device,
-                  "transfer_source": self.transfer_source}
+                  "transfer_source": self.transfer_source, 'orphaned_samples_excluded': orphaned}
         self.path.parent.mkdir(parents=True, exist_ok=True)
         target = self.path if promoted else self.path.with_suffix(".candidate.pt")
         with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:

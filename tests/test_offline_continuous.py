@@ -17,6 +17,7 @@ FMT = "gen9championsvgc2026regmc"
 
 
 def test_guard_defers_under_cpu_or_memory_pressure(monkeypatch):
+    monkeypatch.setattr('ml.resources.memory_pressure', lambda: 1)
     monkeypatch.setattr("ml.resources.psutil.cpu_percent", lambda interval: 95)
     monkeypatch.setattr("ml.resources.psutil.virtual_memory", lambda: SimpleNamespace(available=8*2**30))
     assert ResourcePolicy().sample()["deferred"]

@@ -77,7 +77,22 @@ def generated_spreads(sets: list[dict], fmt: str):
             points = 32 if "champions" in fmt else 252
             remaining = 2 if "champions" in fmt else 4
             stats = features.species(mon["species"]).get("baseStats", {})
-            main = "atk" if stats.get("atk", 0) > stats.get("spa", 0) else "spa"
+            # Base species stats can be misleading for a special Mega set.
+            # Undisclosed spreads follow the actual attacks, then nature/stats.
+            from battle_state import to_id
+            power = {"Physical": 0, "Special": 0}
+            for move in mon.get("moves", []):
+                data = features.dex.get("moves", {}).get(to_id(move), {})
+                if data.get("category") in power:
+                    power[data["category"]] += data.get("basePower", 0)
+            if power["Physical"] != power["Special"]:
+                main = "atk" if power["Physical"] > power["Special"] else "spa"
+            elif mon.get("nature") in ("Modest", "Timid", "Quiet", "Mild", "Rash"):
+                main = "spa"
+            elif mon.get("nature") in ("Adamant", "Jolly", "Brave", "Lonely", "Naughty"):
+                main = "atk"
+            else:
+                main = "atk" if stats.get("atk", 0) > stats.get("spa", 0) else "spa"
             if mon.get("nature") in ("Careful", "Calm", "Sassy", "Impish", "Bold", "Relaxed"):
                 mon["evs"] = {"hp": points, "spd": points, "def": remaining}
             else:
@@ -94,6 +109,8 @@ class TeamPlanner:
     async def plan(self, fmt: str, base: str = "", explore: bool = False,
                    source: str = "ladder", save_as: str = "", max_candidates: int = 8):
         from ml.simulator import validate_team
+        if type(max_candidates) is not int or not 1 <= max_candidates <= 32:
+            raise ValueError("max_candidates must be an integer 1..32")
         ranked = rank_teams(self.store, self.teams, fmt, source)
         if base:
             original = self.teams.get(base)
@@ -114,10 +131,13 @@ class TeamPlanner:
             wins = sum((outcome+1)/2 for outcome in outcomes)
             a, b = 1+wins, 1+len(outcomes)-wins
             score = rng.betavariate(a, b) if explore else a/(a+b)
+            metadata_row = self.store.db.execute("SELECT data FROM team_metadata WHERE id=?", (key,)).fetchone()
+            provenance = json.loads(metadata_row[0]) if metadata_row else {}
             valid.append({"id": key, "name": candidate.get("name", key), "sets": sets, "format": fmt,
-                          "source_url": candidate.get("source_url"), "games": len(outcomes),
+                          "source_url": candidate.get("source_url") or provenance.get("source_url"), "games": len(outcomes),
                           "posterior_win_rate": a/(a+b), "selection_score": score, "validated": True,
-                          "stat_points": "generated_hypothesis" if generated else "provided",
+                          "stat_points": "generated_hypothesis" if generated else provenance.get("stat_points", "provided"),
+                          "provenance": provenance,
                           "packed": validation["packed"]})
         if not valid:
             raise ValueError("no legal team candidates; create/import a team first: " + json.dumps(errors)[:500])

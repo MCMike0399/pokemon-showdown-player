@@ -5,11 +5,16 @@ import hashlib
 import json
 import sqlite3
 import fcntl
+import tempfile
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
 DEFAULT_ROOT = Path(__file__).resolve().parents[1] / "data" / "ml"
+
+
+class WriterBusy(ValueError):
+    """Temporary contention, distinguishable from invalid training state."""
 
 
 def now() -> str:
@@ -23,6 +28,8 @@ def fingerprint(value: object) -> str:
 class Store:
     def __init__(self, root: Path = DEFAULT_ROOT):
         self.root = Path(root)
+        if (self.root / 'inference-only.json').exists():
+            raise ValueError('inference snapshots are immutable; use Store.read_only')
         self.root.mkdir(parents=True, exist_ok=True)
         # MCP serializes brain operations with its async lock; training runs in
         # a worker thread so the live websocket reader remains responsive.
@@ -36,6 +43,10 @@ class Store:
                 outcome REAL, status TEXT NOT NULL DEFAULT 'pending', trained INTEGER DEFAULT 0,
                 data TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS episodes_room_side ON episodes
+                (json_extract(data,'$.room'), json_extract(data,'$.side'));
+            CREATE INDEX IF NOT EXISTS episodes_training ON episodes
+                (format,status,trained,revision,team);
             CREATE TABLE IF NOT EXISTS documents (
                 id TEXT PRIMARY KEY, url TEXT NOT NULL, format TEXT NOT NULL,
                 title TEXT NOT NULL, fetched TEXT NOT NULL, published TEXT,
@@ -60,6 +71,8 @@ class Store:
                 id TEXT PRIMARY KEY, format TEXT NOT NULL, species TEXT NOT NULL,
                 move TEXT NOT NULL, vector TEXT NOT NULL, battle TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS scout_species_moves ON scout_samples
+                (format, species, move);
             CREATE TABLE IF NOT EXISTS team_metadata (
                 id TEXT PRIMARY KEY, data TEXT NOT NULL
             );
@@ -75,6 +88,40 @@ class Store:
     def close(self):
         self.db.close()
 
+    @classmethod
+    def read_only(cls, root: Path):
+        """Frozen inference inputs need no schema initialization or writer access."""
+        store = cls.__new__(cls)
+        store.root = Path(root)
+        store.db = sqlite3.connect((store.root / 'experience.sqlite3').resolve().as_uri() + '?mode=ro',
+                                   uri=True, check_same_thread=False, timeout=30)
+        store.db.row_factory = sqlite3.Row
+        store.db.execute('PRAGMA query_only=ON')
+        return store
+
+    def retain_checkpoint(self, model) -> str:
+        """Keep the collecting artifact once by digest, even after promotion.
+
+Only local model artifacts are retained; no replay labels or private requests
+are reconstructed. Atomic creation also tolerates concurrent local collectors.
+"""
+        target = self.root / 'models' / 'collected' / model.fmt / (model.checkpoint_sha256 + '.pt')
+        if target.exists() and hashlib.sha256(target.read_bytes()).hexdigest() != model.checkpoint_sha256:
+            raise ValueError('retained collecting checkpoint digest mismatch')
+        if not target.exists():
+            payload = model.path.read_bytes()
+            if hashlib.sha256(payload).hexdigest() != model.checkpoint_sha256:
+                raise ValueError('collecting checkpoint changed before archival; reload between games')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with tempfile.NamedTemporaryFile(dir=target.parent, suffix='.tmp', delete=False) as handle:
+                temporary = Path(handle.name)
+                handle.write(payload)
+            try:
+                temporary.replace(target)
+            finally:
+                temporary.unlink(missing_ok=True)
+        return str(target.relative_to(self.root))
+
     @contextmanager
     def writer(self):
         """Only one learning process can mutate a root at a time (Mac/Linux)."""
@@ -82,7 +129,7 @@ class Store:
             try:
                 fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
-                raise ValueError("another learning process is writing this data root; use a separate --root") from None
+                raise WriterBusy("another learning process is writing this data root; use a separate --root") from None
             try:
                 yield
             finally:
@@ -99,7 +146,7 @@ class Store:
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
                 (episode["id"], episode["format"], episode.get("team", ""), episode["source"],
                  episode["revision"], episode.get("created", now()), episode.get("outcome"),
-                 episode.get("status", "pending"), json.dumps(episode)))
+                 episode.get("status", "pending"), json.dumps(episode, separators=(",", ":"))))
 
     def episodes(self, fmt: str, revision: str | None = None, untrained: bool = True) -> list[dict]:
         query = "SELECT data FROM episodes WHERE format=? AND status='complete'"
@@ -110,6 +157,15 @@ class Store:
             query += " AND revision=?"
             args.append(revision)
         return [json.loads(r[0]) for r in self.db.execute(query + " ORDER BY created", args)]
+
+    def room_episodes(self, room: str, side: str | None = None) -> list[dict]:
+        """Recorded sessions for an exact room/perspective, including terminal ones."""
+        query = "SELECT data FROM episodes WHERE json_extract(data,'$.room')=?"
+        args = [room]
+        if side is not None:
+            query += " AND json_extract(data,'$.side')=?"
+            args.append(side)
+        return [json.loads(row[0]) for row in self.db.execute(query + " ORDER BY created", args)]
 
     def mark_trained(self, ids: list[str]):
         with self.db:
@@ -129,11 +185,14 @@ class Store:
                             (key, kind, fmt, now(), now(), json.dumps(payload or {})))
         return key
 
-    def claim(self, lease_seconds: int = 3600):
+    def claim(self, lease_seconds: int = 3600, kinds: tuple[str, ...] | None = None):
         import time
+        if kinds is not None and not kinds:
+            return None
         self.db.execute("BEGIN IMMEDIATE")
         try:
-            row = self.db.execute("SELECT * FROM jobs WHERE (status='queued' OR (status='running' AND lease_until<?)) AND attempts<3 ORDER BY created LIMIT 1", (time.time(),)).fetchone()
+            filter_sql = " AND kind IN (" + ",".join("?" for _ in kinds) + ")" if kinds is not None else ""
+            row = self.db.execute("SELECT * FROM jobs WHERE (status='queued' OR (status='running' AND lease_until<?)) AND attempts<3" + filter_sql + " ORDER BY created LIMIT 1", (time.time(), *(kinds or ()))).fetchone()
             if row:
                 self.db.execute("UPDATE jobs SET status='running',attempts=attempts+1,updated=?,lease_until=? WHERE id=?",
                                 (now(), time.time() + lease_seconds, row["id"]))

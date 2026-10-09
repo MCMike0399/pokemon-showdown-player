@@ -141,3 +141,49 @@ def test_live_submission_is_idempotent_and_rejection_not_rewarded(brain, tmp_pat
     finish = live.finish(room)
     assert finish["experience"]["steps"] == 0
     assert not brain.train(FMT)["trained"]
+
+
+def test_temperature_is_checkpointed_and_collecting_logprobs_match(brain):
+    model = brain.model(FMT)
+    model.policy_temperature = .5
+    model.save()
+    decision = brain.decide(context(), explore=True, record=True)
+    step = next(iter(brain.pending.values()))['steps'][0]
+    states, actions, mask, indices = model.batch([step])
+    logits, _ = model.net(states, actions, mask)
+    actual = torch.distributions.Categorical(logits=logits / .5).log_prob(indices)
+    assert float(actual[0].detach()) == pytest.approx(step['logprob'])
+    assert Model(brain.store.root, FMT).policy_temperature == .5
+    brain.finish('local-test', {'winner': 'Player'}, 'Player')
+    report = brain.train(FMT)
+    assert report['trained'] and report['kl_history']
+
+
+def test_ppo_stops_epochs_when_policy_drift_exceeds_budget(brain):
+    for i in range(16):
+        ctx = context('drift-' + str(i))
+        brain.decide(ctx, explore=True, record=True)
+        brain.finish(ctx['room'], {'winner': 'Player'}, 'Player')
+    model = brain.model(FMT)
+    for group in model.optimizer.param_groups:
+        group['lr'] = 1.0
+    result = model.train(brain.store.episodes(FMT), epochs=10, target_kl=.001)
+    assert result['early_stopped']
+    assert result['epochs_completed'] < 10
+    assert result['kl_history'][-1] > .001
+
+
+def test_lazy_model_and_scout_initialization_preserve_sampling_rng(brain):
+    from ml.scout import Scout
+    torch.manual_seed(101)
+    before = torch.random.get_rng_state().clone()
+    brain.model(FMT)
+    assert torch.equal(torch.random.get_rng_state(), before)
+    Scout(brain.store, FMT, Features())
+    assert torch.equal(torch.random.get_rng_state(), before)
+
+
+def test_loading_existing_checkpoint_does_not_contend_with_learner(brain):
+    original = Model(brain.store.root, FMT)
+    with brain.store.writer():
+        assert brain.model(FMT).revision == original.revision
