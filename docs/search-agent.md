@@ -77,7 +77,8 @@ in the browser transport, all fixed in `ml/browser.py`:
 - the preview choice object exists only after controls render (now awaited);
 - the client rewrites its local copy of a request while rendering, so freshness and
   the click guard compare the server `rqid`, not the whole object;
-- move buttons appear only after turn animations, so clicks wait up to 90 s.
+- move buttons and Mega checkboxes appear only after turn animations, so the
+  transport waits for the controls (up to 90 s) before clicking.
 
 ## Not yet done
 

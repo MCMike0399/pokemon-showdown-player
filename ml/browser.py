@@ -30,6 +30,13 @@ SNAPSHOT = r"""(id) => {
 }"""
 
 
+CONTROLS_SHOWN = r"""id => {
+    const r = app.rooms[id];
+    const b = r && r.el.querySelector('button[name="chooseMove"]');
+    return !!(b && b.offsetParent);
+}"""
+
+
 def request_key(snapshot):
     request = snapshot.get('request') or {}
     return (request.get('rqid'), fingerprint(request))
@@ -298,6 +305,15 @@ class BrowserPlayer:
                         await target.click()
                 else:
                     events = {'mega': 'megaevo', 'megax': 'megaevox', 'megay': 'megaevoy', 'terastallize': 'terastallize'}
+                    # Controls (and their evolution checkboxes) appear only after
+                    # the turn's animations; wait for this slot's move buttons.
+                    for _ in range(360):
+                        shown = await self.page.evaluate(
+                            CONTROLS_SHOWN,
+                            room)
+                        if shown is not False:
+                            break
+                        await asyncio.sleep(.25)
                     for flag, name in events.items():
                         checkbox = root.locator(f'input[name="{name}"]:visible')
                         if await checkbox.count():
