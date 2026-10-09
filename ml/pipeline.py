@@ -24,6 +24,7 @@ LOADED_GENERATION = source_generation()
 from ml.continuous import LearningConfig, queue_daily
 from ml.resources import ResourcePolicy
 from ml.storage import DEFAULT_ROOT, Store, fingerprint, now
+from ml.data_budget import storage_status
 
 
 def atomic_status(path: Path, value: dict):
@@ -202,7 +203,7 @@ async def supervise(root: Path = DEFAULT_ROOT, interval: float = 15, max_seconds
     store = Store(root)
     policy = None
     reload_requested = False
-    disk_checked, root_gb = 0, 0
+    disk_checked, root_gb, disk = 0, 0, {}
     try:
         while not stop.is_set() and (max_seconds is None or time.monotonic() - started < max_seconds):
             if source_generation() != LOADED_GENERATION:
@@ -214,7 +215,8 @@ async def supervise(root: Path = DEFAULT_ROOT, interval: float = 15, max_seconds
                 policy._config = config.resource.copy()
             resources = policy.sample()
             if time.monotonic() - disk_checked >= 60:
-                root_gb = sum(p.stat().st_size for p in root.rglob('*') if p.is_file()) / 2**30
+                disk = storage_status(root, policy.max_disk_gb)
+                root_gb = disk['retained_bytes'] / 2**30
                 disk_checked = time.monotonic()
             exited = {}
             for lane, process in list(children.items()):
@@ -223,7 +225,7 @@ async def supervise(root: Path = DEFAULT_ROOT, interval: float = 15, max_seconds
                     del children[lane]
             queue_daily(store, config, practice=False)
             production = {'queued': [], 'backlog': {}}
-            if config.enabled and resources['training_allowed'] and root_gb <= policy.max_disk_gb:
+            if config.enabled and resources['training_allowed'] and disk.get('background_allowed', False):
                 production = queue_collection(store, config)
                 for lane, kinds in (('collector', ('practice',)), ('learner', ('learn', 'feed')), ('evaluator', ('evaluate',))):
                     if lane in children:
@@ -240,7 +242,7 @@ async def supervise(root: Path = DEFAULT_ROOT, interval: float = 15, max_seconds
             atomic_status(root / 'pipeline-status.json', {'pid': os.getpid(), 'updated_at': now(),
                 'source_generation': LOADED_GENERATION,
                 'enabled': config.enabled, 'resources': resources, 'children': {lane: p.pid for lane, p in children.items()},
-                'data_root_gb': round(root_gb, 3), 'disk_budget_exceeded': root_gb > policy.max_disk_gb,
+                'data_root_gb': round(root_gb, 3), 'disk_budget_exceeded': disk.get('budget_exceeded', False), 'storage': disk,
                 'exited': exited, 'production': production, 'live_player': 'owned by retained campaign, independent of this supervisor'})
             timeout = interval if max_seconds is None else min(interval, max(0, max_seconds - (time.monotonic() - started)))
             try:

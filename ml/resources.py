@@ -43,6 +43,10 @@ class BackgroundGuard:
         self.next_sample = time.monotonic() + 5
         if self.report:
             self.report(status)
+        if hasattr(self.policy, '_storage_root'):
+            from ml.data_budget import storage_status
+            if not storage_status(self.policy._storage_root, self.policy.max_disk_gb)['background_allowed']:
+                raise ResourceDeferred('live storage reserve protected; experience retained')
         if not status['training_allowed']:
             raise ResourceDeferred('host headroom changed; private update discarded, experience retained')
 

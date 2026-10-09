@@ -203,3 +203,76 @@ def test_recovery_refuses_changed_request_with_same_rqid(tmp_path):
         assert row['steps'][0]['snapshot']['request'] == original['request']
     finally:
         store.close()
+
+
+def test_disappearing_optional_sheet_offer_does_not_stop_the_battle(tmp_path):
+    from ml.brain import Brain
+    from ml.features import Features
+    from ml.storage import Store
+    class Offer:
+        calls = 0
+        async def count(self):
+            return 1
+        async def click(self, **kwargs):
+            self.calls += 1
+            raise TimeoutError('optional offer detached before dispatch')
+    offer = Offer()
+    class OfferPage(Page):
+        def locator(self, selector):
+            if '/acceptopenteamsheets' in selector:
+                return offer
+            return super().locator(selector)
+    store = Store(tmp_path)
+    try:
+        page = OfferPage(snapshot())
+        player = BrowserPlayer(page, Brain(store, Features()), log_path=tmp_path / 'events.jsonl')
+        submissions = []
+        async def submit(state, choice):
+            submissions.append(choice)
+            page.state['log'].append('|win|Configured')
+        player.submit = submit
+        outcome = asyncio.run(player.play(ROOM, FMT))
+        assert outcome['winner'] == 'Configured'
+        assert len(submissions) == 1 and offer.calls == 1
+    finally:
+        store.close()
+
+
+def test_search_waits_for_async_team_selection_before_clicking_battle():
+    from ml.storage import fingerprint
+    team = {'format': FMT, 'sets': [{'species': 'Politoed', 'moves': ['Protect']}]}
+    class SearchPage:
+        ready = False
+        searched = False
+        class SearchLocator:
+            def __init__(self, page, selector):
+                self.page, self.selector = page, selector
+            @property
+            def first(self):
+                return self
+            def locator(self, selector):
+                return self.__class__(self.page, selector)
+            def filter(self, **kwargs):
+                return self
+            async def count(self):
+                return 1
+            async def fill(self, value):
+                pass
+            async def press(self, value):
+                pass
+            async def click(self, **kwargs):
+                if 'selectTeam' in self.selector:
+                    asyncio.get_running_loop().call_soon(setattr, self.page, 'ready', True)
+                elif self.selector == 'button[name="search"]':
+                    assert self.page.ready, 'Battle clicked before selected team became available'
+                    self.page.searched = True
+        def locator(self, selector):
+            return self.SearchLocator(self, selector)
+        async def wait_for_function(self, *args, **kwargs):
+            while not self.ready:
+                await asyncio.sleep(0)
+    page = SearchPage()
+    player = BrowserPlayer(page)
+    player.imported_team = (fingerprint(team), 'Selected team')
+    asyncio.run(player.search(FMT, team))
+    assert page.searched

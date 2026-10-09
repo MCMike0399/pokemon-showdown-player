@@ -11,7 +11,6 @@ import os
 import shutil
 import tempfile
 import time
-import sqlite3
 from dataclasses import asdict
 from pathlib import Path
 
@@ -21,6 +20,8 @@ LOADED_GENERATION = os.environ.get('PS_SOURCE_GENERATION') or source_generation(
 from ml.continuous import LearningConfig, queue_daily
 from ml.resources import ResourcePolicy, ResourceDeferred, BackgroundGuard, backend_for
 from ml.storage import Store, WriterBusy, DEFAULT_ROOT, fingerprint, now
+from ml.data_budget import storage_status
+from ml.input_snapshot import freeze_inputs
 
 
 def rollout(task: dict):
@@ -83,6 +84,9 @@ async def parallel_games(tasks: list[dict], policy: ResourcePolicy, deadline: fl
                     return {'games': results, 'deferred': True, 'source_changed': True}
             if hasattr(policy, '_simulator_cap') and not LearningConfig.load(Path(tasks[cursor]['root'])).enabled:
                 return {'games': results, 'deferred': True, 'reason': 'background learning disabled'}
+            disk = storage_status(Path(tasks[cursor]['root']), policy.max_disk_gb)
+            if not disk['background_allowed']:
+                return {'games': results, 'deferred': True, 'reason': 'live storage reserve protected', 'storage': disk}
             resources = policy.sample(resident_workers=resident)
             workers = min(capacity, resources["allowed_workers"])
             if workers == 0:
@@ -145,29 +149,6 @@ def game_tasks(root, checkpoint_root, fmt, teams, games, training, seed_base, op
     elif curriculum != 'legacy':
         raise ValueError('unknown practice curriculum')
     return tasks
-
-
-def freeze_inputs(store: Store, destination: Path, fmt: str):
-    """Both evaluations see the same research/scout, isolated from live feeds."""
-    frozen = Store(destination)
-    source_db = sqlite3.connect((store.root / 'experience.sqlite3').resolve().as_uri() + '?mode=ro', uri=True)
-    try:
-        source_db.execute('BEGIN')  # All tables come from one WAL read snapshot.
-        with frozen.db:
-            for table in ('research_teams', 'documents', 'public_battles', 'scout_samples'):
-                rows = source_db.execute(f"SELECT * FROM {table} WHERE format=?", (fmt,)).fetchall()
-                frozen.db.execute(f"DELETE FROM {table}")
-                if rows:
-                    placeholders = ','.join('?' for _ in rows[0])
-                    frozen.db.executemany(f"INSERT INTO {table} VALUES ({placeholders})", [tuple(row) for row in rows])
-        source = store.root / 'scouts' / (fmt + '.pt')
-        if source.exists():
-            target = destination / 'scouts' / source.name
-            target.parent.mkdir(exist_ok=True)
-            shutil.copy2(source, target)
-    finally:
-        source_db.close()
-        frozen.close()
 
 
 def candidate_teams(store: Store, fmt: str):
@@ -554,6 +535,7 @@ async def run(root: Path, once: bool = True, schedule: bool = False, lane: str =
             return {"skipped": True, "reason": "learning worker already running"}
         owned = True
         policy._source_guard = SourceGuard(LOADED_GENERATION)
+        policy._storage_root = root
         try:
             pin_runtime(LOADED_GENERATION)
         except SourceChanged:
@@ -571,10 +553,10 @@ async def run(root: Path, once: bool = True, schedule: bool = False, lane: str =
         if (status["deferred"] and lane != 'learner') or not status['training_allowed']:
             progress('deferred', resources=status)
             return {"deferred": True, "resources": status}
-        size = sum(p.stat().st_size for p in root.rglob("*") if p.is_file())/2**30
-        if size > policy.max_disk_gb:
+        disk = storage_status(root, policy.max_disk_gb)
+        if not disk['background_allowed']:
             progress('deferred', reason='learning data root exceeds storage budget')
-            return {"deferred": True, "reason": "learning data root exceeds disk budget; preserve or prune old candidate artifacts"}
+            return {"deferred": True, "reason": "retained model data reached background storage limit; live reserve protected", "storage": disk}
         policy.apply_background()
         started = time.monotonic()
         deadline = started + config.max_seconds

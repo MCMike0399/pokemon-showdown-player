@@ -94,7 +94,7 @@ def test_scheduled_archival_defers_to_resource_guard(closed_snapshot,monkeypatch
 
 def _candidate(root, name, finished=True):
     folder=root/'candidates'/name;(folder/'evaluation-inputs').mkdir(parents=True)
-    if finished:(folder/'report.json').write_text('{}')
+    if finished:(folder/'report.json').write_text(json.dumps({'evaluation':{'complete':True}}))
     source=folder/'evaluation-inputs/experience.sqlite3'
     with sqlite3.connect(source) as db:
         db.execute('CREATE TABLE t(v TEXT)');db.execute('INSERT INTO t VALUES(?)',('frozen input '*3000,))
@@ -116,3 +116,20 @@ def test_candidate_snapshots_compact_only_under_storage_pressure(closed_snapshot
     assert result['storage_pressure'] and not done.exists() and running.exists()
     archive.restore(Path(str(done)+'.gz'))
     assert done.read_bytes()==original
+
+
+def test_deferred_candidate_report_is_not_a_finished_evaluation(closed_snapshot):
+    root, _ = closed_snapshot
+    source = _candidate(root, 'paused')
+    (source.parent.parent / 'report.json').write_text(json.dumps({'deferred': True, 'evaluation_progress': {'incumbent': 8}}))
+    assert archive.eligible_candidates(root) == []
+
+
+def test_shared_inference_directory_is_not_cold_archived(closed_snapshot):
+    root, source = closed_snapshot
+    original = source.parent
+    pooled = root / 'input-snapshots' / 'pooled'
+    pooled.parent.mkdir()
+    original.rename(pooled)
+    original.symlink_to(pooled, target_is_directory=True)
+    assert archive.eligible(root) == []

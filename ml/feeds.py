@@ -98,6 +98,10 @@ async def replay_feed(store: Store, fmt: str, limit: int = 24):
             index = index.get("replays", [])
         imported = []
         for replay in index[:limit]:
+            from ml.continuous import LearningConfig
+            from ml.data_budget import storage_status
+            if not storage_status(store.root, LearningConfig.load(store.root).resource['max_disk_gb'])['background_allowed']:
+                break
             replay_id = replay.get("id", "")
             if not re.fullmatch(re.escape(fmt) + r"-\d+", replay_id):
                 continue
@@ -134,6 +138,11 @@ async def archive_feed(store: Store, key: str, max_games: int = 500, deadline: f
     for battle_id, entry in list(data.items())[:max_games]:
         import time
         if deadline is not None and time.monotonic() >= deadline:
+            partial = True
+            break
+        from ml.continuous import LearningConfig
+        from ml.data_budget import storage_status
+        if not storage_status(store.root, LearningConfig.load(store.root).resource['max_disk_gb'])['background_allowed']:
             partial = True
             break
         log = entry[1] if isinstance(entry, list) else entry.get("log", "")

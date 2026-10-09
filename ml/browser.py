@@ -248,6 +248,15 @@ class BrowserPlayer:
             if not await selected.count():
                 await self.page.locator('button[name="moreTeams"]').click()
             await selected.click()
+            # Team import/selection can finish after the click handler returns.
+            # Let the official client expose this exact saved payload before it
+            # sends /utm; an empty team is rejected by formats requiring teams.
+            await self.page.wait_for_function("""s => {
+                const home=app.rooms[''];
+                const team=window.Storage?.teams?.[home?.curTeamIndex];
+                return home?.curFormat===s.format && team?.name===s.name &&
+                    typeof team.team==='string' && team.team.length>0;
+            }""", arg={'format': fmt, 'name': self.imported_team[1]}, timeout=10000)
         await home.locator('button[name="search"]').click()
 
     async def cancel_search(self):
@@ -382,7 +391,7 @@ class BrowserPlayer:
         pinned = None
         previous = None
         retries = {}
-        sheets_accepted = False
+        sheets_attempted = False
         while True:
             snapshot = await self.snapshot(room)
             if snapshot.get('missing'):
@@ -418,14 +427,25 @@ class BrowserPlayer:
                 if retries[key[0]] >= 3:
                     raise ValueError('repeated server rejection; inspect this request before resuming')
             if not snapshot.get('waiting') and legal_choices(snapshot.get('request')) and key not in self.answered:
-                if not sheets_accepted:
+                if not sheets_attempted:
                     offer = self.page.locator(f'[id="room-{room}"] button[name="send"][value="/acceptopenteamsheets"]:visible')
                     if await offer.count():
-                        await offer.click()
-                        sheets_accepted = True
-                        self.last_submission = time.monotonic()
-                        self.log('team_sheets_accepted', room=room)
-                        continue
+                        sheets_attempted = True
+                        try:
+                            await offer.click(timeout=1000)
+                        except Exception as error:
+                            # Playwright is optional for protocol/offline users.
+                            # Only a disappearing optional offer may time out;
+                            # connection failures still stop the owner.
+                            if not (isinstance(error, TimeoutError) or
+                                    (type(error).__name__ == 'TimeoutError' and
+                                     type(error).__module__.startswith('playwright.'))):
+                                raise
+                            self.log('team_sheets_offer_expired', room=room)
+                        else:
+                            self.last_submission = time.monotonic()
+                            self.log('team_sheets_accepted', room=room)
+                        continue  # Re-read the request after the UI may have changed.
                 delay = self.last_submission + self.decision_interval - time.monotonic()
                 if delay > 0:
                     await asyncio.sleep(delay)

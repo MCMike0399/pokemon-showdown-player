@@ -113,7 +113,7 @@ def test_frozen_inputs_keep_scout_support_and_research_identical(tmp_path):
         store.db.execute('DELETE FROM research_teams')
         store.db.execute('DELETE FROM documents')
         store.db.execute('DELETE FROM scout_samples')
-    frozen = Store(frozen_path)
+    frozen = Store.read_only(frozen_path)
     assert frozen.db.execute('SELECT COUNT(*) FROM scout_samples').fetchone()[0] == 1
     from ml.research import species_prior
     assert species_prior(frozen, FMT)['pelipper'] == 1.0
@@ -175,3 +175,25 @@ def test_partial_evaluation_resumes_same_candidate_cases_without_retraining(tmp_
     assert Model(work / 'candidate', FMT).revision == candidate.revision
     assert Model(tmp_path, FMT).revision == incumbent.revision
     store.close()
+
+
+def test_browser_matchmaking_adopts_only_gated_checkpoint_at_boundary(tmp_path):
+    from scripts.browser_play import prepare_matchmaking
+    store = Store(tmp_path)
+    try:
+        brain = Brain(store, Features())
+        incumbent = brain.model(FMT)
+        candidate = Model(tmp_path / 'candidate', FMT)
+        gate = paired_gate(games([False] * 20), games([True] * 20), 20, .1)
+        assert stage(store, FMT, incumbent.revision, candidate.path, gate)
+        pending = {'id': 'active', 'format': FMT, 'source': 'ladder',
+                   'revision': incumbent.revision, 'status': 'pending', 'steps': []}
+        store.save_episode(pending)
+        assert not prepare_matchmaking(brain, FMT)['promoted']
+        assert brain.model(FMT).revision == incumbent.revision
+        pending.update(status='complete', outcome=1)
+        store.save_episode(pending)
+        assert prepare_matchmaking(brain, FMT)['promoted']
+        assert brain.model(FMT).revision == candidate.revision
+    finally:
+        store.close()

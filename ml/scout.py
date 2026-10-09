@@ -172,6 +172,8 @@ class Scout:
 
     def train(self, epochs: int = 3, device: str = "cpu", max_samples: int = 20000,
               duty_fraction: float = 1.0, checkpoint=None):
+        if (self.store.root / 'inference-only.json').exists():
+            raise ValueError('inference-only inputs cannot train a scout; use the canonical store')
         if checkpoint:
             checkpoint()
         orphaned = self.store.db.execute('''SELECT COUNT(*) FROM scout_samples s WHERE s.format=?

@@ -28,6 +28,8 @@ def fingerprint(value: object) -> str:
 class Store:
     def __init__(self, root: Path = DEFAULT_ROOT):
         self.root = Path(root)
+        if (self.root / 'inference-only.json').exists():
+            raise ValueError('inference snapshots are immutable; use Store.read_only')
         self.root.mkdir(parents=True, exist_ok=True)
         # MCP serializes brain operations with its async lock; training runs in
         # a worker thread so the live websocket reader remains responsive.
@@ -144,7 +146,7 @@ are reconstructed. Atomic creation also tolerates concurrent local collectors.
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?)""",
                 (episode["id"], episode["format"], episode.get("team", ""), episode["source"],
                  episode["revision"], episode.get("created", now()), episode.get("outcome"),
-                 episode.get("status", "pending"), json.dumps(episode)))
+                 episode.get("status", "pending"), json.dumps(episode, separators=(",", ":"))))
 
     def episodes(self, fmt: str, revision: str | None = None, untrained: bool = True) -> list[dict]:
         query = "SELECT data FROM episodes WHERE format=? AND status='complete'"

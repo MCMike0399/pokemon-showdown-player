@@ -70,7 +70,9 @@ legacy worker from starting another trainer. Per-battle jobs remain durably queu
 when immediate kicks are suppressed; the supervisor drains that same queue.
 
 The collector validates the team pool/focused team, snapshots the CPU actor and
-freezes scout/research tables from one SQLite read snapshot. Both learner and
+freezes research and distinct scout move support from one SQLite read snapshot.
+The immutable inputs include exact scout weights and are shared by content; full
+training vectors and replay bodies remain in the canonical store. Both learner and
 frozen self-play opponent read those inputs while all recordings/public experience
 go to the shared store. Games use the pinned official simulator, mixed opponents,
 alternating sides, full seeds and configured sheet visibility. Partial bounded
@@ -103,7 +105,7 @@ daily applications for memory. [Apple's Metal compute explanation](https://devel
 
 The deployed budgets retain three reserved CPU cores, 2 GiB available RAM, a 75%
 measured host CPU ceiling, four total simulator slots, two training threads,
-12% of the recommended MPS allocator budget, 50% GPU duty and 50 GiB local storage.
+12% of the recommended MPS allocator budget, 50% GPU duty and 150 GB retained model data.
 These are cooperative processing limits, not OS quotas or guaranteed desktop
 latency. Collector/evaluator pools split capacity; shared advisory slots also
 bound their simultaneous waves. Headroom is rechecked between waves. Pools exit
@@ -143,9 +145,11 @@ This removes scheduling gaps; it does not claim peak utilization or improved pla
 Configuration lives in gitignored `data/ml/autopilot.json`. Status files are
 `pipeline-status.json` and `pipeline-{collector,learner,evaluator}.json`; logs are
 under `data/ml/logs/`. `ps_learning_status` exposes the same pipeline status.
-Storage-budget exhaustion defers background processing and never deletes data.
-Live recording can grow beyond that processing budget, so ongoing storage
-monitoring remains necessary. Disabled learning stops new jobs; running bounded
+Storage admission reserves 10% for live finalization and stops optional production
+and new browser searches at 135 GB. Model data accounting includes experiments and
+caches; identical inference inputs and historical archive chunks are shared.
+[Storage and quality policy](model-storage.md) explains exact-byte restoration,
+retained evidence and the cooperative limit. Disabled learning stops new jobs; running bounded
 jobs finish/yield cooperatively. Removing the service affects only this project.
 
 The campaign's `control.json` supports `continuous: true`: its numeric target is

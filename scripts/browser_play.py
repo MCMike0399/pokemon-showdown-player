@@ -6,6 +6,7 @@ import argparse
 import asyncio
 import fcntl
 import json
+import itertools
 import os
 import signal
 import sys
@@ -28,11 +29,22 @@ def credentials():
     return tuple(os.environ.get(key) or values.get(key) for key in ('PS_USERNAME', 'PS_PASSWORD'))
 
 
+def prepare_matchmaking(brain, fmt):
+    """Adopt an evaluated candidate only before starting a new game."""
+    from ml.promotion import promote_ready
+    promotion = promote_ready(brain.store, fmt)
+    if promotion.get('promoted'):
+        brain.model(fmt)  # Reload the CPU checkpoint for the next preview.
+    return promotion
+
+
 async def run(args):
     from playwright.async_api import async_playwright
     from ml.brain import Brain
     from ml.browser import BrowserPlayer
     from ml.storage import Store
+    from ml.continuous import LearningConfig
+    from ml.data_budget import storage_status
     from ml.reload import pin_runtime, source_generation
 
     pin_runtime(source_generation())
@@ -101,9 +113,11 @@ async def run(args):
                         raise ValueError('configured account credentials are required')
                     await player.login(username, password)
                     active = await page.evaluate("() => Object.values(app.rooms).filter(r => r.id.startsWith('battle-') && r.request && r.request.side && !r.battle.ended).map(r => r.id)")
+                    if args.resume_active and not args.room and len(active) == 1:
+                        args.room = active[0]
                     if active and active != [args.room]:
                         raise ValueError('existing active battle; resume its exact room before searching')
-                    for game in range(args.games):
+                    for game in (itertools.count() if args.continuous else range(args.games)):
                         if stop.is_set():
                             break
                         if game:
@@ -117,6 +131,14 @@ async def run(args):
                             await page.goto('https://play.pokemonshowdown.com/' + room, wait_until='domcontentloaded')
                             await page.wait_for_function('id => {const r=app.rooms[id];return r && (r.request || (r.battle && r.battle.stepQueue.some(l => l.startsWith("|win|") || l === "|tie" || l === "|tie|")));}', arg=room)
                         else:
+                            disk = storage_status(args.root, LearningConfig.load(args.root).resource['max_disk_gb'])
+                            # An explicit room resume and active finalization remain allowed.
+                            if not disk['background_allowed']:
+                                player.log('storage_limit', **disk)
+                                print(json.dumps({'stopped': 'storage limit; active games retained', 'storage': disk}), flush=True)
+                                break
+                            promotion = prepare_matchmaking(player.brain, args.format)
+                            player.log('matchmaking_checkpoint', **promotion)
                             await player.search(args.format, team)
                             deadline = time.monotonic() + args.search_timeout
                             while time.monotonic() < deadline and not stop.is_set():
@@ -128,7 +150,7 @@ async def run(args):
                                     break
                                 popup = page.locator('.ps-popup:visible')
                                 if await popup.count():
-                                    player.log('search_rejected')
+                                    player.log('search_rejected', popups=[text[:1000] for text in (await popup.all_text_contents())[:4]])
                                     raise ValueError('server rejected matchmaking; inspect browser before retrying')
                                 await asyncio.sleep(.25)
                             if not room:
@@ -167,6 +189,8 @@ def parser():
     p.add_argument('--teams-file', type=Path, default=HERE / 'teams.json')
     p.add_argument('--room', help='Resume this existing room before any new search')
     p.add_argument('--games', type=int, default=1)
+    p.add_argument('--continuous', action='store_true', help='Continue until stopped or the storage admission limit is reached')
+    p.add_argument('--resume-active', action='store_true', help='Resume the single active account battle after login')
     p.add_argument('--headed', action='store_true')
     p.add_argument('--chrome', action='store_true', help='Use installed Google Chrome')
     p.add_argument('--inspect', action='store_true', help='Read-only browser check; no login or games')
