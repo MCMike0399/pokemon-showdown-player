@@ -92,6 +92,39 @@ def test_running_browser_recording_is_filtered_for_viewer(campaign):
         assert private not in exported
 
 
+def test_search_run_tracks_verified_games_across_restarts_without_ppo_episodes(campaign):
+    root = live_watch.PROJECT / 'data/ml/browser-runs'
+    for number, (stamp, room, winner) in enumerate([('20261009T120000Z', 'battle-test-41', 'Agent'),
+                                ('20261009T120100Z', 'battle-test-42', 'Rival')]):
+        folder = root / stamp
+        folder.mkdir(parents=True)
+        events = [
+            {'kind': 'search_agent', 'time': 1791547200},
+            {'kind': 'decision', 'time': 1791547201, 'room': room,
+             'request': {'side': {'id': 'p2'}}},
+            {'kind': 'terminal', 'time': 1791547202 + number, 'result': {'room': room, 'winner': winner},
+             'log': ['|player|p1|Rival|1', '|player|p2|Agent|1', '|win|' + winner]},
+        ]
+        (folder / 'events.jsonl').write_text('\n'.join(map(json.dumps, events)) + '\n')
+    folder = root / '20261009T120200Z'
+    folder.mkdir()
+    (folder / 'events.jsonl').write_text('\n'.join(map(json.dumps, [
+        {'kind': 'search_agent', 'time': 1791547203},
+        {'kind': 'decision', 'time': 1791547204, 'room': 'battle-test-43',
+         'request': {'side': {'id': 'p2'}}},
+        {'kind': 'decision', 'time': 1791547205, 'room': 'battle-test-43',
+         'request': {'side': {'id': 'p2'}}},
+    ])))
+    info = live_watch.status()
+    assert info['score'] == [1, 1, 0]
+    assert info['completed'] == 2
+    assert info['game'] == 3
+    assert info['choices'] == 2 and info['side'] == 'p2'
+    assert [row['result'] for row in info['recent']] == ['Loss', 'Win']
+    replay = live_watch.battle_log('battle-test-42')
+    assert not replay['live'] and replay['log'][-1] == '|win|Opponent'
+
+
 def test_browser_snapshots_publish_live_and_terminal_frames_atomically(tmp_path):
     from ml.browser import publish_watch
     frame = {'room': 'battle-test-42', 'request': {'side': {'id': 'p2'}, 'private': 'secret'},
@@ -108,6 +141,40 @@ def test_browser_snapshots_publish_live_and_terminal_frames_atomically(tmp_path)
     assert json.loads((path.parent / 'current.json').read_text()) == terminal
 
 
+def test_terminal_frame_keeps_our_perspective_after_client_clears_request():
+    from ml.browser import watch_frame
+    frame = watch_frame({'room': 'battle-test-42', 'user': {'name': 'Agent'},
+                         'request': None, 'log': ['|player|p1|Rival|1',
+                                                  '|player|p2|Agent|2', '|win|Agent']})
+    assert frame['side'] == 'p2'
+    assert not frame['live'] and frame['log'][-1] == '|win|Your agent'
+
+
+def test_browser_observer_publishes_while_decider_is_waiting(tmp_path):
+    import asyncio
+    from types import SimpleNamespace
+    from ml.browser import BrowserPlayer
+
+    state = {'room': 'battle-test-42', 'side': 'p2', 'log': ['|start', '|turn|1']}
+
+    class Page:
+        async def evaluate(self, script, room):
+            return state
+
+    player = BrowserPlayer(Page(), SimpleNamespace(store=SimpleNamespace(root=tmp_path)))
+
+    async def slow_decision(*args, **kwargs):
+        # The normal decision loop has no opportunity to request a snapshot here.
+        await asyncio.sleep(.05)
+        state['log'].append('|turn|2')
+        await asyncio.sleep(.25)
+        assert json.loads((tmp_path / 'live-watch/battle-test-42.json').read_text())['turn'] == 2
+
+    player._play = slow_decision
+    asyncio.run(player.play(state['room'], 'test'))
+    assert json.loads((tmp_path / 'live-watch/health.json').read_text())['room'] == state['room']
+
+
 def test_latest_state_is_retained_and_slow_consumers_skip_intermediate_states():
     hub = live_watch.StateHub()
     for turn in range(1, 5):
@@ -120,6 +187,20 @@ def test_latest_state_is_retained_and_slow_consumers_skip_intermediate_states():
     hub.publish({**state, 'error': 'unavailable'})
     assert hub.version == 5
     assert hub.snapshot(timeout=0)[1]['battle']['turn'] == 4
+
+
+def test_stream_deltas_only_use_a_matching_prefix_and_reconnect_starts_full():
+    before = {'status': {}, 'battle': {'room': 'battle-test-1', 'side': 'p2',
+                                      'log': ['|start', '|turn|1']}}
+    after = {**before, 'battle': {**before['battle'], 'log': before['battle']['log'] + ['|turn|2']}}
+    assert live_watch.stream_payload(after, None) == after
+    delta = live_watch.stream_payload(after, before)['battle']
+    assert delta['log_start'] == 2 and delta['log'] == ['|turn|2']
+    assert live_watch.stream_payload(after, after)['battle']['log'] == []
+    rewrite = {**after, 'battle': {**after['battle'], 'log': ['|turn|3']}}
+    assert live_watch.stream_payload(rewrite, after) == rewrite
+    switched = {**after, 'battle': {**after['battle'], 'room': 'battle-test-2'}}
+    assert live_watch.stream_payload(switched, before) == switched
 
 
 def read_event(response):
@@ -163,6 +244,14 @@ def test_http_stream_initial_reconnect_pin_and_room_validation(monkeypatch):
         pinned = open_stream('/api/events?room=battle-test-1')
         read_event(pinned)
         assert json.loads(read_event(pinned).split('data: ', 1)[1])['battle']['room'] == 'battle-test-1'
+        delta_client = open_stream('/api/events?deltas=1')
+        read_event(delta_client)
+        assert json.loads(read_event(delta_client).split('data: ', 1)[1]) == payload
+        appended = {**payload, 'battle': {**payload['battle'], 'log': ['|turn|8', '|turn|9']}}
+        hub.publish(appended)
+        assert json.loads(read_event(response).split('data: ', 1)[1]) == appended
+        delta = json.loads(read_event(delta_client).split('data: ', 1)[1])['battle']
+        assert delta['log_start'] == 1 and delta['log'] == ['|turn|9']
         hub.publish({**payload, 'battle': {**payload['battle'], 'log': ['|turn|9']}})
         assert json.loads(read_event(response).split('data: ', 1)[1])['battle']['log'] == ['|turn|9']
         assert open_stream('/api/events?room=../../.env').status == 400

@@ -168,7 +168,8 @@ vm.runInContext('shown = data.room', context);
     assert events[:2] == [["create", True], ["viewpoint", "p2"]]
     assert events.count(["play"]) == 2  # Once for each room, never on repeated polls.
     appended = [event[1] for event in events if event[0] == "append"]
-    assert appended[:3] == [PREVIEW + ["|start"] + SWITCHES, [], ["|turn|2"]]
+    assert appended[:2] == [PREVIEW + ["|start"] + SWITCHES, ["|turn|2"]]
+    assert [] not in appended  # Score-only events must not restart the animation loop.
     assert events[events.index(["destroy"]) - 1] == ["pause"]
 
 

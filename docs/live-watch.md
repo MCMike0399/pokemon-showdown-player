@@ -14,16 +14,25 @@ setup. Keep this route private to the tailnet.
 
 The server maintains one current campaign/battle snapshot from the existing
 player's atomic relay files. `/api/events` sends a full snapshot immediately on
-entry or reconnection, then pushes changes over server-sent events (SSE). This is
+entry or reconnection, then pushes changes over server-sent events (SSE). The
+viewer opts into `/api/events?deltas=1`: subsequent messages carry only newly
+appended protocol lines and their `log_start` offset. A room change, rewritten
+log, or reconnect sends a complete snapshot. Older clients still receive full
+snapshots without this parameter. This is
 a one-way persistent HTTP stream. Each browser has its own renderer and replay
 selection; slow/disconnected viewers receive the latest state without an event
 backlog. A viewer restart recovers from the saved relay and read-only SQLite data.
-Campaign scores are checked every two seconds, relay frames every 250 ms. These
-intervals do not change the player's existing publication rate.
+Scores are checked every 500 ms, relay frames every 100 ms. The browser player
+observes its existing page every 200 ms during model inference and control waits;
+it publishes changed frames atomically without a second Showdown connection.
 
 Live entry, reconnection and returning to a background tab seek to the current
-match position. Normal new events animate, with automatic catch-up if the renderer
-falls more than a turn behind or accumulates over 80 events. Sound stays muted by
+match position. Normal new events use Showdown's faster animation mode, with
+automatic catch-up if the renderer falls more than a turn behind, accumulates
+over 80 events, or is still animating 1.8 seconds after the latest event batch
+(checked every 500 ms). The displayed turn distinguishes catching up from live
+state. Terminal live updates catch up immediately; selected replays animate.
+An observation heartbeat marks a stale player feed after ten seconds. Sound stays muted by
 default. Select a recent game for playback; **Jump to live** returns to auto-follow.
 **Reconnect** replaces the viewer's stream, without touching the player connection.
 The sidebar shows an open-ended ladder record without a game cap or target bar.
@@ -77,8 +86,14 @@ data endpoints.
 
 Live frames are written atomically under `data/ml/live-watch/` by the MCP battle
 observer. The relay excludes requests, chat and authentication messages.
-Terminal scores come from SQLite rather than a runner's counter or a hardcoded
-account name. When no live frame is available, the viewer uses completed recorded
+Terminal scores come from SQLite recordings or verified terminal protocol in the
+browser ledger, rather than a runner's counter or a hardcoded account name.
+Search-agent games intentionally have no PPO episodes; their verified outcomes,
+decision counts, perspective and replays come from the ledger. Consecutive
+search-agent runs share the record across transport restarts. Rooms are counted
+once, and an interrupted game without terminal evidence gets no assigned result.
+Reduced ledger summaries are cached until the source file changes. When no live
+frame is available, the viewer uses completed recorded
 battle logs and labels the view as a replay.
 
 The browser loads Showdown's MIT battle animation engine and public sprite/data

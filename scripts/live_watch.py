@@ -25,38 +25,95 @@ def read(path, default=None):
         return {} if default is None else default
 
 
+_ledger_cache = {}
+_ledger_lock = threading.Lock()
+
+
+def browser_history():
+    """Cache reduced ledgers; search games deliberately have no PPO episodes."""
+    from ml.browser import watch_frame
+    runs = []
+    with _ledger_lock:
+        for path in sorted((PROJECT / 'data/ml/browser-runs').glob('*/events.jsonl'), reverse=True):
+            try:
+                stat = path.stat()
+                signature = (stat.st_mtime_ns, stat.st_size)
+                cached = _ledger_cache.get(path)
+                if cached and cached[0] == signature:
+                    runs.append(cached[1])
+                    continue
+                run = {'directory': str(path.parent), 'first': None, 'search': False,
+                       'room': None, 'phase': 'waiting', 'records': {}}
+                for line in path.read_text().splitlines():
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    kind = event.get('kind')
+                    if kind not in ('search_agent', 'decision', 'terminal', 'stopped', 'interrupted'):
+                        continue
+                    run['first'] = run['first'] or event.get('time')
+                    if kind == 'search_agent':
+                        run['search'] = True
+                    elif kind == 'decision':
+                        room = event.get('room')
+                        if not isinstance(room, str) or not ROOM.fullmatch(room):
+                            continue
+                        row = run['records'].setdefault(room, {'room': room, 'choices': 0})
+                        row['choices'] += 1
+                        row['side'] = (event.get('request') or {}).get('side', {}).get('id')
+                        run['room'], run['phase'] = room, 'playing'
+                    elif kind == 'terminal':
+                        room = event.get('result', {}).get('room')
+                        if not isinstance(room, str) or not ROOM.fullmatch(room):
+                            continue
+                        row = run['records'].setdefault(room, {'room': room, 'choices': 0, 'side': event.get('side')})
+                        frame = watch_frame({'room': room, 'side': row.get('side'), 'log': event.get('log', [])})
+                        terminal = next((line for line in reversed(frame['log'])
+                                         if line.startswith('|win|') or line in ('|tie', '|tie|')), None)
+                        outcome = {'|win|Your agent': 1, '|win|Opponent': -1, '|tie': 0, '|tie|': 0}.get(terminal)
+                        if outcome in (-1, 1) and row.get('side') not in ('p1', 'p2'):
+                            outcome = None  # A winner alone cannot identify our side.
+                        if outcome is not None:
+                            row.update(status='complete', outcome=outcome,
+                                       created=datetime.fromtimestamp(event['time'], timezone.utc).isoformat(), frame=frame)
+                        run['room'], run['phase'] = None, 'waiting'
+                    elif kind == 'stopped':
+                        run['room'], run['phase'] = None, 'stopped'
+                    elif kind == 'interrupted':
+                        run['room'], run['phase'] = event.get('room'), 'interrupted'
+                _ledger_cache[path] = (signature, run)
+                runs.append(run)
+            except OSError:
+                continue
+    return runs
+
+
 def viewer_run():
     latest = read(PROJECT / 'data/ml/campaigns/latest.json')
     # Browser runs have their own ledger; never rewrite the stopped campaign.
-    for events in sorted((PROJECT / 'data/ml/browser-runs').glob('*/events.jsonl'), reverse=True):
-        records, room, first, phase = [], None, None, 'waiting'
-        try:
-            lines = events.read_text().splitlines()
-        except OSError:
-            continue
-        for line in lines:
-            try:
-                event = json.loads(line)
-            except ValueError:
-                continue  # A writer may still be appending the final line.
-            if event.get('kind') == 'decision':
-                room = event.get('room')
-                if isinstance(room, str) and ROOM.fullmatch(room):
-                    records.append({'room': room})
-                    first = first or event['time']
-                    phase = 'playing'
-            elif event.get('kind') == 'terminal':
-                room, phase = None, 'waiting'
-            elif event.get('kind') == 'stopped':
-                room, phase = None, 'stopped'
+    runs = browser_history()
+    for index, run in enumerate(runs):
+        first = run['first']
         if first is None:
             continue
         started = datetime.fromtimestamp(first, timezone.utc).isoformat()
         if latest.get('started_at', '') >= started:
             break
-        fmt = records[0]['room'].split('-')[1]
-        return ({'directory': str(events.parent), 'started_at': started, 'transport': 'browser'},
-                {'active_room': room, 'phase': phase}, {'format': fmt}, {}, records)
+        records = dict(run['records'])
+        if run['search']:
+            # A transport recovery is still the same search-agent ladder record.
+            for previous in runs[index + 1:]:
+                if not previous['search']:
+                    break
+                for room, row in previous['records'].items():
+                    if room not in records or row.get('status') == 'complete':
+                        records[room] = row
+        if not records:
+            continue
+        fmt = next(iter(records)).split('-')[1]
+        return ({'directory': run['directory'], 'started_at': started, 'transport': 'browser'},
+                {'active_room': run['room'], 'phase': run['phase']}, {'format': fmt}, {}, list(records.values()))
     directory = latest.get('directory')
     if not directory:
         return latest, {}, {}, {}, []
@@ -103,12 +160,13 @@ def status():
     finally:
         database.close()
     # Reconnects can leave several segments for one room. Count terminal rooms once.
-    complete = {}
+    complete = {row['room']: row for row in records if row.get('status') == 'complete'}
     for row in rows:
         if row["status"] == "complete" and row["outcome"] in (-1, 0, 1):
             complete[row["room"]] = row
     score = [sum(r["outcome"] == n for r in complete.values()) for n in (1, -1, 0)]
-    live = [r for r in rows if r["room"] == room]
+    complete = dict(sorted(complete.items(), key=lambda item: str(item[1]['created'])))
+    live = [r for r in rows if r["room"] == room] or [r for r in records if r['room'] == room]
     if room in complete:
         room = None
     observer = read(PROJECT / "artifacts/openclaw-monitoring" / campaign.name / "latest.json")
@@ -118,28 +176,37 @@ def status():
                        "result": "Win" if row["outcome"] == 1 else "Loss" if row["outcome"] == -1 else "Tie"})
         if len(recent) == 8:
             break
+    health = read(PROJECT / 'data/ml/live-watch/health.json')
+    stale = bool(room and health.get('room') == room and time.time() - health.get('observed_at', 0) > 10)
     return {"campaign": campaign.name, "room": room, "phase": state.get("phase", "waiting"),
+            "feed_stale": stale or state.get('phase') == 'interrupted',
             "score": score, "completed": len(complete),
             "target": control.get("target_ladder", state.get("target_ladder", manifest.get("targets", {}).get("ladder_games", 100))),
             "game": len(complete) + 1, "choices": live[-1]["choices"] if live else 0,
-            "side": live[-1]["side"] if live else None,
+            "side": live[-1].get("side") if live else None,
             "updates": observer.get("actor", {}).get("updates"),
             "scout_samples": observer.get("scout", {}).get("samples"),
             "recent": recent, "checked_at": datetime.now(timezone.utc).isoformat()}
 
 
 def battle_log(room=None):
-    latest, state, _, _, _ = viewer_run()
-    room = room or state.get("active_room")
+    if room is None:
+        _, state, _, _, _ = viewer_run()
+        room = state.get("active_room")
     if room and ROOM.fullmatch(room):
         snapshot = read(PROJECT / "data/ml/live-watch" / (room + ".json"))
         if snapshot:
             return {**snapshot, "turn": next((int(line.split('|')[2]) for line in reversed(snapshot.get("log", []))
                                                 if re.fullmatch(r"\|turn\|[0-9]+", line)), 0)}
-    info = status()
-    room = room or (info["recent"][0]["room"] if info["recent"] else None)
+    if room is None:
+        info = status()
+        room = info["recent"][0]["room"] if info["recent"] else None
     if not room or not ROOM.fullmatch(room):
         return {"room": None, "log": [], "live": False, "source": "waiting"}
+    for run in browser_history():
+        frame = run['records'].get(room, {}).get('frame')
+        if frame:
+            return {**frame, 'source': 'completed-recording'}
     database = sqlite3.connect((PROJECT / "data/ml/experience.sqlite3").resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
     try:
         # Already running browser processes can be previewed from their durable
@@ -178,6 +245,17 @@ def battle_log(room=None):
             line = "|win|" + ("Your agent" if perspective[1] == 1 else "Opponent")
         lines.append(line)
     return {"room": room, "side": side, "log": lines, "live": False, "source": "completed-recording"}
+
+
+def stream_payload(payload, previous):
+    """Send only appended protocol lines after each connection's full snapshot."""
+    frame = payload['battle']
+    old = (previous or {}).get('battle', {})
+    log, before = frame.get('log', []), old.get('log', [])
+    if (previous and frame.get('room') == old.get('room') and frame.get('side') == old.get('side')
+            and len(log) >= len(before) and log[:len(before)] == before):
+        return {**payload, 'battle': {**frame, 'log_start': len(before), 'log': log[len(before):]}}
+    return payload
 
 
 class StateHub:
@@ -222,7 +300,7 @@ class StateHub:
             try:
                 if time.monotonic() >= next_status:
                     info = status()
-                    next_status = time.monotonic() + 2
+                    next_status = time.monotonic() + .5
                 # Retain the last game between matches, until the next room starts.
                 previous = self.payload["battle"].get("room") if info.get("campaign") == self.payload["status"].get("campaign") else None
                 room = info.get("room") or previous
@@ -230,7 +308,7 @@ class StateHub:
                 self.publish({"status": info, "battle": frame, "error": None})
             except (OSError, sqlite3.Error, ValueError, KeyError):
                 self.publish({**self.payload, "error": "Campaign state temporarily unavailable"})
-            self.stopped.wait(.25)
+            self.stopped.wait(.1)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -243,7 +321,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_error(400, "Invalid battle room")
             return
         if route.path == "/api/events":
-            return self.stream(room)
+            return self.stream(room, deltas=parse_qs(route.query).get('deltas') == ['1'])
         if route.path in ("/api/status", "/api/battle"):
             try:
                 payload = status() if route.path == "/api/status" else battle_log(room)
@@ -274,7 +352,7 @@ class Handler(BaseHTTPRequestHandler):
         except OSError:
             pass  # A viewer may navigate away while an asset/API reply is sent.
 
-    def stream(self, room):
+    def stream(self, room, deltas=False):
         hub = self.server.hub
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -287,6 +365,7 @@ class Handler(BaseHTTPRequestHandler):
         self.connection.settimeout(20)
         version = None
         pinned = None
+        previous = None
         try:
             self.wfile.write(b"retry: 1500\n\n")
             self.wfile.flush()
@@ -300,8 +379,10 @@ class Handler(BaseHTTPRequestHandler):
                         if not pinned or pinned.get("live") or not pinned.get("log"):
                             pinned = battle_log(room)
                         payload = {**payload, "battle": pinned}
+                    outgoing = stream_payload(payload, previous) if deltas else payload
+                    previous = payload
                     body = (f"id: {hub.instance}:{current}\nevent: state\ndata: " +
-                            json.dumps(payload) + "\n\n").encode()
+                            json.dumps(outgoing) + "\n\n").encode()
                 self.wfile.write(body)
                 self.wfile.flush()
                 version = current

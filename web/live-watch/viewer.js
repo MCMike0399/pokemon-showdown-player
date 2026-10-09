@@ -2,7 +2,8 @@
 const $id = id => document.getElementById(id);
 let follow = true, shown = null, latest = null, battle = null, stream = null;
 let catchUpNext = true, replay = false, relayLog = [], recentSignature = null;
-let retryTimer = null;
+let retryTimer = null, liveTimer = null;
+let relayReceivedAt = 0, streamBattle = null;
 let alternateArtwork = new Set();
 const roomPattern = /^battle-[a-z0-9]+-[0-9]+(?:-[a-z0-9]+)?$/;
 const battleURL = room => 'https://play.pokemonshowdown.com/' + room;
@@ -60,9 +61,12 @@ function newBattle(room, side) {
   jQuery('#battle,#battle-log').empty();
   alternateArtwork.clear();
   $id('sprite-notice').classList.add('hidden');
-  battle = new Battle({id: room, $frame: jQuery('#battle'), $logFrame: jQuery('#battle-log'), paused: true});
+  battle = new Battle({id: room, $frame: jQuery('#battle'), $logFrame: jQuery('#battle-log'), paused: true,
+    subscription: updateViewerStatus});
   battle.roomid = room;
   battle.joinButtons = false;
+  // Showdown's own fast animation mode retains move effects at twice the pace.
+  battle.messageFadeTime = 100;
   if (side) battle.setViewpoint(side);
   resizeBattle();
 }
@@ -96,19 +100,34 @@ function applyBattle(data) {
     newBattle(data.room, data.side);
     relayCount = 0; relayRoom = data.room;
   }
-  battle.addBatch(log.slice(relayCount));
+  if (log.length > relayCount) {
+    relayReceivedAt = Date.now();
+    battle.addBatch(log.slice(relayCount));
+  }
   relayCount = log.length; relayLog = log; relayLast = data;
-  const liveView = !replay && (data.live || data.source === 'player-relay');
+  const liveView = !replay;
   const lag = Number(data.turn || 0) - battle.turn;
   const pending = (battle.stepQueue?.length || 0) - (battle.currentStep || 0);
-  if (liveView && (reset || catchUpNext || document.hidden || lag > 1 || pending > 80)) {
+  if (liveView && (reset || catchUpNext || document.hidden || lag > 1 || pending > 80 || !data.live && pending > 0)) {
     battle.seekTurn(Infinity);
   }
   // addBatch resumes playback itself. Starting a second loop causes scene errors.
   if (reset) battle.play();
   catchUpNext = false;
-  $id('viewer-status').textContent = data.live
-    ? data.turn ? 'Live · Turn ' + data.turn : 'Live · Team preview'
+  updateViewerStatus();
+}
+
+function updateViewerStatus() {
+  if (!relayLast || !battle) return;
+  if (latest?.feed_stale) {
+    $id('viewer-status').textContent = 'Player feed interrupted · Last received turn ' + (relayLast.turn || 0);
+    return;
+  }
+  const turn = Math.max(0, battle.turn || 0);
+  const lagging = relayLast.live && turn < (relayLast.turn || 0);
+  $id('viewer-status').textContent = relayLast.live
+    ? lagging ? 'Catching up · Turn ' + turn + ' → ' + relayLast.turn
+      : relayLast.turn ? 'Live · Turn ' + relayLast.turn : 'Live · Team preview'
     : replay ? 'Recorded game replay' : 'Match finished';
 }
 
@@ -116,11 +135,21 @@ function connect() {
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   if (stream) stream.close();
   catchUpNext = true;
-  stream = new EventSource('/api/events' + (!follow && shown ? '?room=' + encodeURIComponent(shown) : ''));
+  streamBattle = null;
+  stream = new EventSource('/api/events?deltas=1' + (!follow && shown ? '&room=' + encodeURIComponent(shown) : ''));
   const current = stream;
   stream.addEventListener('state', event => {
     if (stream !== current) return;
     const data = JSON.parse(event.data);
+    const frame = data.battle;
+    if (frame?.log_start !== undefined) {
+      if (streamBattle?.room !== frame.room || streamBattle.log.length !== frame.log_start) {
+        connect(); // Recover a lost base with a complete snapshot.
+        return;
+      }
+      data.battle = {...frame, log: [...streamBattle.log, ...frame.log]};
+    }
+    streamBattle = data.battle;
     applyStatus(data.status);
     if ((!shown || follow && !data.status.room) && data.battle?.room) {
       const game = data.status.recent?.find(row => row.room === data.battle.room)?.game || data.status.game || '—';
@@ -191,7 +220,16 @@ $id('reconnect').onclick = connect;
 window.addEventListener('beforeunload', () => {
   if (retryTimer) clearTimeout(retryTimer);
   if (stream) stream.close();
+  if (liveTimer) clearInterval(liveTimer);
 });
+// A turn can contain enough animations to fall behind without another relay
+// arriving. Bound that delay even when the latest server turn has not changed.
+liveTimer = window.setInterval?.(() => {
+  if (!replay && battle && relayLast?.live && !document.hidden &&
+      battle.currentStep < battle.stepQueue.length && Date.now() - relayReceivedAt > 1800) {
+    battle.seekTurn(Infinity);
+  }
+}, 500);
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden) {
     catchUpNext = true;
@@ -235,10 +273,10 @@ function applyStatus(data) {
     $id('streak').textContent = stats.streakText;
     $id('updates').textContent = data.updates ?? '—'; $id('choices').textContent = data.choices ?? '—';
     $id('samples').textContent = data.scout_samples?.toLocaleString() ?? '—';
-    $id('signal').textContent = data.room ? 'Live game' : data.phase==='paused_for_adjustments' ? 'Adjustment checkpoint' :
+    $id('signal').textContent = data.feed_stale ? 'Player feed interrupted' : data.room ? 'Live game' : data.phase==='paused_for_adjustments' ? 'Adjustment checkpoint' :
       ['blocked', 'paused'].includes(data.phase) ? 'Run paused' :
       ['complete', 'ladder_target_complete', 'deadline_reached'].includes(data.phase) ? 'Run stopped' : 'Between games';
-    $id('dot').classList.toggle('wait', !data.room);
+    $id('dot').classList.toggle('wait', !data.room || data.feed_stale);
     if (follow && data.room) show(data.room, data.game);
     if (!shown && data.recent?.length) show(data.recent[0].room, data.recent[0].game);
     const signature = JSON.stringify(data.recent || []);

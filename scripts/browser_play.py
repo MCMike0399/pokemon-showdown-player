@@ -115,7 +115,7 @@ async def run(args):
                         room = args.room if game == 0 else None
                         if room:
                             await page.goto('https://play.pokemonshowdown.com/' + room, wait_until='domcontentloaded')
-                            await page.wait_for_function('id => app.rooms[id] && app.rooms[id].request', arg=room)
+                            await page.wait_for_function('id => {const r=app.rooms[id];return r && (r.request || (r.battle && r.battle.stepQueue.some(l => l.startsWith("|win|") || l === "|tie" || l === "|tie|")));}', arg=room)
                         else:
                             await player.search(args.format, team)
                             deadline = time.monotonic() + args.search_timeout
@@ -145,6 +145,10 @@ async def run(args):
                         await agent.close()
                     player.log('stopped', finish_active_game=True)
                     print('Browser run stopped; evidence: ' + str(output), flush=True)
+                except Exception:
+                    if 'player' in locals():
+                        player.log('interrupted', room=locals().get('room'))
+                    raise
                 finally:
                     await browser.close()
         finally:

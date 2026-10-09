@@ -6,6 +6,7 @@ reads only the configured player's client state; Playwright performs all actions
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import json
 import time
 import uuid
@@ -55,6 +56,11 @@ def watch_frame(snapshot):
     """Export battle protocol only; never requests, chat, or player identities."""
     from ml.scout import PUBLIC_KINDS
     side = (snapshot.get('request') or {}).get('side', {}).get('id') or snapshot.get('side')
+    if not side and snapshot.get('user', {}).get('name'):
+        user = to_id(snapshot['user']['name'])
+        side = next((parts[2] for line in snapshot.get('log', [])
+                     if len(parts := line.split('|')) > 3 and parts[1] == 'player'
+                     and to_id(parts[3]) == user), None)
     names = {s: 'Your agent' if s == side else 'Opponent' for s in ('p1', 'p2')}
     players = {}
     log = []
@@ -80,10 +86,17 @@ def publish_watch(root, snapshot):
     folder = Path(root) / 'live-watch'
     folder.mkdir(exist_ok=True)
     frame = watch_frame(snapshot)
-    text = json.dumps(frame)
     target = folder / (snapshot['room'] + '.json')
-    if target.exists() and target.read_text() == text:
-        return
+    if target.exists():
+        try:
+            previous = json.loads(target.read_text())
+            previous.pop('updated_at', None)
+            if previous == frame:
+                return
+        except (OSError, ValueError):
+            pass
+    frame['updated_at'] = time.time()
+    text = json.dumps(frame)
     for target in (target, folder / 'current.json'):
         temporary = target.with_suffix('.tmp')
         temporary.write_text(text)
@@ -163,6 +176,21 @@ class BrowserPlayer:
         if self.brain and not snapshot.get('missing'):
             publish_watch(self.brain.store.root, snapshot)
         return snapshot
+
+    async def watch(self, room):
+        """Observe during inference and UI waits using the existing browser only."""
+        while True:
+            try:
+                snapshot = await self.snapshot(room)
+                if self.brain and not snapshot.get('missing'):
+                    target = self.brain.store.root / 'live-watch/health.json'
+                    temporary = target.with_suffix('.tmp')
+                    temporary.write_text(json.dumps({'room': room, 'observed_at': time.time()}))
+                    temporary.replace(target)
+            except Exception:
+                # A failed observation must never cancel or submit a player action.
+                pass
+            await asyncio.sleep(.2)
 
     async def login(self, username, password):
         # A persistent profile re-authenticates on its own a few seconds after
@@ -260,6 +288,12 @@ class BrowserPlayer:
         if (current.get('request') or {}).get('rqid') != key or current.get('waiting') or current.get('partial'):
             raise ValueError('request changed or browser already has a choice')
         root = self.page.locator(f'[id="room-{room}"]')
+        if not choice.startswith('team '):
+            # Use the official playback control to expose the current request
+            # immediately; long move animations must not consume the game timer.
+            skip = root.locator('button[name="goToEnd"]:visible')
+            if await skip.count():
+                await skip.click(timeout=5000)
 
         async def click(name, value):
             await root.locator(f'button[name="{name}"][value="{value}"]').click(timeout=90000)
@@ -333,6 +367,15 @@ class BrowserPlayer:
         self.log('submitted', room=room, request_id=key, choice=choice)
 
     async def play(self, room, fmt, *, sets=None, timeout=180, record=True):
+        observer = asyncio.create_task(self.watch(room))
+        try:
+            return await self._play(room, fmt, sets=sets, timeout=timeout, record=record)
+        finally:
+            observer.cancel()
+            with suppress(asyncio.CancelledError):
+                await observer
+
+    async def _play(self, room, fmt, *, sets=None, timeout=180, record=True):
         if self.brain is None:
             raise ValueError('a local model is required')
         last_progress = time.monotonic()
@@ -346,7 +389,7 @@ class BrowserPlayer:
                 raise ValueError('battle room disappeared; rejoin before resuming')
             outcome = result(snapshot)
             if not outcome.get('ongoing'):
-                side = (snapshot.get('request') or {}).get('side', {}).get('id') or self.brain.room_side(room)
+                side = watch_frame(snapshot)['side'] or self.brain.room_side(room)
                 pending = self.brain.resume(room, side)
                 if pending and pending['steps'] and pending['steps'][-1].get('submitted') is False:
                     self.brain.reject(room, side, reason='browser-unconfirmed-terminal-proposal')
@@ -362,7 +405,7 @@ class BrowserPlayer:
                             features=self.brain.features)}
                     except Exception as error:
                         saved = {**(saved or {}), 'public_experience': {'imported': False, 'error': type(error).__name__}}
-                self.log('terminal', result=outcome, experience=saved, log=snapshot['log'])
+                self.log('terminal', result=outcome, side=side, experience=saved, log=snapshot['log'])
                 return outcome
             key = request_key(snapshot)
             rejected = previous and (any(line.startswith('|error|') for line in snapshot['log'][previous['log_length']:]) or
