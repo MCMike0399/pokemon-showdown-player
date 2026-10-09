@@ -182,3 +182,24 @@ def test_pacing_reads_new_request_before_model_decision(tmp_path):
         assert store.room_episodes(ROOM, 'p2')[0]['steps'][0]['request_id'] == 5
     finally:
         store.close()
+
+
+def test_recovery_refuses_changed_request_with_same_rqid(tmp_path):
+    from ml.brain import Brain
+    from ml.features import Features
+    from ml.storage import Store
+    store = Store(tmp_path)
+    try:
+        brain = Brain(store, Features())
+        original = snapshot()
+        brain.decide(context(original, FMT), explore=True, record=True)
+        changed = deepcopy(original)
+        changed['request']['side']['pokemon'][0]['condition'] = '20/100'
+        player = BrowserPlayer(Page(changed), brain)
+        with pytest.raises(ValueError, match='differs from the recorded proposal'):
+            asyncio.run(player.play(ROOM, FMT))
+        row = store.room_episodes(ROOM, 'p2')[0]
+        assert row['status'] == 'pending' and row['steps'][0]['submitted'] is False
+        assert row['steps'][0]['snapshot']['request'] == original['request']
+    finally:
+        store.close()

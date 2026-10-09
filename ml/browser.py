@@ -325,6 +325,8 @@ class BrowserPlayer:
                         raise ValueError('pending recording does not match team/checkpoint')
                     if saved.get('submitted'):
                         raise ValueError('submission acknowledgement ambiguous; inspect existing room')
+                    if fingerprint(saved.get('snapshot', {}).get('request')) != fingerprint(ctx['request']):
+                        raise ValueError('recovered request differs from the recorded proposal; inspect before resuming')
                     decision = {'choice': saved['choice'], 'recorded': True, 'recovered': True}
                 else:
                     decision = self.brain.decide(ctx, explore=record, record=record)
