@@ -1,0 +1,285 @@
+\section{Learning from outcomes: policy gradients, GAE and PPO}
+\label{sec:learning}
+
+\subsection{Reward and objective}
+For a completed episode with $T$ recorded decisions, let $Y\in\{-1,0,1\}$ be
+loss, tie or win from our side. The reward is terminal only:
+$r_t=0$ for $t<T-1$ and $r_{T-1}=Y$. With $\gamma=0.99$,
+\begin{equation}
+  G_t=\sum_{j=t}^{T-1}\gamma^{j-t}r_j=\gamma^{\,T-1-t}\,Y.
+\end{equation}
+With $\gamma=1$, $\E[Y]=\Prob(\mathrm{win})-\Prob(\mathrm{loss})
+=2\Prob(\mathrm{win})+\Prob(\mathrm{tie})-1$. When ties are absent, as in every
+recorded M-C game, maximizing $\E[Y]$ is the same as maximizing win
+probability. With $\gamma<1$, the same outcome is worth less after a longer
+game, so training mildly prefers shorter wins and longer losses. The promotion
+gate counts raw wins. The two criteria are related but not identical.
+
+For a fixed policy, the history-conditioned value, action value and advantage
+are $V^\pi(h_t)=\E_\pi[G_t\mid h_t]$,
+$Q^\pi(h_t,a)=\E_\pi[G_t\mid h_t,a_t=a]$ and $A^\pi=Q^\pi-V^\pi$. The critic
+approximates $V^\pi$ through compressed features. Its output is unbounded and
+is not a calibrated win probability.
+
+\subsection{The policy-gradient identity on histories}
+\begin{theorem}[Finite-horizon likelihood-ratio gradient]
+\label{thm:gradient}
+Assume a finite trajectory space and a finite horizon $T$, padding terminated
+trajectories with zero-reward absorbing steps. Assume bounded rewards, a
+differentiable policy with parameter-independent support on each history, and
+environment and opponent kernels that do not depend on $\theta$. Let
+$J(\theta)=\E_\theta[\sum_{t<T}\gamma^tr_t]$. Then
+\begin{equation}
+  \nabla_\theta J(\theta)=
+  \E_\theta\Big[\sum_{t=0}^{T-1}\gamma^tG_t\,
+       \nabla_\theta\log\pi_\theta(a_t\mid h_t)\Big],
+\label{eq:gradient}
+\end{equation}
+and $G_t$ may be replaced by $G_t-B(h_t)$ for any action-independent baseline
+$B$ without changing the expectation.
+\end{theorem}
+\begin{proof}
+A trajectory's probability factors into initial, transition and policy terms.
+Only the policy terms depend on $\theta$, so
+$\nabla\log p_\theta(\tau)=\sum_t\nabla\log\pi_\theta(a_t\mid h_t)$.
+Differentiating the finite expectation gives $\E[R(\tau)\nabla\log
+p_\theta(\tau)]$. A reward earned before $a_t$ is determined by $h_t$, and
+$\E[\nabla\log\pi_\theta(a_t\mid h_t)\mid h_t]=\sum_a\nabla\pi_\theta(a\mid
+h_t)=\nabla1=0$. Those cross terms therefore vanish, which leaves
+$\sum_{j\ge t}\gamma^jr_j=\gamma^tG_t$. The same zero-mean identity removes the
+baseline.
+\end{proof}
+
+\intuition{An action gains probability when the outcome that follows it is
+better than expected for that situation. The theorem needs no Markov
+assumption on the hashed features, because it is stated on histories. It does
+need the recorded action to have actually been sampled from $\pi_\theta$.
+This is why search decisions are never PPO data.}
+
+\caveat{The implemented surrogate averages decision samples equally and omits
+the $\gamma^t$ factor. It is therefore a standard heuristic related to
+Equation~\eqref{eq:gradient}, not an unbiased estimator of $\nabla J$
+\citep{policygradient,ppo,gae}. Opponent kernels are not fixed in self-play
+either: the \code{self} opponent is a frozen snapshot of the incumbent, which
+is fixed within a batch but changes after each promotion.}
+
+\subsection{Generalized advantage estimation}
+Using the collecting critic's stored values $V_t$, and $V_T=0$,
+\begin{align}
+  \delta_t&=r_t+\gamma V_{t+1}-V_t,\qquad
+  \widehat A_t=\delta_t+\gamma\lambda\widehat A_{t+1},\qquad \widehat A_T=0,\qquad\lambda=0.95,\\
+  \widehat R_t&=\widehat A_t+V_t.
+\label{eq:gae}
+\end{align}
+Figure~\ref{fig:gae} shows how the recursion runs backward through one
+episode.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \foreach \i/\lab in {0/{preview},1/{turn 1},2/{turn 2},3/{turn 3}}{
+    \node[box,text width=20mm] (s\i) at (3.6*\i,0) {$t=\i$\\\scriptsize\lab};
+    \node[note] at (3.6*\i,-0.85) {$V_\i$ stored};
+  }
+  \node[warmbox,text width=17mm] (end) at (14.2,0) {win\\$r_3=Y=+1$};
+  \foreach \i/\j in {0/1,1/2,2/3}{ \draw[arr] (s\i) -- (s\j); }
+  \draw[arr] (s3) -- (end);
+  \foreach \i in {0,1,2,3}{
+    \node[font=\scriptsize] (d\i) at (3.6*\i,1.35) {$\delta_\i=r_\i+\gamma V_{\the\numexpr\i+1\relax}-V_\i$};
+  }
+  \foreach \i/\j in {3/2,2/1,1/0}{
+    \draw[-{Latex[length=2mm]},thick,draw=seriesB] (3.6*\i-0.3,2.0) to[out=150,in=30]
+      node[note,above]{$\times\gamma\lambda=0.9405$} (3.6*\j+0.3,2.0);
+  }
+  \node[font=\scriptsize,text=muted,align=left,anchor=west] at (-1.0,-1.6)
+   {$\widehat A_t=\sum_{j\ge t}(\gamma\lambda)^{j-t}\delta_j$; critic target $\widehat R_t=\widehat A_t+V_t$;
+    the actor uses advantages standardized once over the whole batch.};
+\end{tikzpicture}}
+\caption{GAE on a four-decision episode with a terminal win. Only the last
+residual contains the reward. Each earlier advantage adds its own residual to
+the next advantage, discounted by $\gamma\lambda$.}
+\label{fig:gae}
+\end{figure}
+
+\begin{proposition}[GAE expansion and the Monte Carlo endpoint]
+\label{prop:gae}
+The recurrence~\eqref{eq:gae} gives
+$\widehat A_t=\sum_{j=t}^{T-1}(\gamma\lambda)^{j-t}\delta_j$. If $\lambda=1$
+and $V_T=0$, then $\widehat A_t=G_t-V_t$.
+\end{proposition}
+\begin{proof}
+Unroll the recurrence backward from $\widehat A_T=0$, or argue by induction
+from $t=T-1$. With $\lambda=1$, the $+\gamma V_{j+1}$ in each residual cancels
+the $-V_{j+1}$ in the next one after discounting. What remains is the
+discounted rewards, $-V_t$, and $\gamma^{T-t}V_T=0$.
+\end{proof}
+
+\begin{example}[Two decisions ending in a win]
+With $(V_0,V_1)=(0.20,0.30)$ and $(r_0,r_1)=(0,1)$: $\delta_1=0.70$,
+$\delta_0=0.99(0.30)-0.20=0.097$, $\widehat A_1=0.70$, and
+$\widehat A_0=0.097+0.9405(0.70)=0.75535$. The critic targets are
+$(0.95535,1.00)$; the Monte Carlo target for $t=0$ would be 0.99.
+\end{example}
+
+\subsection{Stored probabilities and importance ratios}
+\label{sec:ratios}
+For a step collected by revision $\theta_{\mathrm{old}}$, PPO uses
+\begin{equation}
+  \rho_t(\theta)=\frac{\pi_\theta(a_t\mid x_t,\A_t)}{\pi_{\theta_{\mathrm{old}}}(a_t\mid x_t,\A_t)}
+  =\exp\big(\log\pi_\theta(a_t\mid x_t,\A_t)-\mathrm{storedLogProb}_t\big),
+\end{equation}
+with both policies tempered as in Equation~\eqref{eq:policy}.
+
+\begin{proposition}[Conditional importance identity]
+\label{prop:importance}
+At a fixed stored input and candidate set, if the old policy $p$ is positive
+wherever the new policy $q$ is, then $\E_{a\sim p}[(q(a)/p(a))f(a)]=\E_{a\sim
+q}[f(a)]$ for every real $f$.
+\end{proposition}
+\begin{proof}
+Write the left side as $\sum_ap(a)\,q(a)f(a)/p(a)$ and cancel $p(a)$ on its
+support. The support assumption means no term with positive $q$-mass is lost.
+\end{proof}
+
+This corrects the action choice at fixed inputs only, not the whole
+trajectory distribution. It is wrong when the action was really chosen by
+greedy play, a human, search, or an unknown policy. Rejections add a further
+subtlety. The stored likelihood is the probability of the \emph{proposal}. If
+hidden restrictions reject some proposals and only accepted ones survive, the
+executed action follows the proposal policy conditioned on acceptance. The
+recorder therefore keeps rejected proposals separately, and accepts a step
+only after its submission is confirmed.
+
+\subsection{Collecting-likelihood validation}
+\label{sec:likelihood}
+Before training, the learner reloads the parent (collecting) weights and
+recomputes every stored step's tempered log-probability. Any episode with a
+step where the recomputed and stored values differ by more than
+$\eta=10^{-4}$ is excluded.
+
+\begin{proposition}[What the likelihood check guarantees]
+\label{prop:likelihood}
+Suppose every retained step satisfies
+$|\log\pi_{\theta_{\mathrm{old}}}(a_t)-\mathrm{storedLogProb}_t|\le\eta$, with
+the left side recomputed from the stored inputs. Then for every $\theta$ the
+ratio used in training equals the exact ratio times $e^{\epsilon_t}$ with
+$|\epsilon_t|\le\eta$. For $\eta=10^{-4}$, the relative ratio error is at most
+$e^{\eta}-1\approx1.00005\times10^{-4}$.
+\end{proposition}
+\begin{proof}
+Write $\epsilon_t=\log\pi_{\theta_{\mathrm{old}}}(a_t)-\mathrm{storedLogProb}_t$.
+Then $\exp(\log\pi_\theta-\mathrm{storedLogProb})
+=\exp(\log\pi_\theta-\log\pi_{\theta_{\mathrm{old}}})e^{\epsilon_t}$, and
+$|\epsilon_t|\le\eta$ by assumption.
+\end{proof}
+
+\intuition{The check certifies more than arithmetic. A trajectory whose
+features, candidate list, checkpoint or temperature changed after recording
+would fail it. The six most recent learner jobs had a maximum discrepancy of
+$1.9\times10^{-6}$. The check cannot certify that the recorded inputs were
+themselves a faithful observation; Section~\ref{sec:game} covers that
+separately.}
+
+\subsection{The optimized PPO loss}
+Advantages are standardized once over the whole batch, before any epoch:
+$\widetilde A_t=(\widehat A_t-\overline A)/(s_A+10^{-8})$ when the batch has
+more than one sample and $s_A>10^{-6}$. Here $s_A$ is the population
+standard deviation. Each minibatch $\mathcal B$ of size $B$ also carries phase
+weights $\omega_t=w_t/\overline w_{\mathcal B}$, where $w_t$ is the preview
+training weight ($1\le w\le16$) for preview steps and 1 otherwise. The
+minimized loss is
+\begin{equation}
+  \mathcal L(\theta)=\frac1B\sum_{t\in\mathcal B}\omega_t\Big[
+   -\min\!\big(\rho_t\widetilde A_t,\clip(\rho_t,0.8,1.2)\widetilde A_t\big)
+   +0.5\big(V_\theta(x_t)-\widehat R_t\big)^2
+   -c_H\,H\big(\pi_\theta(\cdot\mid x_t,\A_t)\big)\Big].
+\label{eq:loss}
+\end{equation}
+The entropy is that of the tempered distribution, and the value loss is not
+clipped. The deployed configuration is: entropy coefficient $c_H=0.01$; preview
+weight 1 (so $\omega_t\equiv1$); Adam with learning rate $3\cdot10^{-4}$;
+minibatches of 32 drawn by a seeded permutation; four epochs; global
+gradient-norm clip 0.5; target KL 0.03. A non-finite loss aborts before any
+checkpoint is written. Each training call produces a new revision UUID and
+increments the update counter once.
+
+\begin{proposition}[What clipping bounds]
+\label{prop:clip}
+For a fixed advantage $A$ and positive ratio $\rho$,
+\[
+  \min(\rho A,\clip(\rho,1-\epsilon,1+\epsilon)A)=
+  \begin{cases}A\min(\rho,1+\epsilon),&A\ge0,\\A\max(\rho,1-\epsilon),&A<0,\end{cases}
+\]
+and this is never larger than the unclipped term $\rho A$.
+\end{proposition}
+\begin{proof}
+For $A\ge0$ multiplication by $A$ preserves order, so the minimum picks the
+smaller of $\rho$ and $\clip(\rho)$. That is $\min(\rho,1+\epsilon)$, because
+clipping from below never lowers $\rho$. For $A<0$ the order reverses. The
+minimum picks the larger of the two, which is $\max(\rho,1-\epsilon)$. Taking
+a minimum with $\rho A$ cannot exceed $\rho A$.
+\end{proof}
+
+\begin{example}[A clipped update]
+If $\pi_{\mathrm{old}}(a)=0.20$, $\pi_\theta(a)=0.30$ and $A=0.70$, then
+$\rho=1.5$. The unclipped term is 1.05; the clipped term is
+$1.2(0.70)=0.84$. With $A=-0.70$ and $\rho=0.5$ the clipped term is
+$0.8(-0.70)=-0.56$, not $-0.35$.
+\end{example}
+
+The proposition does not keep every ratio within $[0.8,1.2]$, does not enforce
+a KL constraint, and does not lower-bound win-rate improvement
+\citep{ppo,trpo}. The KL stop below is the implementation's coarse trust
+region.
+
+\subsection{The KL early stop}
+After each full epoch, the learner evaluates the whole batch at the current
+parameters and computes
+\begin{equation}
+  \widehat{\KL}=\frac1N\sum_{i=1}^N\big[(\rho_i-1)-\log\rho_i\big],
+  \label{eq:k3}
+\end{equation}
+where $\rho_i$ is the ratio at the stored action. If $\widehat{\KL}>0.03$, the
+remaining epochs are skipped. The updates from the epoch that crossed the
+threshold are \emph{kept}.
+
+\begin{proposition}[The KL estimator]
+\label{prop:k3}
+Fix a state, an old policy $p$ and a new policy $q$ with the same support, and
+let $\rho(a)=q(a)/p(a)$. Then each term $(\rho-1)-\log\rho$ is non-negative,
+and $\E_{a\sim p}[(\rho(a)-1)-\log\rho(a)]=\KL(p\Vert q)$. Consequently, if
+the stored actions were sampled from the old policy, Equation~\eqref{eq:k3} is
+an unbiased estimate of the average $\KL(\pi_{\mathrm{old}}\Vert\pi_\theta)$
+over the batch's stored states.
+\end{proposition}
+\begin{proof}
+For $u>0$, $u-1-\log u\ge0$, with equality only at $u=1$, because $\log u\le
+u-1$. Next, $\E_p[\rho]=\sum_aq(a)=1$, so $\E_p[\rho-1]=0$, and
+$\E_p[-\log\rho]=\sum_ap(a)\log(p(a)/q(a))=\KL(p\Vert q)$. Averaging over
+states with their stored actions preserves unbiasedness, by linearity.
+\end{proof}
+
+\caveat{The estimator is unbiased for $\KL(\text{old}\Vert\text{new})$
+(\citealp{klapprox}). The check runs only between epochs, so the returned
+candidate can exceed 0.03 by up to one epoch's movement. Recent production
+batches stopped at final-epoch values between 0.012 and 0.017, so none
+triggered the stop. The statistic is still computed on the same samples used
+for the gradient, so it is a training-set diagnostic rather than a held-out
+one.}
+
+\subsection{Demonstrations}
+For explicitly labelled demonstrations $(x_t,\A_t,a_t^*)$, a separate training
+call minimizes
+\begin{equation}
+  \mathcal L_{\mathrm{BC}}(\theta)=-\frac1B\sum_t\omega_t\log\pi_\theta(a_t^*\mid x_t,\A_t),
+\end{equation}
+the weighted conditional log-likelihood. There is no ratio, entropy or value
+term, and no collecting-likelihood check. The shared state encoder still
+changes, so the critic moves too. Imitating a weak teacher does not make the
+learner an expert.
+
+\source{\code{Model.train} (eligibility, GAE, likelihood validation,
+standardization, loss, KL stop, saving) in \code{ml/model.py};
+\code{RolloutBatcher} in \code{ml/batching.py}; \code{trajectory_issues} in
+\code{ml/data_quality.py}; \code{LearningConfig} in \code{ml/continuous.py}.}

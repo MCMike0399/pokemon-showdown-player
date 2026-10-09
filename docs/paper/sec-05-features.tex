@@ -1,0 +1,216 @@
+\section{Features, profiles and the strategic prior}
+\label{sec:features}
+
+\subsection{Fixed-dimensional vectors for variable objects}
+The state vector has $d_s=384$ coordinates and each candidate's action vector
+has $d_a=192$. A named feature $f$ with value $v_f$ is added by signed hashing:
+\begin{equation}
+  \phi_j \mathrel{+}=\sigma(f)\,v_f,\qquad
+  j=H(f)\bmod(d-16),\qquad \sigma(f)\in\{-1,+1\}.
+\end{equation}
+Both $H$ and $\sigma$ come from an eight-byte BLAKE2b digest: the first four
+bytes, little-endian, give $H$, and the parity of the fifth byte gives the
+sign. The last sixteen coordinates are reserved for dense numbers. That
+leaves 368 hashed state buckets and 176 hashed action buckets. Feature names
+are namespaced by role and position: species, item, ability, HP, status,
+boosts, stats, types, moves with their PP ratio, volatiles, field and side
+conditions. The last sixteen public move events are added with weight
+$1/\sqrt{i+1}$, counting back from the newest. A research prior adds
+\code{meta/<species>} frequencies. It is built from the top 32 team-sheet
+frequencies, overlaid by the top 32 usage entries. Dense state slots hold turn
+progress $\min(\text{turn}/50,2)$, total own HP divided by six, and
+$|\A|/1000$.
+
+The whole vector is clipped to $[-5,5]$. After clipping, the decision code
+adds the scout's top-three move probabilities
+(Section~\ref{sec:scout}). The \emph{stored} state therefore can leave the
+clipped interval.
+
+\begin{proposition}[Hashing loses distinctions]
+\label{prop:hash}
+A signed hash map from $m$ categorical indicator coordinates into $d'<m$
+buckets ($d'=d-16$ here) is not injective on $\R^m$. Any later function of the
+hashed vector, including clipping, cannot restore the lost distinctions.
+\end{proposition}
+\begin{proof}
+The map is linear with rank at most $d'<m$, so its null space is nontrivial.
+Two inputs that differ by a null-space vector hash to the same output, and
+any later function maps equal inputs to equal outputs.
+\end{proof}
+This is a capacity statement, not a claim that two particular battle states
+collide. Expected-collision results for feature hashing assume random hash
+functions \citep{featurehashing}; a fixed digest over a realized vocabulary
+does not inherit them automatically.
+
+\subsection{Feature profiles}
+A checkpoint stores a \code{feature_profile}. Training excludes episodes
+recorded under any other profile, so a profile is a versioned input semantics.
+The schema number alone is not enough to identify the inputs. Nineteen profiles
+exist; Table~\ref{tab:profiles} lists the families.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.27\linewidth} X}
+\toprule
+Profile family & What it changes \\
+\midrule
+\code{legacy}, \code{weather-v1} & Original features and the power/type prior
+of Section~\ref{sec:legacyprior}; weather-aware move data. \\
+\code{tactics-v1}, \code{rain-v1}, \code{mechanics-v1} & Damage-based turn
+priors and rain-team mechanics. \code{tactics-v1} and \code{rain-v1}, with
+\code{opening-v1}, are the only profiles that use the corrected coloured-HP
+parser. \\
+\code{preview-*}, \code{lineup-v1}, \code{opening-*}, \code{mega-v1} &
+Preview priors (coverage, lead pressure, exposure) and exact prospective Mega
+stats under Champions rules. \\
+\code{strategic-v1} (\textbf{deployed}) & Scenario-evaluation prior for turns
+and previews (Section~\ref{sec:strategic}); bench canonicalization. \\
+\code{strategic-v2..v5} & More mechanics, preview plan summaries, Mega
+uncertainty. v2--v4 were evaluated and rejected; the v5 experiment was paused
+before a completed gate (Section~\ref{sec:evidence}). \\
+\bottomrule
+\end{tabularx}
+\caption{Feature-profile families. Only \code{strategic-v1} is deployed.}
+\label{tab:profiles}
+\end{table}
+
+\subsection{The deployed strategic prior}
+\label{sec:strategic}
+The final action coordinate holds a scalar prior $q_0(x,a)$. Under
+\code{strategic-v1} it comes from a one-turn \emph{scenario evaluation} in
+\code{ml/strategy.py}, which has four steps.
+
+\paragraph{Opponent hypotheses.}
+For each live opposing active Pok\'{e}mon, candidate moves are drawn from the
+disclosed sheet if there is one. Otherwise they are the observed moves plus
+the five most frequent executed moves for the species in the checkpoint's
+\code{strategy_knowledge}. That table holds counts from 766 earlier games.
+Each move gets the weight
+\begin{equation}
+  w=2+\sqrt{\text{count}}+\min(3,\text{recent}),
+\end{equation}
+with Protect multiplied by 1.5 below 40\% HP, by 0.65 otherwise, and by 0.3
+if it was used on the previous turn. The two strongest attacks and one support
+move are kept. A single-target attack is split over targets: weight~1 goes to
+the target with the largest damage relative to its remaining HP
+($\text{damage}/\max(0.2,h)$), and 0.45 to the others. Two further hypotheses are
+added when they apply:
+\begin{itemize}
+  \item a switch-in from the revealed bench, with weight $0.12\sum w$;
+  \item a 50/50 Mega-forme split, when the stone is disclosed and the side's
+    Mega is unspent.
+\end{itemize}
+
+\paragraph{Joint scenarios.}
+Per-position hypotheses are multiplied across the two opposing positions.
+Impossible combinations, such as two Megas or two switches into one reserve,
+are removed. The six most probable scenarios are kept and renormalized to
+probabilities $p_k$.
+
+\paragraph{Deterministic resolution.}
+For our candidate $a$ and scenario $k$, \code{simulate} resolves one turn in
+priority and speed order, including Trick Room. It accounts for Protect, Wide
+Guard, redirection, Helping Hand, Fake Out, weather, terrain, Intimidate on
+entry, drain, recoil and Focus Sash. Damage uses the standard formula
+\begin{equation}
+  \text{dmg}=\Big(\tfrac{22\,\mathrm{BP}\,A/D}{50}+2\Big)\cdot\mathrm{STAB}\cdot E\cdot
+  \text{burn}\cdot\text{weather}\cdot0.75^{[\text{spread}]}\cdot0.925\cdot\text{acc}\,/\,\text{maxHP},
+\end{equation}
+where unknown stats are approximated as base~$+\,35$ with stage multipliers, and
+unknown maximum HP as base HP~$+\,90$. The constant 0.925 is the mean damage
+roll. The outcome value is
+\begin{equation}
+  v_k(a)=\sum_{\text{foes}}\big[\Delta h+0.8\,\mathbf 1_{\mathrm{KO}}\big]
+  -\sum_{\text{own}}\big[\Delta h(1+0.2\rho)+(0.9+\rho)\mathbf 1_{\mathrm{KO}}\big]
+  -0.08\,\#\text{Protect}-0.10\,\#\text{switch}+\dots,
+\end{equation}
+where $\rho\in[0,0.5]$ is a scarcity bonus for a Pok\'{e}mon that is the only
+good answer to some opponent. Smaller terms reward a switch-in's next-turn
+threat and penalize spending the Mega.
+
+\paragraph{Risk-sensitive aggregation and squashing.}
+If speeds tie, each $v_k$ averages both orders. The turn score is
+\begin{equation}
+  s(a)=3\Big[(1-\kappa)\sum_kp_kv_k(a)+\kappa\min_kv_k(a)\Big],\qquad
+  \kappa=\clip\big(0.15+0.05(R_{\mathrm{own}}-R_{\mathrm{foe}}),0.05,0.25\big),
+  \label{eq:turnscore}
+\end{equation}
+where $R_{\mathrm{own}}$ sums our HP fractions. $R_{\mathrm{foe}}$ sums the
+revealed foes' HP fractions and counts each unseen foe as one. Preview
+candidates use \code{opening_score} instead. It takes the better of no-Mega
+and one-Mega modes over coverage, lead pressure and exposure, adds terms for
+rain dependency, Intimidate, Fake Out and Trick Room, and doubles the total.
+Finally,
+\begin{equation}
+  q_0(a)=g(s(a)),\qquad g(s)=\frac{4s}{4+|s|}.
+  \label{eq:squash}
+\end{equation}
+
+\begin{proposition}[Properties of the risk aggregate and the squash]
+\label{prop:squash}
+\leavevmode
+\begin{enumerate}
+  \item For any scenario values,
+    $\min_kv_k\le(1-\kappa)\sum_kp_kv_k+\kappa\min_kv_k\le\sum_kp_kv_k$.
+    The aggregate is monotone in each $v_k$, and adding a constant $c$ to every
+    $v_k$ adds $c$ to it.
+  \item The function $g$ is odd, strictly increasing and a bijection from $\R$
+    onto $(-4,4)$. It satisfies $0<g'(s)=16/(4+|s|)^2\le1$, so it is
+    1-Lipschitz. Its ranking of candidates equals the ranking by $s$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+(1) Since $\min_kv_k\le\sum_kp_kv_k$, a convex combination of the two lies
+between them. Each part is monotone and translation-equivariant, and so is
+their combination. (2) For $s\ge0$, $g(s)=4s/(4+s)$ has derivative
+$16/(4+s)^2>0$; oddness extends this to $s<0$. The function is continuous at
+0, and $g(s)\to\pm4$ as $s\to\pm\infty$. The derivative is largest at $s=0$,
+where it equals~1, which gives the Lipschitz bound. A strictly increasing map
+preserves order.
+\end{proof}
+
+\intuition{The squash replaces a hard clip, which had flattened 288 of the 360
+preview candidates into one tied value (\code{docs/strategic-validation.md}).
+The pessimism weight $\kappa$ \emph{increases} when we are ahead on resources:
+the prior becomes more risk-averse when there is more to lose. The final
+\code{clip} to $[-4,4]$ in the source is redundant after $g$.}
+
+\begin{example}[A strategic prior, end to end]
+\label{ex:strategic}
+Three scenarios have values $(0.9,0.4,-0.6)$ and probabilities
+$(0.5,0.3,0.2)$, with equal resources, so $\kappa=0.15$. The expectation is
+$0.45$, the minimum is $-0.6$, and
+$s=3[0.85(0.45)+0.15(-0.6)]=0.8775$. The squash gives
+$q_0=4(0.8775)/4.8775\approx0.720$. At the deployed temperature $\tau=0.25$
+(Section~\ref{sec:network}), this prior adds $0.720/0.25\approx2.88$ to the
+effective logit before any learned residual.
+\end{example}
+
+\subsection{The legacy power prior}
+\label{sec:legacyprior}
+Earlier profiles used the rough pressure term
+\begin{equation}
+  p(m,j)=\frac{\mathrm{BP}(m)}{100}\,\mathrm{acc}(m)\,\mathrm{STAB}(m)\,E(m,j),
+\label{eq:prior}
+\end{equation}
+summed over live targets, negated against allies, minus 0.4 per switch, plus
+0.15 for Protect, Detect or Wide Guard, and clipped to $[-4,4]$.
+
+\begin{example}[A legacy prior]
+Base power 80, accuracy 1, STAB 1.5 and a super-effective multiplier of 2 give
+$0.8\cdot1.5\cdot2=2.4$. Paired with Protect the candidate scores 2.55; paired
+with a switch it scores 2.0. These numbers are preferences, not HP damage or
+win probabilities. At preview this legacy prior is zero; the strategic prior
+is not.
+\end{example}
+
+The legacy term still feeds a dense action slot, but it is not the deployed
+prior. Neither prior models full speed control, stat spreads, most items, or
+the opponent's best response. Search (Section~\ref{sec:search}) addresses
+exactly that last omission.
+
+\source{\code{Features.add/state/action} in \code{ml/features.py};
+\code{hypotheses}, \code{prepare}, \code{simulate}, \code{turn_score} and
+\code{opening_score} in \code{ml/strategy.py}; \code{damage} in
+\code{ml/tactics.py}; \code{preview_score} in \code{ml/opening.py};
+\code{species_prior} in \code{ml/research.py}.}

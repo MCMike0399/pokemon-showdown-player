@@ -1,0 +1,123 @@
+\section{Candidate actions and doubles constraints}
+\label{sec:actions}
+
+\subsection{Actions are complete player decisions}
+For an actionable request $r$, let $\A(r)$ be the list returned by
+\code{legal_choices(r)}. In doubles, one candidate is a complete pair
+$a=(u_1,u_2)$. Each $u_i$ is a move slot with a target, a switch destination
+or a pass. Examples are
+\begin{lstlisting}
+move 1 1, move 2 -1
+move 1 2 mega, switch 4
+\end{lstlisting}
+Positive targets are opposing positions and negative targets are our own. The
+opponent's simultaneous choice is \emph{not} part of a candidate. The
+enumerator takes the Cartesian product of the per-position options. It
+removes combinations that violate shared constraints, filters disabled or
+exhausted moves, respects visible trapping, and handles fainted positions.
+More than two active positions are rejected. Hidden restrictions can still
+make the server refuse a candidate, so $\A(r)$ is \emph{request-visible
+admissibility}, not proof of acceptance.
+
+\begin{proposition}[Constraints enforced by joint enumeration]
+\label{prop:joint}
+Every emitted doubles candidate has distinct switch destinations, at most one
+Mega-family activation and at most one Terastallization. In a
+forced-replacement request, the number of switching positions equals
+$\min(\text{forced positions},\text{available bench members})$.
+\end{proposition}
+\begin{proof}
+Each product element is tested in turn. Its switch strings must form a set,
+so duplicates are rejected. Under forced switching, its switch count must
+equal the stated minimum. Elements with more than one Mega-family event or
+more than one Terastallization event are rejected. An emitted element has
+passed every predicate.
+\end{proof}
+
+The proposition covers these predicates only. Champions requests never offer
+Terastallization, so that branch is dormant. Team validation and other hidden
+mechanics are outside its scope.
+
+\subsection{Team preview and an exact symmetry}
+With $n$ party members and $k$ to bring, preview candidates are ordered
+selections, $|\A_{\mathrm{preview}}|=n!/(n-k)!$, which is 360 for six choose
+four. The first two positions lead; the last two are the bench. Under
+\code{opening-v2} and every \code{strategic-*} profile except
+\code{strategic-turn-v1}, the action encoder
+canonicalizes the bench by sorting its indices before hashing. The
+representation is therefore exactly invariant to swapping the two bench
+positions. The actor still scores all 360 candidates, so each plan appears
+twice.
+
+\begin{proposition}[Bench symmetry halves the preview space]
+\label{prop:preview}
+Let $\sim$ identify two preview candidates that agree in their ordered leads
+and in their bench as a set. For six choose four this gives 180 classes of
+exactly two candidates each. If the features, and hence the logits, are
+constant on each class, then:
+\begin{enumerate}
+  \item the class probabilities $\Pi(C)=\sum_{a\in C}\pi(a)$ are a softmax
+    over the 180 class logits, at the same temperature;
+  \item the PPO ratio of any candidate equals the ratio of its class;
+  \item the candidate-level entropy is $H(\pi)=H(\Pi)+\log2$.
+\end{enumerate}
+\end{proposition}
+\begin{proof}
+There are $6\cdot5=30$ ordered lead pairs. Each leaves four members, from
+which $\binom{4}{2}=6$ bench sets can be formed, so there are 180 classes.
+Each bench set has exactly two orderings, which accounts for all
+$180\cdot2=360$ candidates. Let $\ell_C$ be the shared logit. Then
+$\pi(a)=e^{\ell_C/\tau}/\sum_{C'}2e^{\ell_{C'}/\tau}$ for $a\in C$, so
+$\Pi(C)=2\pi(a)=e^{\ell_C/\tau}/\sum_{C'}e^{\ell_{C'}/\tau}$. The ratio
+$\pi_\theta(a)/\pi_{\mathrm{old}}(a)=\Pi_\theta(C)/\Pi_{\mathrm{old}}(C)$
+because the factor~2 cancels. Finally,
+$H(\pi)=-\sum_C2\pi_C\log\pi_C=-\sum_C\Pi(C)\log(\Pi(C)/2)=H(\Pi)+\log2$.
+\end{proof}
+
+\intuition{The duplication is harmless for learning. Ratios are unchanged, and
+the entropy bonus is shifted by a constant whose gradient is zero. Statements
+such as ``the policy chooses among 360 previews'' should still say 180 distinct
+plans. Lead order is kept on purpose: it fixes which Pok\'{e}mon occupies the
+left and right positions.}
+
+\subsection{Why joint scoring rather than a product policy}
+Sampling each position independently gives
+$\pi(u_1,u_2\mid x)=p(u_1\mid x)q(u_2\mid x)$. That family cannot express
+coordination.
+
+\begin{proposition}[A coordination a product policy cannot represent]
+\label{prop:product}
+With two options $A,B$ per position, no unmasked product distribution gives
+positive mass to both $(A,A)$ and $(B,B)$ and zero mass to both $(A,B)$ and
+$(B,A)$.
+\end{proposition}
+\begin{proof}
+Positive diagonal mass forces $p(A),q(A),p(B),q(B)>0$, so the off-diagonal
+products are positive too. Equivalently, every product table has rank one and
+determinant zero. The required table has determinant
+$\pi(A,A)\pi(B,B)>0$.
+\end{proof}
+
+The implemented alternative scores each feasible complete candidate directly.
+Masking a product policy with joint constraints, or factorizing it
+autoregressively, would also introduce dependence. Feature collisions and
+finite capacity still limit which joint distributions the network can express.
+
+\subsection{Two enumerators}
+The search engine enumerates candidates separately, inside the simulator, in
+\code{sideChoices} of \code{search/engine.cjs}. Its pruning differs from
+$\A(r)$:
+\begin{itemize}
+  \item Damaging moves aimed at the partner are removed.
+  \item Targets in empty foe slots are removed while the other foe is alive.
+  \item Every move of a Mega-capable Pok\'{e}mon carries the \code{mega} flag,
+    so delaying Mega Evolution is never considered.
+\end{itemize}
+Our own live choices still start from $\A(r)$ and are pruned in Python. The
+engine enumeration is used for the opponent and for our forced-replacement
+look-ahead. Appendix~\ref{app:defects} records a defect in it: when both
+actives on one side can Mega Evolve, every move-and-move pair is discarded.
+
+\source{\code{legal_choices} in \code{battle_state.py}; bench canonicalization
+in \code{Features.action} (\code{ml/features.py}); \code{_prune_ours} in
+\code{search/agent.py}; \code{sideChoices} in \code{search/engine.cjs}.}

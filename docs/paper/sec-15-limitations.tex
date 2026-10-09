@@ -1,0 +1,53 @@
+\section{Limitations and research directions}
+\label{sec:limits}
+
+The system is a working, auditable player with one strong offline result and
+a long list of honest failures. Its main open problems follow from the
+analysis above, in rough order of importance.
+
+\begin{enumerate}
+  \item \textbf{Evaluate the system that is deployed.} The promotion gate
+    measures the sampled self-play actor. Live turns are chosen by search.
+    A candidate actor should be evaluated as a \emph{preview} policy under
+    search turns. Search changes (worlds, opponent blend, evaluation) need a
+    gate of their own, with the opponent team as the unit
+    (Sections~\ref{sec:promotion} and~\ref{sec:evidence}).
+  \item \textbf{Control multiplicity.} The pipeline runs about a hundred gates
+    a day. A fixed $\alpha=0.05$ per gate admits several false promotions per
+    hundred null candidates. Options are an alpha-spending budget, a
+    Bonferroni or Holm level per day, or a mandatory independent final panel,
+    which the experiment runner already uses (Proposition~\ref{prop:multiplicity}).
+  \item \textbf{Measure strength on a fixed scale.} Live win rate depends on
+    the rating band (Proposition~\ref{prop:elo}). Rating trajectories over
+    pre-specified game counts, or GXE, should replace raw win rate as the live
+    target. A frozen pool of real opponent teams piloted by fixed policies
+    should replace synthetic teams as the offline target.
+  \item \textbf{Fix the search defects and reduce its noise.} The defects are
+    the both-Mega enumeration drop, Mega forcing, forme lookups and unseeded
+    durations. Noise can be cut with common random numbers across rows, more
+    than one seed per cell, and more worlds for close decisions
+    (Proposition~\ref{prop:mc}). The optimistic replacement scoring could be
+    replaced by a committed choice across worlds
+    (Proposition~\ref{prop:fusion}).
+  \item \textbf{Better beliefs.} The usage prior ignores correlations between
+    moves, items and spreads, as well as teammates. A joint set model, or a
+    posterior updated from damage observations (a revealed roll constrains
+    the stat spread), would sharpen the worlds. Information-set search would
+    remove fusion at the cost of compute \citep{cowling2012}.
+  \item \textbf{State sufficiency.} Fix the legacy HP parser in the deployed
+    profile, distinguish unknown from observed values, and test longer
+    histories or recurrence. An exact simulator does not help if the encoder
+    drops a mechanic.
+  \item \textbf{Make learning matter.} Inference-time changes (temperature,
+    prior, search) produced every confirmed gain, while gradient updates
+    produced almost none. A learned value function for search, trained on
+    self-play with the existing value-net pipeline and gated like any
+    candidate, is the clearest route by which learning could compound with
+    search, in the spirit of \citet{vgcbench}, \citet{metamon} and
+    \citet{pokechamp}.
+\end{enumerate}
+
+The system has no theorem of equilibrium convergence, optimal team
+construction, belief recovery or monotone improvement. Its rigour lies in
+stating each implemented contract and each proof assumption explicitly, so
+that every new empirical claim can be tested against a defined system.

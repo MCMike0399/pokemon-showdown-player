@@ -1,0 +1,163 @@
+\section{The action-conditioned actor--critic}
+\label{sec:network}
+
+\subsection{Exact architecture}
+Let $x\in\R^{384}$ be the state vector and $z_a\in\R^{192}$ the vector for
+candidate $a$. The deployed \code{concat-v1} network computes
+\begin{align}
+  e_s&=\tanh(W_sx+b_s)\in\R^{128},\qquad
+  e_a=\tanh(W_az_a+b_a)\in\R^{96},\\
+  \ell_\theta(x,a)&=w_\pi^\top\tanh\!\big(W_\pi[e_s;e_a]+b_\pi\big)+c_\pi+q_0(x,a),
+    \label{eq:logit}\\
+  V_\theta(x)&=w_V^\top\tanh(W_Ve_s+b_V)+c_V,
+\end{align}
+with an actor hidden width of 96 and a critic hidden width of 64. The prior
+$q_0(x,a)=z_a[191]$ is the last action coordinate (Section~\ref{sec:features}).
+It enters as a fixed residual and has no learned weight. The critic sees only
+the state. Figure~\ref{fig:network} shows the data flow.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \node[box,text width=22mm] (x) at (0,1.2) {state $x$\\$\R^{384}$};
+  \node[box,text width=22mm] (z) at (0,-1.2) {candidate $z_a$\\$\R^{192}$, $a\in\A$};
+  \node[inkbox,text width=22mm] (es) at (3.2,1.2) {$e_s=\tanh(\cdot)$\\$\R^{128}$};
+  \node[inkbox,text width=22mm] (ea) at (3.2,-1.2) {$e_a=\tanh(\cdot)$\\$\R^{96}$};
+  \node[inkbox,text width=22mm] (h) at (6.3,0) {$[e_s;e_a]\to96$\\$\tanh\to1$};
+  \node[warmbox,text width=17mm] (plus) at (9.0,0) {$+\,q_0(x,a)$\\prior};
+  \node[box,text width=22mm] (pi) at (12.0,0) {$\softmax_{\A}(\ell/\tau)$\\$\tau=0.25$};
+  \node[inkbox,text width=22mm] (v) at (6.3,2.6) {$128\to64\to1$\\critic $V(x)$};
+  \draw[arr] (x) -- (es); \draw[arr] (z) -- (ea);
+  \draw[arr] (es) -- (h); \draw[arr] (ea) -- (h);
+  \draw[arr] (h) -- node[note,above]{$f_\theta$} (plus); \draw[arr] (plus) -- node[note,above]{$\ell_\theta$} (pi);
+  \draw[arr] (es) |- (v);
+  \draw[darr] (z.south) to[out=-30,in=-120] node[note,above,pos=.5,fill=white]{last coordinate $z_a[191]$} (plus.south);
+  \draw[decorate,decoration={brace,amplitude=4pt,mirror},draw=muted] (-1.1,-3.1) -- (13.3,-3.1)
+    node[midway,below=5pt,note]{the same scorer is applied to every candidate; parameter count is independent of $|\A|$};
+\end{tikzpicture}
+\caption{The deployed actor--critic. The final actor layer is initialized to
+zero, so a fresh actor equals $\softmax(q_0/\tau)$. The optional
+\code{matchup-v1} variant adds a bilinear term $u^\top(e_a\odot Me_s)$ to the
+logit.}
+\label{fig:network}
+\end{figure}
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrr}
+\toprule
+Module & Shape & Parameters \\
+\midrule
+State encoder & $384\to128$ & 49{,}280 \\
+Action encoder & $192\to96$ & 18{,}528 \\
+Actor head & $224\to96\to1$ & 21{,}697 \\
+Critic head & $128\to64\to1$ & 8{,}321 \\
+\midrule
+\code{concat-v1} total (\textbf{deployed}) & & \textbf{97{,}826} \\
+\code{matchup-v1} extra: $M$ ($128\to96$), $u$ ($96\to1$) & no bias & $12{,}288+96$ \\
+\code{matchup-v1} total (rejected) & & 110{,}210 \\
+Scout (Section~\ref{sec:scout}) & $384\to96\to938$ & 127{,}946 \\
+\bottomrule
+\end{tabular}
+\caption{Parameter counts, checked by instantiating the classes. The scout's
+output width equals the move vocabulary of the live format.}
+\label{tab:params}
+\end{table}
+
+The \code{matchup-v1} migration loads every old tensor and zero-initializes
+$u$, so migrated logits are exactly unchanged. That variant passed a
+development panel (70 vs.\ 55 of 96) but tied its final panel 126--126 of
+200, and was rejected. The deployed checkpoint (revision \code{893e35e3},
+113 updates) is \code{concat-v1} with profile \code{strategic-v1}. It uses a
+feedforward summary of history: no recurrence, no attention, and no search
+inside the network.
+
+\subsection{The tempered masked policy}
+A checkpoint carries two temperatures in $[0.25,2]$: one for turns and one for
+previews. The deployed value is $\tau=0.25$ for both. For a nonempty
+candidate set the policy is
+\begin{equation}
+  \pi_\theta(a\mid x,\A)=
+  \begin{cases}
+    \dfrac{\exp(\ell_\theta(x,a)/\tau)}{\sum_{u\in\A}\exp(\ell_\theta(x,u)/\tau)}, &a\in\A,\\[1.5ex]
+    0, &a\notin\A.
+  \end{cases}
+\label{eq:policy}
+\end{equation}
+The same $\tau$ is used for sampling, for stored log-probabilities, and for
+the training loss. Inference scores only real candidates. Training pads
+variable candidate sets and fills padded logits with the most negative finite
+float. After division by $\tau<1$ that sentinel overflows to $-\infty$ in
+float32. The categorical distribution handles this exactly, so padded
+probabilities are exactly zero.
+
+\begin{proposition}[Normalization, support and score function]
+\label{prop:mask}
+For finite logits, $\tau>0$ and a nonempty, parameter-independent set $\A$,
+the policy~\eqref{eq:policy} sums to one, vanishes outside $\A$, and for
+$a\in\A$ satisfies
+\begin{equation}
+  \nabla_\theta\log\pi_\theta(a\mid x,\A)
+  =\frac1\tau\Big(\nabla_\theta\ell_\theta(x,a)
+   -\sum_{u\in\A}\pi_\theta(u\mid x,\A)\nabla_\theta\ell_\theta(x,u)\Big).
+\end{equation}
+\end{proposition}
+\begin{proof}
+The denominator is a finite sum of positive terms, so the admissible
+probabilities are positive and sum to one; the others are zero by definition.
+The logarithm is $\ell_\theta(x,a)/\tau-\log\sum_u\exp(\ell_\theta(x,u)/\tau)$.
+Differentiating the log-sum-exp gives the $\pi$-weighted average of
+$\nabla\ell_\theta/\tau$.
+\end{proof}
+
+\intuition{A low temperature multiplies every logit gradient by $1/\tau=4$ and
+sharpens the policy. Turn-temperature promotion was itself the project's
+largest single measured improvement: the same weights at $\tau=0.25$ won 129
+of 200 paired games against 95 at the previous setting.}
+
+\begin{example}[Temperature changes the same preferences]
+\label{ex:temperature}
+For logits $(2.55,2.00,0.30)$, $\tau=1$ gives probabilities
+$(0.594,0.343,0.063)$. The deployed $\tau=0.25$ gives
+$(0.900,0.100,0.0001)$. Greedy play picks the first candidate in both cases.
+These numbers are selection probabilities, not win probabilities.
+\end{example}
+
+\subsection{The learned residual as a tilt of the prior}
+Fix an input and candidate set. Split the logit into the prior $q_0$ and the
+learned residual $f_\theta=\ell_\theta-q_0$, and let
+$q_\tau=\softmax(q_0/\tau)$. Then
+\begin{equation}
+  \pi_\theta(a)=\frac{q_\tau(a)\,e^{f_\theta(a)/\tau}}{Z},\qquad
+  Z=\sum_uq_\tau(u)e^{f_\theta(u)/\tau}.
+\end{equation}
+
+\begin{proposition}[Variational form with temperature]
+\label{prop:variational}
+For a strictly positive $q_\tau$ and finite $f$ on a finite set, the
+distribution $p^*\propto q_\tau e^{f/\tau}$ is the unique maximizer of
+$\sum_ap(a)f(a)-\tau\KL(p\Vert q_\tau)$ over probability vectors $p$.
+\end{proposition}
+\begin{proof}
+From $\log p^*=\log q_\tau+f/\tau-\log Z$,
+\[
+  \sum_ap(a)f(a)-\tau\KL(p\Vert q_\tau)=\tau\log Z-\tau\KL(p\Vert p^*).
+\]
+The right side is maximized, uniquely, where the KL divergence vanishes,
+that is at $p=p^*$.
+\end{proof}
+
+\intuition{The policy behaves as if it maximized the learned residual
+against a KL penalty toward the tempered prior, with penalty strength $\tau$.
+At $\tau=0.25$ the prior is sharpened four-fold and the residual is also
+amplified four-fold. The trainer never optimizes this objective explicitly,
+and a large enough residual can overturn the prior completely.}
+
+\paragraph{Permutation equivariance.} The scorer is applied independently to
+each candidate. Permuting the candidate rows therefore permutes the logits
+and probabilities in the same way. With a unique maximum, the greedy choice is
+independent of list order. Exact ties fall back to the first index.
+
+\source{\code{ActorCritic}, \code{Model.temperature}, \code{Model.predict}
+and \code{enable_matchups} in \code{ml/model.py}; \code{Brain.decide} in
+\code{ml/brain.py}.}

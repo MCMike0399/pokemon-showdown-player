@@ -1,0 +1,182 @@
+\section{The data recorded for every match}
+\label{sec:data}
+
+A learning system is only as trustworthy as its records. The recorder
+answers four questions for every decision:
+\begin{itemize}
+  \item What did the player know?
+  \item Which candidates were legal?
+  \item With which probabilities, under which exact checkpoint, was one
+    sampled?
+  \item What happened afterwards?
+\end{itemize}
+The current format is \emph{recorder~3}.
+
+\subsection{Anatomy of an episode}
+Figure~\ref{fig:episode} shows one episode as stored in the \code{episodes}
+table. An episode is a JSON document of four parts: a header, the conditions
+of collection, the decision steps, and a terminal section.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[x=1cm,y=1cm,
+  field/.style={font=\scriptsize,align=left,anchor=north west,text width=#1},
+  field/.default=6.6cm]
+  % outer episode
+  \draw[draw=ink,rounded corners=3pt,fill=pale] (0,0) rectangle (15.6,-10.25);
+  \node[font=\small\bfseries,text=ink,anchor=north west] at (0.15,-0.1) {Episode (one row of \code{episodes}; JSON \code{data})};
+  % header
+  \draw[draw=accent,fill=white,rounded corners=2pt] (0.3,-0.7) rectangle (7.6,-3.4);
+  \node[font=\footnotesize\bfseries,anchor=north west,text=accent] at (0.4,-0.75) {Header};
+  \node[field] at (0.4,-1.15) {\code{id}, \code{room}, \code{format}, \code{side}, \code{source}
+    (ladder or local); \code{team}: 80-bit fingerprint of the exact sets;
+    \code{revision} of the collecting actor; \code{schema}=1;
+    \code{feature_profile}; \code{recorder_version}=3; \code{status}:
+    pending $\to$ complete; \code{on_policy} or \code{demonstration}.};
+  % collecting policy
+  \draw[draw=accent,fill=white,rounded corners=2pt] (8.0,-0.7) rectangle (15.3,-3.4);
+  \node[font=\footnotesize\bfseries,anchor=north west,text=accent] at (8.1,-0.75) {Conditions of collection};
+  \node[field] at (8.1,-1.15) {\code{collecting_policy}: checkpoint SHA-256 and archived
+    copy, temperatures, architecture, dex digest, source generation.
+    \code{team_sets}: our exact sets. \code{simulation} (local only): 64-bit seed,
+    side, opponent and its revision, opponent team, open-sheet flag.};
+  % steps
+  \draw[draw=seriesB!70!black,fill=warm,rounded corners=2pt] (0.3,-3.7) rectangle (15.3,-7.3);
+  \node[font=\footnotesize\bfseries,anchor=north west,text=seriesB!70!black] at (0.4,-3.75) {Steps $t=0,\dots,T-1$ (one per actionable request)};
+  \node[field=7.0cm] at (0.4,-4.15) {\textbf{Learning arrays.} \code{state} $\in\R^{384}$;
+    \code{actions} $\in\R^{|\A_t|\times192}$ (a 360-row preview is about 358\,KB);
+    \code{index} and \code{choice}; \code{logprob} (tempered);
+    \code{value} $V_{\theta_{\mathrm{old}}}(x_t)$; \code{request_id} (the rqid);
+    \code{inference_ms}; \code{submitted} (ladder).};
+  \node[field=7.0cm] at (8.1,-4.15) {\textbf{Readable snapshot.} The exact private \code{request};
+    the \code{observation}; every legal choice with named components and its
+    probability; selected index; sampling temperature; \code{knowledge}
+    inputs; scout \code{opponent_predictions}; a public-log prefix reference
+    \{segment, length, SHA-256\}.};
+  \node[font=\scriptsize,text=muted,anchor=north west,text width=14.6cm] at (0.4,-6.55)
+    {A retry for the same \code{request_id} overwrites its step. Rejected proposals move to
+     \code{discarded_proposals} with a reason. Player names are redacted to \code{Player-p1/p2}.};
+  % terminal
+  \draw[draw=accent,fill=white,rounded corners=2pt] (0.3,-7.6) rectangle (15.3,-9.95);
+  \node[font=\footnotesize\bfseries,anchor=north west,text=accent] at (0.4,-7.65) {Terminal};
+  \node[field=14.6cm] at (0.4,-8.05) {\code{outcome} $\in\{-1,0,+1\}$ from the
+    verified winner line; \code{terminal_log} \{segment, length, SHA-256\};
+    \code{observation_logs}. \code{postgame}: captured and unmatched move components,
+    own faints, weather changes, opponent leads and executed moves, observed
+    failures, and explicit limitations. Optional \code{recoveries}. A complete
+    episode is immutable.};
+\end{tikzpicture}
+\caption{The recorder-3 episode. Learning uses the orange arrays; auditing and
+replay use the snapshot. For the last 20 ladder games the median document was
+1.30\,MB (range 0.73--2.06\,MB). In a 7-step game, feature arrays took 750\,KB
+and snapshots 440\,KB of 1.20\,MB.}
+\label{fig:episode}
+\end{figure}
+
+\subsection{Tables}
+The store is one SQLite database in write-ahead-log mode. Its tables are listed
+in Table~\ref{tab:sqlite}. Jobs carry a persistent identity, status, attempt
+count and a lease, which is how the three lanes of
+Section~\ref{sec:pipeline} share work safely.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.2\linewidth} X r}
+\toprule
+Table & Contents & Rows (M-C) \\
+\midrule
+\code{episodes} & Header columns plus the JSON document above & 14{,}137 complete \\
+\code{jobs} & Collector, learner, feed and evaluator jobs with leases & --- \\
+\code{public_battles} & Sanitized public logs, unique by digest & 12{,}573 \\
+\code{scout_samples} & Pre-turn public vectors with executed-move labels & 192{,}835 \\
+\code{research_teams}, \code{documents} & Attributed tournament sets and prose & --- \\
+\code{team_metadata}, \code{feed_state} & Team versions; daily feed bookkeeping & --- \\
+\bottomrule
+\end{tabularx}
+\caption{SQLite schema. Counts are a read-only snapshot taken on 9 October
+2026 at about 20:15\,UTC, while collection was still running (database
+18.4\,GB). Of the complete M-C episodes, 854 are recorded ladder games
+(353--501) and 13{,}283 are local self-play games (9{,}010--4{,}273); there
+are no ties. The recorded ladder count also includes browser games played in
+model mode after the 847-game campaign stopped.}
+\label{tab:sqlite}
+\end{table}
+
+\subsection{What makes a record usable for learning}
+Before any gradient step, each candidate episode passes
+\code{trajectory_issues}. An episode is excluded, not repaired, if any check
+fails:
+\begin{enumerate}
+  \item It is not complete, has another format, revision, schema or feature
+    profile, or its outcome is outside $\{-1,0,1\}$.
+  \item Any ladder step was proposed but never submitted.
+  \item Any array has the wrong shape or a non-finite value, or any stored
+    log-probability exceeds $10^{-6}$.
+  \item The snapshot's probabilities do not sum to one, or
+    $p[\text{index}]\ne e^{\text{logprob}}$ (relative tolerance $10^{-5}$).
+  \item The snapshot's choices differ from \code{legal_choices} of its own
+    stored request.
+  \item A log-prefix digest fails, a step contains future or terminal lines,
+    a request is credited twice, or the terminal log lacks a win or tie line.
+\end{enumerate}
+A second check recomputes every stored log-probability under the archived
+collecting checkpoint (Section~\ref{sec:likelihood}). Excluded episodes are
+never marked consumed, so a persistent defect stays visible in later batch
+reports rather than disappearing silently.
+
+\subsection{Games played by search}
+A browser game decided by search writes no \code{episodes} row. Its actions
+were not sampled from $\pi_\theta$, so storing them as PPO samples would give
+false importance ratios (Section~\ref{sec:ratios}). The runner logs each
+decision, with its request, choice and search statistics, to a private
+per-run ledger. At the end of the game, the sanitized public log enters
+\code{public_battles} as an \code{own-live-game} and yields scout labels.
+
+\subsection{Storage lifecycle and budget}
+Data has a bounded lifetime, shown in Figure~\ref{fig:storage}. Each candidate
+freezes the inference inputs it was evaluated with: research teams, documents,
+species and move support, and scout weights. These are stored as a
+content-addressed, read-only snapshot. Completed snapshots are gzip-archived
+every 900\,s, with byte-count and SHA-256 verification, so they stay
+reproducible. A storage budget limits optional work.
+
+\begin{figure}[htbp]
+\centering
+\resizebox{\linewidth}{!}{%
+\begin{tikzpicture}[x=1cm,y=1cm]
+  \node[box,text width=30mm] (src) at (0,0) {Live (MCP) and\\self-play episodes};
+  \node[box,text width=30mm] (pub) at (0,-1.9) {Search games:\\public log only};
+  \node[box,text width=26mm] (db) at (4.4,-0.95) {SQLite store\\hot, WAL};
+  \node[inkbox,text width=40mm] (snap) at (9.3,0) {Frozen inference inputs\\content-addressed, read-only};
+  \node[inkbox,text width=40mm] (cold) at (9.3,-1.9) {Cold archive\\gzip + SHA-256 verified};
+  \node[box,text width=24mm] (ck) at (13.9,-0.95) {Collected\\checkpoints,\\one per digest};
+  \draw[arr] (src) -- (db); \draw[arr] (pub) -- (db);
+  \draw[arr] (db.north east) -- node[note,above left]{per candidate} (snap.west);
+  \draw[arr] ([xshift=-12mm]snap.south) -- node[note,left]{every 900\,s} ([xshift=-12mm]cold.north);
+  \draw[arr] (db.east) -- (ck.west);
+  % budget bar
+  \begin{scope}[yshift=-3.6cm]
+    \fill[pale] (0,0) rectangle (13.97,0.45);
+    \draw[draw=ink] (0,0) rectangle (13.97,0.45);
+    \foreach \f/\l in {0.75/{.75: compaction target},0.85/{.85: compaction trigger},0.90/{.90: optional work stops}}{
+      \draw[very thick,draw=seriesB] (13.97*\f,-0.1) -- (13.97*\f,0.55);
+    }
+    \node[note,anchor=north] at (13.97*0.75,-0.12) {.75 target};
+    \node[note,anchor=south] at (13.97*0.85,0.57) {.85 compact};
+    \node[note,anchor=north] at (13.97*0.90,-0.12) {.90 admission};
+    \node[note,anchor=west] at (0.1,0.225) {retained data under \code{data/}, \code{artifacts/}, \code{cache/} (each inode counted once)};
+    \node[note,anchor=north west] at (0,-0.12) {budget 150\,GB = 139.7\,GiB};
+  \end{scope}
+\end{tikzpicture}}
+\caption{Data lifecycle and the storage budget. Above 90\% of the budget,
+collection, learning and evaluation defer. Above 85\%, finished candidates'
+input snapshots are compacted down to 75\%. Collecting checkpoints are kept
+once per digest, so every recorded likelihood can be recomputed.}
+\label{fig:storage}
+\end{figure}
+
+\source{\code{ml/storage.py} (schema, fingerprint, collected checkpoints);
+\code{ml/brain.py} and \code{ml/recording.py} (steps and snapshots);
+\code{ml/postgame.py}; \code{ml/data_quality.py}; \code{ml/input_snapshot.py};
+\code{ml/data_budget.py}; \code{docs/cold-input-archiving.md};
+\code{docs/model-storage.md}.}

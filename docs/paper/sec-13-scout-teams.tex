@@ -1,0 +1,147 @@
+\section{Opponent-move scouting and team selection}
+\label{sec:scout}
+
+\subsection{The public-move scout}
+Public logs contain executed events, not private requests or a collecting
+policy's probabilities. The repository therefore uses them to train a
+classifier, the scout, and never fabricates PPO samples from them.
+\code{ingest_public} takes a snapshot of each player's public view at every
+turn boundary. A later executed move becomes a label for that snapshot only
+if all of the following hold:
+\begin{itemize}
+  \item the actor was already on the field at the boundary;
+  \item the actor is still unambiguous when the move happens;
+  \item the move is in the dex;
+  \item the move is not tagged \code{[from]} (called or forced).
+\end{itemize}
+Chat, authentication, HTML and private request lines are removed, and players
+are redacted. Incomplete games and orphan samples, whose source battle row is
+missing, are excluded.
+
+\begin{proposition}[Turn-boundary non-anticipation]
+\label{prop:scout}
+If the supplied log is chronological, each retained scout vector is a
+function of the prefix up to its turn boundary and of an actor visible in that
+prefix. Later moves in the same turn, and later reveals, do not enter it.
+\end{proposition}
+\begin{proof}
+At a \code{turn} event the importer builds the context from the prefix up to
+that boundary. When a later move arrives, it encodes the saved context; the
+current prefix is used only to reject ambiguous actors. No later prefix is
+substituted into a saved context.
+\end{proof}
+The selection of which examples to keep does use later identity checks. The
+proposition is about feature content, not selection independence.
+
+The scout is an MLP: $384\to96$ (tanh) $\to M$. For the live format $M=938$
+moves and the network has 127{,}946 parameters. It minimizes
+\begin{equation}
+  \mathcal L_{\mathrm{scout}}(\psi)=-\frac1N\sum_{n}\log q_\psi(m_n\mid u_n)
+\end{equation}
+with Adam at learning rate $10^{-3}$, batches of 128, three epochs and
+gradient norm 1. Training uses at most 20{,}000 rows. That cap now binds. The
+rows used are the 20{,}000 with the smallest hash identifiers, a fixed
+pseudo-random tenth of the 192{,}835 M-C samples. A new sample enters training
+only if its identifier sorts inside the cap, so the subset behaves like a
+uniform subsample that refreshes slowly. Battles whose digest is $0\bmod5$ form the held-out set, so no
+battle is split across partitions. A new scout is promoted only with at least
+eight held-out samples and no increase in held-out cross-entropy. At inference
+the softmax is restricted to the moves on a disclosed sheet, or to the moves
+historically seen for the species. The three most likely moves become hashed
+state features. Their probabilities are not renormalized, so their sum can be
+below one.
+
+\begin{proposition}[Cross-entropy decomposition]
+\label{prop:ce}
+For a true label distribution $p$ and a prediction $q$ positive on $p$'s
+support, $-\sum_mp(m)\log q(m)=H(p)+\KL(p\Vert q)$. The left side is minimized
+exactly at $q=p$.
+\end{proposition}
+\begin{proof}
+Add and subtract $\sum_mp\log p$. Then $\KL\ge0$ by Jensen's inequality, with
+equality only at $q=p$.
+\end{proof}
+
+\caveat{The optimum concerns the distribution of \emph{retained executed}
+moves, not opponents' intentions. Inference may also run mid-turn, for example
+at a forced replacement, whereas training contexts are taken at turn starts,
+so there is a possible distribution shift. Empirically, the scout lowered
+held-out cross-entropy, but in a matched battle comparison it changed no
+outcomes (0 improved, 0 worsened in 200 games), and recorded-state probes show
+the actor responds only weakly to scout features
+(\code{docs/offline-ppo-followup.md}).}
+
+\subsection{Team versions as bandit arms}
+A team arm is an exact ordered list of sets together with its format. Its
+identifier is
+\[
+  v=\mathrm{SHA256}(\mathrm{canonicalJSON}(\{\mathrm{format},\mathrm{sets}\}))_{1:20},
+\]
+an 80-bit truncated fingerprint. Canonicalization sorts object keys, not the
+party list. Completed outcomes $Y_i$ become scores $z_i=(Y_i+1)/2$, and local
+and ladder evidence are queried separately. The posterior uses a
+$\mathrm{Beta}(1,1)$ prior:
+\begin{equation}
+  \alpha_v=1+\sum_iz_i,\quad\beta_v=1+\sum_i(1-z_i),\quad
+  \mu_v=\frac{\alpha_v}{\alpha_v+\beta_v},\quad
+  \sigma_v^2=\frac{\alpha_v\beta_v}{(\alpha_v+\beta_v)^2(\alpha_v+\beta_v+1)}.
+\label{eq:beta}
+\end{equation}
+
+\begin{proposition}[Conjugacy, and the tie extension]
+\label{prop:beta}
+Suppose binary outcomes are conditionally independent and stationary given
+$p_v$. Then $w$ wins and $l$ losses update $\mathrm{Beta}(\alpha_0,\beta_0)$ to
+$\mathrm{Beta}(\alpha_0+w,\beta_0+l)$. Fractional tie scores follow the same
+algebra under the pseudo-likelihood $\prod_ip_v^{z_i}(1-p_v)^{1-z_i}$, which
+is not a Bernoulli model of a three-outcome game.
+\end{proposition}
+\begin{proof}
+Multiply the density $\propto p^{\alpha_0-1}(1-p)^{\beta_0-1}$ by
+$p^w(1-p)^l$. Replacing the integer counts by score sums gives the same
+exponents, but a Bernoulli variable cannot take the value $\tfrac12$.
+\end{proof}
+
+\begin{example}[A played and an unplayed team]
+Seven wins and three losses give $\mathrm{Beta}(8,4)$, $\mu=2/3$ and
+$\sigma=\sqrt{32/1872}\approx0.131$. An unplayed team has $\mu=1/2$ and
+$\sigma=\sqrt{1/12}\approx0.289$.
+\end{example}
+
+With exploration enabled, the planner draws $\tilde p_v\sim
+\mathrm{Beta}(\alpha_v,\beta_v)$ independently and plays
+$\arg\max_{v\in C}\tilde p_v$. This is Thompson sampling \citep{thompson}.
+
+\begin{proposition}[Probability matching]
+\label{prop:thompson}
+Assume independent continuous posteriors over a fixed pool $C$. Then Thompson
+sampling selects arm $v$ with probability equal to the posterior probability
+that $v$ has the largest \emph{true} success parameter:
+$\Prob(\text{select }v)=\Prob_{\text{post}}\big(p_v=\max_{u\in C}p_u\big)$.
+\end{proposition}
+\begin{proof}
+The sampled vector $(\tilde p_u)_{u\in C}$ has the same joint law as the true
+parameters $(p_u)_{u\in C}$ under the posterior. The event ``$v$ attains the
+maximum'' is therefore equally likely for both vectors. Continuity makes ties
+have probability zero.
+\end{proof}
+
+\intuition{The first edition stated this with ``largest \emph{sampled}
+parameter'', which is circular: the algorithm selects that arm by definition.
+The content of the theorem is that sampled and true maxima share one law.}
+
+The estimate describes success \emph{as piloted by the policy of the time,
+against the opponents of the time}. It is not intrinsic team quality, and the
+posterior is not conditioned on the actor revision. In production the team
+was pinned (one candidate, exploration off). Thompson selection was therefore
+inactive in the later campaigns, and every live result in
+Section~\ref{sec:evidence} uses a single rain team. Variants replace one
+member with an attributed same-species set and are validated in the
+simulator. Missing stat spreads are generated, labelled as such, and follow
+the move categories. A generated Garchomp spread that once boosted the wrong
+attacking stat was fixed for this reason.
+
+\source{\code{ingest_public}, \code{public_lines} and \code{Scout} in
+\code{ml/scout.py}; \code{rank_teams}, \code{TeamPlanner.plan},
+\code{suggest_variants} and \code{generated_spreads} in \code{ml/teams.py};
+\code{fingerprint} in \code{ml/storage.py}.}

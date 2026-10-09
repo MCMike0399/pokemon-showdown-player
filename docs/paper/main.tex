@@ -1,0 +1,145 @@
+\documentclass[11pt,letterpaper]{article}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern,microtype}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{booktabs,tabularx,longtable,array,multirow}
+\usepackage{xcolor,graphicx}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,fit,calc,backgrounds,shapes.geometric,shapes.multipart,decorations.pathreplacing}
+\usepackage{pgfplots}
+\pgfplotsset{compat=1.18}
+\usepackage{listings}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{enumitem}
+\usepackage{caption}
+\usepackage{hyperref}
+
+% Palette: ink/accent for prose and diagrams; two validated data colours
+% (blue #2a78d6, orange #eb6834; orange always carries a direct label).
+\definecolor{ink}{HTML}{18354A}
+\definecolor{accent}{HTML}{126B72}
+\definecolor{pale}{HTML}{EEF5F6}
+\definecolor{paleink}{HTML}{E4EAF0}
+\definecolor{warm}{HTML}{FBEFE6}
+\definecolor{muted}{HTML}{52514E}
+\definecolor{gridgray}{HTML}{D9D9D6}
+\definecolor{seriesA}{HTML}{2A78D6}
+\definecolor{seriesB}{HTML}{EB6834}
+
+\hypersetup{colorlinks=true,linkcolor=ink,citecolor=accent,urlcolor=accent,
+  pdftitle={Learning, Search and Evidence in a Pokemon Showdown VGC Agent},
+  pdfauthor={pokemon-showdown-player project}}
+\lstset{basicstyle=\small\ttfamily,breaklines=true,columns=fullflexible,
+  frame=single,rulecolor=\color{pale},backgroundcolor=\color{pale},
+  showstringspaces=false,keepspaces=true}
+\setlist{itemsep=2pt,topsep=5pt}
+\setlength{\emergencystretch}{2em}
+\captionsetup{font=small,labelfont={bf,color=ink}}
+
+\newtheorem{proposition}{Proposition}[section]
+\newtheorem{theorem}[proposition]{Theorem}
+\newtheorem{lemma}[proposition]{Lemma}
+\newtheorem{definition}[proposition]{Definition}
+\newtheorem{example}[proposition]{Example}
+\theoremstyle{remark}
+\newtheorem{remark}[proposition]{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\A}{\mathcal{A}}
+\newcommand{\B}{\mathcal{B}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\softmax}{\operatorname{softmax}}
+\newcommand{\KL}{D_{\mathrm{KL}}}
+\newcommand{\Bin}{\operatorname{Bin}}
+\newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\intuition}[1]{\par\smallskip\noindent\textcolor{accent}{\textbf{Interpretation.}} #1\par\smallskip}
+\newcommand{\source}[1]{\par\smallskip\begingroup\small\raggedright
+  \noindent\textcolor{ink}{\textbf{Implementation:}} #1\par\endgroup\smallskip}
+\newcommand{\caveat}[1]{\par\smallskip\noindent\textcolor{seriesB!80!black}{\textbf{Caveat.}} #1\par\smallskip}
+
+% Shared TikZ styles for every diagram.
+\tikzset{
+  box/.style={draw=ink,rounded corners=3pt,fill=pale,align=center,font=\small,
+    minimum height=9mm,inner sep=4pt},
+  warmbox/.style={box,fill=warm,draw=seriesB!70!black},
+  inkbox/.style={box,fill=paleink},
+  note/.style={font=\scriptsize,text=muted,align=center},
+  arr/.style={-{Latex[length=2mm]},thick,draw=accent},
+  darr/.style={arr,dashed},
+  lane/.style={draw=gridgray,fill=white,rounded corners=2pt},
+  lanelabel/.style={font=\small\bfseries,text=ink,anchor=east,align=right},
+}
+
+\title{\textcolor{ink}{Learning, Search and Evidence in a\\
+  Pok\'{e}mon Showdown VGC Agent}\\[0.6em]
+  \large Architecture, Data, Training on CPU and Apple~MPS, Decision-Time Search,\\
+  and the Mathematics Behind Each Claim}
+\author{\texttt{pokemon-showdown-player}\\\small Technical report grounded in the repository implementation}
+\date{9 October 2026 (second edition; first edition 7 October 2026)\\
+  \small Public source snapshot: \texttt{0c00ec2}; simulator pin \texttt{c046106}; feature schema 1}
+
+\begin{document}
+\maketitle
+\begin{abstract}
+This report describes a complete system for playing the Champions VGC 2026
+Regulation~M-C doubles format on Pok\'{e}mon Showdown, and it audits the
+mathematics behind each component. Turn decisions are made by a
+\emph{determinized simultaneous-move search} run in the official simulator,
+over opponent sets sampled from ladder usage statistics. A compact
+action-conditioned actor--critic chooses team previews and generates all
+training data. A Playwright browser transport clicks the decisions into the
+real client. A supervisor schedules three bounded lanes on one Apple~M5
+laptop: CPU self-play collection, PPO learning on the Metal (MPS) GPU, and
+paired CPU evaluation. A candidate is promoted only after an exact paired sign
+test and a set of integrity checks.
+
+We give the exact network, the strategic prior and its temperature, the
+per-decision record kept for every match, the PPO loss and its KL stop, the
+resource and promotion rules, and the search algorithm. Thirty-one
+propositions, theorems and lemmas state their assumptions and are proved.
+Eight worked examples recompute the implemented numbers. A new evidence chapter reports the paired
+offline result (search 30/45 against the learned policy's 19/45, McNemar
+$p=0.0064$), the live record before and after search, and a negative-results
+ledger of more than thirty rejected candidates. This edition also corrects the
+first: it records stale claims, a circular proposition and an unstated
+temperature, and it documents implementation defects found during review.
+\end{abstract}
+
+\vspace{0.5em}
+\noindent\textbf{Keywords:} Pok\'{e}mon Showdown, VGC doubles, determinization,
+regret matching, PPO, action masking, Apple MPS, paired sign test, Elo.
+
+\clearpage
+\setcounter{tocdepth}{1}
+\tableofcontents
+\listoffigures
+\clearpage
+
+\input{sec-01-introduction}
+\input{sec-02-system}
+\input{sec-03-game}
+\input{sec-04-actions}
+\input{sec-05-features}
+\input{sec-06-network}
+\input{sec-07-data}
+\input{sec-08-learning}
+\input{sec-09-pipeline}
+\input{sec-10-promotion}
+\input{sec-11-search}
+\input{sec-12-transport}
+\input{sec-13-scout-teams}
+\input{sec-14-evidence}
+\input{sec-15-limitations}
+
+\appendix
+\input{sec-a-appendices}
+
+\begingroup
+\small\raggedright
+\bibliographystyle{plainnat}
+\bibliography{references}
+\endgroup
+\end{document}
