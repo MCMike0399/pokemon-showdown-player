@@ -3,6 +3,7 @@
 import json
 import re
 import sqlite3
+import sys
 import threading
 import time
 import uuid
@@ -12,6 +13,7 @@ from pathlib import Path
 from urllib.parse import urlsplit, parse_qs
 
 PROJECT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(PROJECT))
 HERE = PROJECT / "web/live-watch"
 ROOM = re.compile(r"^battle-[a-z0-9]+-[0-9]+(?:-[a-z0-9]+)?$")
 
@@ -23,24 +25,60 @@ def read(path, default=None):
         return {} if default is None else default
 
 
-def status():
-    latest = read(PROJECT / "data/ml/campaigns/latest.json")
-    directory = latest.get("directory")
+def viewer_run():
+    latest = read(PROJECT / 'data/ml/campaigns/latest.json')
+    # Browser runs have their own ledger; never rewrite the stopped campaign.
+    for events in sorted((PROJECT / 'data/ml/browser-runs').glob('*/events.jsonl'), reverse=True):
+        records, room, first, phase = [], None, None, 'waiting'
+        try:
+            lines = events.read_text().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue  # A writer may still be appending the final line.
+            if event.get('kind') == 'decision':
+                room = event.get('room')
+                if isinstance(room, str) and ROOM.fullmatch(room):
+                    records.append({'room': room})
+                    first = first or event['time']
+                    phase = 'playing'
+            elif event.get('kind') == 'terminal':
+                room, phase = None, 'waiting'
+            elif event.get('kind') == 'stopped':
+                room, phase = None, 'stopped'
+        if first is None:
+            continue
+        started = datetime.fromtimestamp(first, timezone.utc).isoformat()
+        if latest.get('started_at', '') >= started:
+            break
+        fmt = records[0]['room'].split('-')[1]
+        return ({'directory': str(events.parent), 'started_at': started, 'transport': 'browser'},
+                {'active_room': room, 'phase': phase}, {'format': fmt}, {}, records)
+    directory = latest.get('directory')
     if not directory:
-        return {"phase": "waiting", "score": [0, 0, 0], "recent": [], "room": None}
+        return latest, {}, {}, {}, []
     campaign = Path(directory)
-    state = read(campaign / "status.json")
-    manifest = read(campaign / "manifest.json")
-    control = read(campaign / "control.json")
     records = []
     try:
-        for line in (campaign / "games.jsonl").read_text().splitlines():
+        for line in (campaign / 'games.jsonl').read_text().splitlines():
             try:
                 records.append(json.loads(line))
             except ValueError:
                 continue
     except OSError:
         pass
+    return latest, read(campaign / 'status.json'), read(campaign / 'manifest.json'), read(campaign / 'control.json'), records
+
+
+def status():
+    latest, state, manifest, control, records = viewer_run()
+    directory = latest.get("directory")
+    if not directory:
+        return {"phase": "waiting", "score": [0, 0, 0], "recent": [], "room": None}
+    campaign = Path(directory)
     room = state.get("active_room")
     room = room if isinstance(room, str) and ROOM.fullmatch(room) else None
     known = {row.get("room") for row in records}
@@ -57,10 +95,11 @@ def status():
                    CASE WHEN json_extract(data,'$.room')=? AND status!='complete'
                         THEN json_array_length(json_extract(data,'$.steps')) ELSE 0 END choices,
                    json_extract(data,'$.side') side
-            FROM episodes WHERE source='ladder' AND format=?
+            FROM episodes INDEXED BY episodes_room_side WHERE source='ladder' AND format=?
                 AND json_extract(data,'$.room') IN ({placeholders})
                 AND julianday(created)>=julianday(?) ORDER BY created
-        """, (room, manifest.get("format"), *rooms, latest.get("started_at")))]
+        """, (room, manifest.get("format"), *rooms,
+              '1970-01-01T00:00:00Z' if latest.get('transport') == 'browser' else latest.get("started_at")))]
     finally:
         database.close()
     # Reconnects can leave several segments for one room. Count terminal rooms once.
@@ -90,8 +129,7 @@ def status():
 
 
 def battle_log(room=None):
-    latest = read(PROJECT / "data/ml/campaigns/latest.json")
-    state = read(Path(latest["directory"]) / "status.json") if latest.get("directory") else {}
+    latest, state, _, _, _ = viewer_run()
     room = room or state.get("active_room")
     if room and ROOM.fullmatch(room):
         snapshot = read(PROJECT / "data/ml/live-watch" / (room + ".json"))
@@ -104,6 +142,25 @@ def battle_log(room=None):
         return {"room": None, "log": [], "live": False, "source": "waiting"}
     database = sqlite3.connect((PROJECT / "data/ml/experience.sqlite3").resolve().as_uri() + "?mode=ro", uri=True, timeout=3)
     try:
+        # Already running browser processes can be previewed from their durable
+        # observations without reconnecting the player or opening another socket.
+        recorded = database.execute("SELECT data,status,outcome FROM episodes INDEXED BY episodes_room_side WHERE json_extract(data,'$.room')=? ORDER BY created DESC LIMIT 1", (room,)).fetchone()
+        if recorded:
+            episode = json.loads(recorded[0])
+            steps = episode.get('steps', [])
+            captured = steps[-1].get('snapshot', {}) if steps else {}
+            reference = episode.get('terminal_log') or captured.get('public_log')
+            if reference:
+                from ml.recording import log_prefix
+                from ml.browser import watch_frame
+                frame = watch_frame({'room': room, 'side': episode.get('side'),
+                                     'log': log_prefix(episode, reference)})
+                frame['live'] = recorded[1] != 'complete'
+                if recorded[1] == 'complete':
+                    frame['log'] = ['|win|' + ('Your agent' if recorded[2] == 1 else 'Opponent')
+                                    if line.startswith('|win|') else line for line in frame['log']]
+                    frame['source'] = 'completed-recording'
+                return frame
         row = database.execute("SELECT log FROM public_battles WHERE id=?", ("own-" + room,)).fetchone()
         perspective = database.execute("SELECT json_extract(data,'$.side'),outcome FROM episodes WHERE json_extract(data,'$.room')=? AND status='complete' LIMIT 1", (room,)).fetchone()
     finally:

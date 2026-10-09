@@ -44,6 +44,45 @@ def result(snapshot):
     return {'room': snapshot['room'], 'ongoing': True}
 
 
+def watch_frame(snapshot):
+    """Export battle protocol only; never requests, chat, or player identities."""
+    from ml.scout import PUBLIC_KINDS
+    side = (snapshot.get('request') or {}).get('side', {}).get('id') or snapshot.get('side')
+    names = {s: 'Your agent' if s == side else 'Opponent' for s in ('p1', 'p2')}
+    players = {}
+    log = []
+    visible = PUBLIC_KINDS | {'teampreview', 'teamsize', 'upkeep', 'inactive', 'inactiveoff', 'cant', 'swap', 'start'}
+    for line in snapshot.get('log', []):
+        parts = line.split('|')
+        if len(parts) < 2 or not (parts[1] in visible or parts[1].startswith('-')):
+            continue
+        if parts[1] == 'player' and len(parts) > 3:
+            players[parts[3]] = parts[2]
+            avatar = parts[4] if len(parts) > 4 and parts[4].isdigit() else '1'
+            line = f"|player|{parts[2]}|{names.get(parts[2], 'Player')}|{avatar}"
+        elif parts[1] == 'win' and len(parts) > 2:
+            line = '|win|' + names.get(players.get(parts[2]), 'Winner')
+        log.append(line)
+    return {'room': snapshot['room'], 'side': side, 'log': log,
+            'turn': next((int(line.split('|')[2]) for line in reversed(log)
+                          if line.startswith('|turn|') and line.split('|')[2].isdigit()), 0),
+            'live': bool(result(snapshot).get('ongoing')), 'source': 'browser-player-relay'}
+
+
+def publish_watch(root, snapshot):
+    folder = Path(root) / 'live-watch'
+    folder.mkdir(exist_ok=True)
+    frame = watch_frame(snapshot)
+    text = json.dumps(frame)
+    target = folder / (snapshot['room'] + '.json')
+    if target.exists() and target.read_text() == text:
+        return
+    for target in (target, folder / 'current.json'):
+        temporary = target.with_suffix('.tmp')
+        temporary.write_text(text)
+        temporary.replace(target)
+
+
 def context(snapshot, fmt, sets=None):
     room, request = snapshot['room'], snapshot.get('request')
     if not room.startswith('battle-' + fmt + '-'):
@@ -111,7 +150,10 @@ class BrowserPlayer:
                 handle.write(json.dumps({'time': time.time(), 'kind': kind, **data}) + '\n')
 
     async def snapshot(self, room):
-        return await self.page.evaluate(SNAPSHOT, room)
+        snapshot = await self.page.evaluate(SNAPSHOT, room)
+        if self.brain and not snapshot.get('missing'):
+            publish_watch(self.brain.store.root, snapshot)
+        return snapshot
 
     async def login(self, username, password):
         identity = await self.page.evaluate("() => ({name:app.user.get('name'),named:app.user.get('named')})")

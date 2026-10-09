@@ -73,3 +73,13 @@ The controller runs one game at a time, spaces model submissions at least one
 second apart, and waits 30 seconds between games (`--game-delay`). It stops on
 matchmaking rejection and does not automatically retry or disguise automation.
 Normal DOM readiness and request freshness remain required after every delay.
+
+## Live viewer
+
+Browser snapshots publish filtered battle frames to `data/ml/live-watch/` on the
+same observation loop, without a second Showdown connection. The retained viewer
+automatically follows the newest browser run's event ledger instead of an older
+campaign. It counts verified SQLite outcomes, including resumed games, and uses
+recorded observations as a fallback for browser processes started before relay
+support. Completed browser games remain replayable from their terminal logs.
+Requests, chat, authentication and account names are excluded from viewer frames.

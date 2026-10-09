@@ -56,6 +56,58 @@ def test_no_campaign_is_a_waiting_state(tmp_path, monkeypatch):
     assert live_watch.battle_log()['log'] == []
 
 
+def test_browser_run_supersedes_stopped_campaign_and_keeps_resumed_outcomes(campaign):
+    folder = live_watch.PROJECT / 'data/ml/browser-runs/20261009T120000Z'
+    folder.mkdir(parents=True)
+    events = [
+        {'kind': 'decision', 'time': 1791547200, 'room': 'battle-test-1'},
+        {'kind': 'terminal', 'time': 1791547201, 'result': {'room': 'battle-test-1'}},
+        {'kind': 'decision', 'time': 1791547202, 'room': 'battle-test-2'},
+    ]
+    (folder / 'events.jsonl').write_text('\n'.join(map(json.dumps, events)) + '\n{"partial":')
+    info = live_watch.status()
+    assert info['campaign'] == folder.name
+    assert info['room'] == 'battle-test-2'
+    assert info['score'] == [1, 0, 0]
+    assert info['choices'] == 2
+    assert json.loads((campaign / 'status.json').read_text())['active_room'] == 'battle-test-2'
+
+
+def test_running_browser_recording_is_filtered_for_viewer(campaign):
+    from ml.recording import record_log
+    episode = {'room': 'battle-test-2', 'side': 'p2'}
+    raw = ['|player|p1|RealOpponent|2', '|player|p2|RealAccount|3',
+           '|start', '|turn|4', '|move|p2a: Politoed|Surf|p1a: Pikachu',
+           '|c|RealAccount|private chat', '|request|secret-request', '|challstr|secret']
+    episode['steps'] = [{'snapshot': {'public_log': record_log(episode, raw)}}]
+    db = sqlite3.connect(live_watch.PROJECT / 'data/ml/experience.sqlite3')
+    db.execute("UPDATE episodes SET data=? WHERE status='pending'", (json.dumps(episode),))
+    db.commit()
+    db.close()
+    frame = live_watch.battle_log('battle-test-2')
+    assert frame['live'] and frame['turn'] == 4 and frame['side'] == 'p2'
+    assert '|player|p2|Your agent|1' in frame['log']
+    exported = json.dumps(frame)
+    for private in ['RealAccount', 'RealOpponent', 'private chat', 'secret-request', 'challstr']:
+        assert private not in exported
+
+
+def test_browser_snapshots_publish_live_and_terminal_frames_atomically(tmp_path):
+    from ml.browser import publish_watch
+    frame = {'room': 'battle-test-42', 'request': {'side': {'id': 'p2'}, 'private': 'secret'},
+             'log': ['|player|p1|OpponentName|1', '|player|p2|AccountName|2', '|start', '|turn|6']}
+    publish_watch(tmp_path, frame)
+    path = tmp_path / 'live-watch/battle-test-42.json'
+    first = json.loads(path.read_text())
+    assert first['live'] and first['turn'] == 6
+    assert 'secret' not in path.read_text()
+    frame['log'].append('|win|AccountName')
+    publish_watch(tmp_path, frame)
+    terminal = json.loads(path.read_text())
+    assert not terminal['live'] and terminal['log'][-1] == '|win|Your agent'
+    assert json.loads((path.parent / 'current.json').read_text()) == terminal
+
+
 def test_latest_state_is_retained_and_slow_consumers_skip_intermediate_states():
     hub = live_watch.StateHub()
     for turn in range(1, 5):
