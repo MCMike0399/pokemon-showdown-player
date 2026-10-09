@@ -217,7 +217,7 @@ def test_reconnect_catches_up_and_replays_ignore_other_rooms():
 context.data = {room:'battle-test-1', side:'p2', live:true, turn:1, log:['|turn|1']};
 vm.runInContext('shown=data.room; applyBattle(data)', context);
 vm.runInContext('applyBattle(data)', context); // Unchanged state does not start another animation loop.
-vm.runInContext('connect(); applyBattle(data)', context); // Reconnecting catches up even with the same log.
+vm.runInContext('connect(); applyBattle(data)', context); // Reconnecting to the shown game resumes in place.
 context.data = {...context.data, turn:5, log:['|turn|1','|turn|5']};
 vm.runInContext('applyBattle(data)', context); // A large backlog jumps to the newest turn's start.
 context.data = {...context.data, log:['|turn|2','|turn|5']};
@@ -229,7 +229,7 @@ context.data = {...context.data, room:'battle-test-2'};
 vm.runInContext('applyBattle(data)', context);
 process.stdout.write(JSON.stringify({liveEvents, replayEvents, events}));
 """)
-    assert data['liveEvents'] == ['create', 'seek', 'play', 'seek', 'seek:4', 'create', 'seek', 'play']
+    assert data['liveEvents'] == ['create', 'seek', 'play', 'seek:4', 'create', 'seek', 'play']
     assert data['replayEvents'] == ['create', 'play']
     assert data['events'] == data['liveEvents'] + data['replayEvents']
 

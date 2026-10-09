@@ -26,9 +26,9 @@ Scores are checked every 500 ms, relay frames every 100 ms. The browser player
 observes its existing page every 200 ms during model inference and control waits;
 it publishes changed frames atomically without a second Showdown connection.
 
-Live entry and reconnection show the current match position instantly. After
-that every turn, including the final one, plays out in full in Showdown's fast
-animation mode; animations are never cut on a timer. A frame normally carries one
+Opening a game shows its current position instantly; a reconnect to the game
+already on screen resumes in place without skipping. After that every turn,
+including the final one, plays out in full in Showdown's fast animation mode; animations are never cut on a timer. A frame normally carries one
 turn, so the renderer is one turn behind while it animates. With a second turn
 queued it switches to hyperfast mode until caught up; only with four or more
 queued (or after returning to a background tab that far behind) does it jump to
@@ -40,8 +40,8 @@ Playback triage. Add `?debug=1` to show live counters over the arena (displayed
 vs. live turn, pending steps, speed, skips, resets, main-thread stalls,
 reconnects, last turn's play time). Every page also reports these events in
 batches to `POST /api/diag`, appended to `data/ml/logs/live-watch-client.jsonl`
-(`seek` = a skip during playback with reason and skipped steps, `enter`, `reset`
-with reason `room|shrink|rewrite`, `speed`, `jank`, `drained`, `stream-error`).
+(`seek` = a skip during playback with reason and skipped steps, `enter` = the
+initial jump into a game, `reset` with reason `room|shrink|rewrite`, `speed`, `jank`, `drained`, `stream-error`).
 The server logs each published battle-frame change to
 `data/ml/logs/live-watch-frames.jsonl` (`append`, `room`, or `rewrite` with the
 first differing line). Both logs keep 5 MB plus one rotated generation. To

@@ -1,7 +1,7 @@
 /* Read-only public battle renderer. No login, account creation, chat or choices. */
 const $id = id => document.getElementById(id);
 let follow = true, shown = null, latest = null, battle = null, stream = null;
-let catchUpNext = true, replay = false, relayLog = [], recentSignature = null;
+let replay = false, relayLog = [], recentSignature = null;
 let retryTimer = null, liveTimer = null;
 let streamBattle = null;
 let alternateArtwork = new Set();
@@ -162,12 +162,12 @@ function applyBattle(data) {
     battle.addBatch(log.slice(relayCount));
   }
   relayCount = log.length; relayLog = log; relayLast = data;
-  // Entering or reconnecting shows the current position instantly; after that,
-  // live turns play out in full and pace() only speeds up or skips real backlog.
-  if (!replay && (reset || catchUpNext)) catchUp(reset ? 'reset' : 'connect');
+  // Entering a game shows the current position instantly. A reconnect to the
+  // game already on screen resumes in place: live turns play out in full and
+  // pace() only speeds up or skips real backlog.
+  if (!replay && reset) catchUp('reset');
   // addBatch resumes playback itself. Starting a second loop causes scene errors.
   if (reset) battle.play();
-  catchUpNext = false;
   pace();
   updateViewerStatus();
 }
@@ -211,8 +211,8 @@ function catchUp(reason, turn = Infinity) {
   battle.seekTurn(turn);
   const skipped = battle.currentStep - from;
   if (active && skipped > 0) {
-    // Entering/reconnecting shows the current position; only later skips are cuts.
-    const entry = reason === 'reset' || reason === 'connect';
+    // Entering a game shows the current position; only later skips are cuts.
+    const entry = reason === 'reset';
     if (!entry) { diagCounts.seeks++; diagCounts.skippedSteps += skipped; }
     diag(entry ? 'enter' : 'seek', {reason, skipped, to: turn === Infinity ? 'end' : turn});
   }
@@ -235,7 +235,6 @@ function updateViewerStatus() {
 function connect() {
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = null; }
   if (stream) stream.close();
-  catchUpNext = true;
   streamBattle = null;
   stream = new EventSource('/api/events?deltas=1' + (!follow && shown ? '&room=' + encodeURIComponent(shown) : ''));
   const current = stream;
@@ -263,8 +262,7 @@ function connect() {
     if (stream !== current) return;
     diagCounts.reconnects++;
     diag('stream-error', {state: current.readyState});
-    catchUpNext = true;
-    connectionInterrupted('Connection interrupted. Reconnecting to the live feed…');
+      connectionInterrupted('Connection interrupted. Reconnecting to the live feed…');
     // EventSource retries dropped sockets itself, but an HTTP 503 can close it
     // permanently. Retry that case too (e.g. while launchd restarts the viewer).
     if (current.readyState === 2) {
