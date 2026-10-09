@@ -231,6 +231,21 @@ class BrowserPlayer:
             # Import via the actual teambuilder UI, then select that exact team.
             digest = fingerprint(team)
             if not self.imported_team or self.imported_team[0] != digest:
+                await self.page.wait_for_function(
+                    '() => !!window.Storage?.whenTeamsLoaded?.isLoaded', timeout=15000)
+                # Reuse a fully saved exact team, avoiding draft imports and
+                # duplicate browser teams across service starts. These Storage
+                # functions only compute the expected packed representation.
+                saved_name = await self.page.evaluate("""text => {
+                    const packed=Storage.packTeam(Storage.importTeam(text));
+                    const teams=Storage.teams || [];
+                    const saved=teams.find(t => t.team===packed && t.iconCache!=='!' &&
+                        teams.filter(other => other.name===t.name).length===1);
+                    return saved?.name || null;
+                }""", team_text(team['sets']))
+                if saved_name:
+                    self.imported_team = (digest, saved_name)
+            if not self.imported_team or self.imported_team[0] != digest:
                 name = 'Browser ' + uuid.uuid4().hex[:12]
                 await home.locator('button[name="joinRoom"][value="teambuilder"]').click()
                 builder = self.page.locator('[id="room-teambuilder"]')

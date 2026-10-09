@@ -126,3 +126,8 @@ Before each new search, the browser runner consumes a staged candidate through
 the existing source/parent/checksum/evaluation gate. Resumed rooms keep their
 current checkpoint. A successful promotion reloads the CPU model for the next
 preview; workers never replace the playing checkpoint themselves.
+
+At startup, team storage must finish loading. The controller reuses a saved team
+only when its packed payload exactly matches the requested sets and its name is
+unambiguous. This avoids repeated draft imports and browser-team duplicates
+across service starts. New imports remain available when no exact saved team exists.
