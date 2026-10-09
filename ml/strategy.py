@@ -206,16 +206,20 @@ def hypotheses(ctx, mon, targets, features):
     if bench:
         incoming = max(bench, key=lambda m: -sum(hit(t, m, n, features.dex.get('moves', {}).get(n, {}), ctx['state'], features, 'mine') for t in targets for n in move_names(t)))
         result.append(('switch', {'hypothesis_switch': {**incoming, 'slot': mon.get('slot'), 'boosts': {}, 'volatiles': []}}, None, sum(r[3] for r in result) * .12))
-    # A disclosed Mega stone licenses a prospective form hypothesis; raw species
-    # alone does not disclose the opposing choice of stone or evolution timing.
-    item = to_id(mon.get('item'))
-    form = next((d for d in features.dex.get('pokedex', {}).values() if item and to_id(d.get('requiredItem')) == item and to_id(d.get('baseSpecies')) == to_id(mon.get('species'))), None)
-    mine = ctx['state'].get('side_id', ctx.get('request', {}).get('side', {}).get('id', 'p1'))
-    mega_used = any(features.species(m.get('species', '')).get('isMega') for m in ctx['state'].get('opp_revealed', []) + ctx['state'].get('opp_actives', [])) or any(line.startswith('|-mega|') and not line.split('|')[2].startswith(mine) for line in ctx.get('public_log', []))
-    if form and not mega_used:
-        prospective = {**mon, 'species': form['name'], 'ability': form.get('abilities', {}).get('0', ''),
-                       'stats': {}}
-        result = [(n, d, t, w * .5) for n, d, t, w in result] + [(n, {**d, 'hypothesis_form': prospective}, t, w * .5) for n, d, t, w in result if n != 'switch']
+    if ctx['state'].get('_strategic_v5'):
+        from ml.mega_uncertainty import expand
+        result = expand(ctx, mon, result, features)
+    else:
+        # A disclosed Mega stone licenses a prospective form hypothesis; raw species
+        # alone does not disclose the opposing choice of stone or evolution timing.
+        item = to_id(mon.get('item'))
+        form = next((d for d in features.dex.get('pokedex', {}).values() if item and to_id(d.get('requiredItem')) == item and to_id(d.get('baseSpecies')) == to_id(mon.get('species'))), None)
+        mine = ctx['state'].get('side_id', ctx.get('request', {}).get('side', {}).get('id', 'p1'))
+        mega_used = any(features.species(m.get('species', '')).get('isMega') for m in ctx['state'].get('opp_revealed', []) + ctx['state'].get('opp_actives', [])) or any(line.startswith('|-mega|') and not line.split('|')[2].startswith(mine) for line in ctx.get('public_log', []))
+        if form and not mega_used:
+            prospective = {**mon, 'species': form['name'], 'ability': form.get('abilities', {}).get('0', ''),
+                           'stats': {}}
+            result = [(n, d, t, w * .5) for n, d, t, w in result] + [(n, {**d, 'hypothesis_form': prospective}, t, w * .5) for n, d, t, w in result if n != 'switch']
     total = sum(row[3] for row in result)
     return [(n, d, t, w / total) for n, d, t, w in result] or [('', {}, None, 1)]
 
@@ -231,7 +235,12 @@ def prepare(ctx, features):
             return False
         incoming = [r[1]['hypothesis_switch'].get('ident', r[1]['hypothesis_switch'].get('species')) for r in rows if r[1].get('hypothesis_switch')]
         return len(incoming) == len(set(incoming))
-    joint = sorted((rows for rows in itertools.product(*options) if possible(rows)), key=lambda rows: -math.prod(r[3] for r in rows))[:6]
+    joint = sorted((rows for rows in itertools.product(*options) if possible(rows)), key=lambda rows: -math.prod(r[3] for r in rows))
+    if ctx['state'].get('_strategic_v5'):
+        from ml.mega_uncertainty import envelope
+        joint = envelope(joint)
+    else:
+        joint = joint[:6]
     total = sum(math.prod(r[3] for r in rows) for rows in joint)
     scenarios = [(rows, math.prod(r[3] for r in rows) / total) for rows in joint] if total else [((), 1)]
     ctx['_strategy'] = {'own': own, 'enemy': enemy, 'scenarios': scenarios, 'components': {}, 'scores': {}, 'roles': {}}
@@ -508,7 +517,7 @@ def simulate(ctx, ours, theirs, prepared, features, reverse_ties=False):
     value -= sum((initial[j] - hp[j]) * (1 + .2 * role_value(ctx, ours[j][1], prepared, features)) +
                  (.9 + role_value(ctx, ours[j][1], prepared, features)) * (initial[j] > 0 and hp[j] == 0) for j in range(n))
     value -= .08 * sum(c[2] in PROTECT for c in ours)
-    if ctx.get('feature_profile') in ('strategic-v2', 'strategic-v3', 'strategic-v4'):
+    if ctx.get('feature_profile') in ('strategic-v2', 'strategic-v3', 'strategic-v4', 'strategic-v5'):
         from ml.strategic_mechanics import unproductive_solo_protect
         value -= unproductive_solo_protect(ctx, ours, mons[n:])
     # Residual damage makes a lost tempo turn consequential. Known healing is
@@ -598,9 +607,9 @@ def opening_score(ctx, choice, features):
 
 
 def score(ctx, choice, features):
-    if ctx.get('feature_profile') in ('strategic-v2', 'strategic-mechanics-v2', 'strategic-v3', 'strategic-v4'):
+    if ctx.get('feature_profile') in ('strategic-v2', 'strategic-mechanics-v2', 'strategic-v3', 'strategic-v4', 'strategic-v5'):
         if '_strategic_v2_context' not in ctx:
-            ctx['_strategic_v2_context'] = {**ctx, 'state': {**ctx['state'], '_strategic_v2': True, '_strategic_v4': ctx.get('feature_profile') == 'strategic-v4'}}
+            ctx['_strategic_v2_context'] = {**ctx, 'state': {**ctx['state'], '_strategic_v2': True, '_strategic_v4': ctx.get('feature_profile') in ('strategic-v4', 'strategic-v5'), '_strategic_v5': ctx.get('feature_profile') == 'strategic-v5'}}
         ctx = ctx['_strategic_v2_context']
     if choice.startswith('team '):
         return opening_score(ctx, choice, features)

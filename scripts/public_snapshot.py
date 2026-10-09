@@ -13,7 +13,7 @@ import shutil
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parents[1]
-FILES = [".env.example", ".gitignore", "README.md", "LICENSE", "requirements.txt", "requirements-ml.txt",
+FILES = [".env.example", ".gitignore", "README.md", "LICENSE", "requirements.txt", "requirements-ml.txt", "requirements-browser.txt",
          "package.json", "package-lock.json", "pytest.ini", "battle_state.py", "harness.py", "policy.py",
          "ps_client.py", "ps_mcp_server.py", "simulator.cjs", "selftest.py", "mcp_selftest.py"]
 GLOBS = ["ml/*.py", "docs/*.md", "docs/paper/*.tex", "docs/paper/*.bib", "docs/paper/*.md",

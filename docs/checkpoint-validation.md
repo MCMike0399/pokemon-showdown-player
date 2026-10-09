@@ -55,3 +55,20 @@ The trained v4 stratum results were: self55 cases26→35 wins; pressure44 cases2
 The operator prospectively selected a5-percentage-point minimum while retaining the one-sidedp<=0.05 threshold. The completed10-point verdicts were left unchanged. A new200-case development panel used the immutable trained weights, new seeds, the same source/team pool and matching frozen scouting/research content. It finished139–136 (+1.5 points,p=.38988), failing both the practical and statistical criteria. Its independent200-case final remained unopened, and the live weights were retained.
 
 Fresh strata: self55 cases27→31; tactical55 cases45→38; pressure46 cases26→29; heuristic22 cases16→19; random22 cases22→22. The earlier9.9-point result did not replicate. The evidence supports investigating the tactical-opponent failures, not deploying the candidate or pooling panels after the fact to manufacture a pass. Selected replay diagnoses stay separate from PPO/expert labels.
+
+## V5 source and paused experiment
+
+The opt-in `strategic-v5` profile adds defense/HP-aware preview coverage and
+bounded hypotheses for undisclosed opposing Mega stones. Format eligibility is
+explicit uncertainty, never a claim that an opponent holds a particular item.
+An explicit empty or removed item excludes those hypotheses. One prospective
+own Mega is considered at a time. Legacy collecting profiles remain unchanged.
+
+The prospective v5 run froze a 756-game corpus (7,260 observed move executions),
+13-team pool, four 128-game fresh training rounds and separate 200-case
+development/final panels, with a 5-point minimum and paired p≤0.05. At shutdown,
+two 128-game updates were complete; the third collection round had 51/128 games.
+The experiment is paused and retained locally. No completed development/final
+gate or v5 competitive improvement is claimed, and no v5 weights were promoted.
+Training plans now bind their runner hash and prospective minimum gain, so a
+resume cannot silently change the declared criteria.

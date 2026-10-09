@@ -31,11 +31,14 @@ def digest(path):
 
 
 async def run(root, output, fmt, focus, practice, development, final, seed, seconds,
-              rounds=1, matchups=False, initial=None, profile='opening-v1', opponent_pool=None, pressure=False):
+              rounds=1, matchups=False, initial=None, profile='opening-v1', opponent_pool=None, pressure=False, promotion_margin=None):
     from harness import TeamStore
     from ml.simulator import validate_team, load_dex
     from ml.teams import team_id
     config = LearningConfig.load(root)
+    minimum = config.promotion_margin if promotion_margin is None else promotion_margin
+    if not .05 <= minimum <= .5:
+        raise ValueError('promotion margin must be .05..5')
     policy = ResourcePolicy(**config.resource)
     # Serialize this experiment's recordings; production uses the other shared slots.
     policy._simulator_cap = 1
@@ -81,11 +84,12 @@ async def run(root, output, fmt, focus, practice, development, final, seed, seco
                 'team_fingerprint': team_id(fmt, team['sets']), 'opponents': teams,
                 'parent_revision': incumbent.revision, 'parent_sha256': digest(incumbent.path),
                 'source_generation': source_generation(), 'dex_sha256': features.signature(),
+                'runner_sha256': digest(Path(__file__).resolve()),
                 'practice': practice, 'development': development, 'final': final, 'seed': seed,
                 'rounds': rounds, 'matchups': matchups, 'profile': profile,
                 'pressure_opponent': pressure, 'opponent_pool_sha256': digest(opponent_pool) if opponent_pool else None,
                 'initial_checkpoint_sha256': digest(initial) if initial else None,
-                'margin': .1, 'selection': 'Development-passing trained candidate; independent final gate before staging.',
+                'margin': minimum, 'selection': 'Development-passing trained candidate; independent final gate before staging.',
                 'notes': ['New-profile stochastic own rollouts only, no legacy PPO relabeling.',
                           'Counterfactual prior and Mega-only development ablations do not open final partitions.',
                           'Seeds, sides, research/scout, team pool and opponents are frozen.']}
@@ -102,6 +106,8 @@ async def run(root, output, fmt, focus, practice, development, final, seed, seco
             plan[name + '_sha256'] = digest(model.path)
         atomic_json(plan_path, plan)
     plan = json.loads(plan_path.read_text())
+    if plan.get('runner_sha256') and plan['runner_sha256'] != digest(Path(__file__).resolve()):
+        raise ValueError('declared runner changed; retain evidence and use fresh output')
     if plan['source_generation'] != source_generation():
         raise ValueError('experiment source changed; retain evidence and use fresh output')
     if digest(output / 'incumbent' / 'models' / (fmt + '.pt')) != plan['parent_sha256']:
@@ -241,11 +247,12 @@ if __name__ == '__main__':
     parser.add_argument('--initial-checkpoint', type=Path)
     parser.add_argument('--opponent-pool', type=Path)
     parser.add_argument('--pressure-opponent', action='store_true')
-    parser.add_argument('--profile', choices=['opening-v1', 'opening-v2', 'strategic-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4'], default='opening-v1')
+    parser.add_argument('--promotion-margin', type=float, help='Minimum gain for a new declared plan; existing plans retain their margin')
+    parser.add_argument('--profile', choices=['opening-v1', 'opening-v2', 'strategic-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4', 'strategic-v5'], default='opening-v1')
     args = parser.parse_args()
     if not all(4 <= n <= 1000 for n in (args.practice, args.development, args.final)) or not 10 <= args.seconds <= 7200 or not 1 <= args.rounds <= 8:
         parser.error('panels must be 4..1000 and seconds 10..7200')
     print(json.dumps(asyncio.run(run(args.root.resolve(), args.output.resolve(), args.format, args.focus,
           args.practice, args.development, args.final, args.seed, args.seconds, args.rounds,
           args.matchups, args.initial_checkpoint.resolve() if args.initial_checkpoint else None, args.profile,
-          args.opponent_pool.resolve() if args.opponent_pool else None, args.pressure_opponent)), indent=2))
+          args.opponent_pool.resolve() if args.opponent_pool else None, args.pressure_opponent, args.promotion_margin)), indent=2))

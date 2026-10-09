@@ -15,6 +15,9 @@ Always-on use: [OpenClaw decision/team workflow](docs/agent-workflow.md) ·
 [Resource-aware CPU/MPS training and daily feeds](docs/continuous-learning.md) ·
 [Data sources and licenses](docs/continuous-learning-research.md).
 
+[Programmatic browser play](docs/browser-play.md) uses Playwright clicks and the
+same local model for decisions, without OpenClaw or per-turn LLM calls.
+
 ## What's here
 - `ps_client.py` - async client over wss://sim3.psim.us/showdown/websocket (SockJS).
   Handles challstr, login (assertion), rooms, message buffering and battle state.

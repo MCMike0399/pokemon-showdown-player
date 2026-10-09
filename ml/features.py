@@ -13,7 +13,7 @@ from battle_state import hp_fraction, legacy_hp_fraction, to_id
 SCHEMA = 1
 STATE_DIM = 384
 ACTION_DIM = 192
-FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2', 'rain-v1', 'mechanics-v1', 'lineup-v1', 'opening-v1', 'opening-v2', 'mega-v1', 'strategic-v1', 'strategic-turn-v1', 'strategic-preview-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4'}
+FEATURE_PROFILES = {'legacy', 'weather-v1', 'tactics-v1', 'preview-v1', 'preview-v2', 'rain-v1', 'mechanics-v1', 'lineup-v1', 'opening-v1', 'opening-v2', 'mega-v1', 'strategic-v1', 'strategic-turn-v1', 'strategic-preview-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4', 'strategic-v5'}
 
 
 class Features:
@@ -126,7 +126,7 @@ class Features:
             self.add(vector, f"history/{i}/{event['side']}/{event['slot']}/{to_id(event['move'])}", 1 / math.sqrt(i + 1))
         for species, frequency in (knowledge or {}).items():
             self.add(vector, "meta/" + species, frequency)
-        if ctx.get('feature_profile') in ('strategic-v3', 'strategic-v4'):
+        if ctx.get('feature_profile') in ('strategic-v3', 'strategic-v4', 'strategic-v5'):
             from ml.preview_features import add_state
             add_state(vector, ctx, self)
         vector[-16] = min(float(state.get("turn", 0)) / 50, 2)
@@ -143,7 +143,7 @@ class Features:
         prior = 0.0
         if choice.startswith("team "):
             indices = [int(i) - 1 for i in choice[5:].split(",")]
-            if ctx.get('feature_profile') in ('opening-v2', 'strategic-v1', 'strategic-preview-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4'):
+            if ctx.get('feature_profile') in ('opening-v2', 'strategic-v1', 'strategic-preview-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4', 'strategic-v5'):
                 indices = indices[:2] + sorted(indices[2:])
             for order, index in enumerate(indices):
                 if index < len(party):
@@ -196,9 +196,9 @@ class Features:
                 # Joint interaction allows learning focus fire, attack+support,
                 # double Protect and switch+attack rather than independent picks.
                 self.add(vector, "joint/" + "/".join(p.strip().split()[0] for p in components))
-        if ctx.get('feature_profile') in ('strategic-v1', 'strategic-turn-v1', 'strategic-preview-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4'):
+        if ctx.get('feature_profile') in ('strategic-v1', 'strategic-turn-v1', 'strategic-preview-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4', 'strategic-v5'):
             from ml.strategy import score
-            if ctx['feature_profile'] in ('strategic-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4') or choice.startswith('team ') == (ctx['feature_profile'] == 'strategic-preview-v1'):
+            if ctx['feature_profile'] in ('strategic-v1', 'strategic-mechanics-v2', 'strategic-v2', 'strategic-v3', 'strategic-v4', 'strategic-v5') or choice.startswith('team ') == (ctx['feature_profile'] == 'strategic-preview-v1'):
                 prior = score(ctx, choice, self)
                 # Preserve matchup ordering instead of flattening many strong
                 # joint/preview scores to the final feature's hard cap.
@@ -236,7 +236,10 @@ class Features:
                         self._mon(vector, f'prospective/{i}', actor, ctx['feature_profile'])
             if ctx['feature_profile'] == 'opening-v1' or (ctx['feature_profile'] == 'opening-v2' and choice.startswith('team ')):
                 prior = 4 * prior / (4 + abs(prior))
-        if ctx.get('feature_profile') in ('strategic-v3', 'strategic-v4'):
+        if ctx.get('feature_profile') == 'strategic-v5':
+            from ml.preview_v5 import add_action
+            add_action(vector, ctx, choice, self)
+        elif ctx.get('feature_profile') in ('strategic-v3', 'strategic-v4'):
             from ml.preview_features import add_action
             add_action(vector, ctx, choice, self)
         vector[-1] = max(-4, min(4, prior))
