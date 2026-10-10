@@ -305,7 +305,11 @@ def test_live_priority_pauses_and_resumes_background_groups(tmp_path, monkeypatc
     monkeypatch.setattr(value_store, 'BACKGROUND_PGIDS', tmp_path / 'pgids.json')
     monkeypatch.setattr(value_store, 'PAUSE_MARKER', tmp_path / 'deciding')
     (tmp_path / 'pgids.json').write_text(json.dumps([proc.pid, other.pid]))
-    state = lambda pid: subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+    def state(pid):
+        stat = Path('/proc') / str(pid) / 'stat'
+        if stat.exists():
+            return stat.read_text().rsplit(')', 1)[1].split()[0]
+        return subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
     try:
         async def decide():
             async with value_store.LivePriority() as lp:

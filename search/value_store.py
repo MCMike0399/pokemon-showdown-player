@@ -176,7 +176,7 @@ def _command(pid: int) -> str:
             return ''
     import subprocess
     try:
-        return subprocess.run(['ps', '-o', 'command=', '-p', str(pid)], capture_output=True, text=True,
+        return subprocess.run(['ps', '-ww', '-o', 'command=', '-p', str(pid)], capture_output=True, text=True,
                               timeout=5).stdout
     except (OSError, subprocess.SubprocessError):
         return ''

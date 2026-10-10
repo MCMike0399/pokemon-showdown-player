@@ -42,8 +42,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from search.value_store import (BACKGROUND_PGIDS, VALUE_ROOT, POINTER, atomic_json, current_value,  # noqa: E402
-                                dir_bytes, pack_shard, promote, resume_if_stale)
+from search.value_store import (BACKGROUND_PGIDS, VALUE_ROOT, POINTER, _command, atomic_json,  # noqa: E402
+                                current_value, dir_bytes, pack_shard, promote, resume_if_stale)
 
 DATA = ROOT / 'data' / 'ml'
 PY = sys.executable
@@ -93,11 +93,21 @@ def _alive(pid: int | None, marker: str = 'search/') -> bool:
         os.kill(pid, 0)
     except OSError:
         return False
-    try:
-        out = subprocess.run(['ps', '-o', 'stat=,command=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
-        return bool(out) and not out.startswith('Z') and marker in out
-    except OSError:
-        return True
+    stat = Path('/proc') / str(pid) / 'stat'
+    if stat.exists():
+        try:
+            if stat.read_text().rsplit(')', 1)[1].split()[0] == 'Z':
+                return False
+        except (OSError, IndexError):
+            return False
+    else:
+        try:
+            out = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)], capture_output=True, text=True).stdout.strip()
+            if not out or out.startswith('Z'):
+                return False
+        except OSError:
+            pass
+    return marker in _command(pid)
 
 
 class Slots:
