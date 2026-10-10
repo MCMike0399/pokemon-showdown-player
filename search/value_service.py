@@ -406,6 +406,27 @@ class Service:
             elif name == 'ingest':
                 self.note(f'ingest done code={code}')
 
+    def shed(self, res: dict):
+        """Critical memory pressure: stop our own background load so macOS never has to
+kill the live runner. Producers lose at most one self-play game; a gate resumes
+from its results file. New work starts again once admission allows it."""
+        pressure = res.get('memory_pressure')
+        if not pressure or not pressure & 4:
+            return
+        pids = [p.pid for n, p in self.children.items() if n.startswith('prod-') or n == 'gate']
+        pids += [i['pid'] for i in self.state['producers'].values() if _alive(i.get('pid'))]
+        gate = self.state.get('gate') or {}
+        if gate.get('pid') and _alive(gate['pid']):
+            pids.append(gate['pid'])
+        for pid in set(pids):
+            try:
+                os.killpg(pid, signal.SIGCONT)  # a paused group must be able to exit
+                os.killpg(pid, signal.SIGTERM)
+            except OSError:
+                pass
+        if pids:
+            self.note(f'critical memory pressure: stopped {len(set(pids))} background groups')
+
     def publish_pgids(self):
         """Process groups the live runner may pause: producers and gates (own session each)."""
         pids = [p.pid for n, p in self.children.items() if n.startswith('prod-') or n == 'gate']
@@ -471,6 +492,7 @@ class Service:
             for seq, info in list(self.state['producers'].items()):
                 if f'prod-{seq}' not in self.children and not _alive(info.get('pid')):
                     self.finish_producer('prod-' + seq, -1)
+            self.shed(res)
             self.publish_pgids()
             resume_if_stale()
             self.ingest()

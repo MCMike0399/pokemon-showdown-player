@@ -343,3 +343,23 @@ def test_engine_timeout_restarts_instead_of_reading_a_stale_answer():
         await e.close()
         return out
     assert asyncio.run(run())['ok'] is True
+
+
+def test_critical_memory_pressure_stops_background_groups(tmp_path, monkeypatch):
+    import time as _time
+    script = tmp_path / 'search' / 'spin.py'
+    script.parent.mkdir()
+    script.write_text('import time\nwhile True: time.sleep(0.05)\n')
+    proc = subprocess.Popen([sys.executable, str(script)], start_new_session=True)
+    monkeypatch.setattr(value_service, 'VALUE_ROOT', tmp_path / 'value')
+    svc = value_service.Service(tmp_path)
+    svc.state['producers'] = {'1': {'pid': proc.pid, 'shard': 'sp-1.jsonl'}}
+    try:
+        svc.shed({'memory_pressure': 2})
+        _time.sleep(0.2)
+        assert proc.poll() is None  # warning level: keep working
+        svc.shed({'memory_pressure': 4})
+        proc.wait(timeout=5)
+        assert proc.returncode is not None
+    finally:
+        proc.kill()

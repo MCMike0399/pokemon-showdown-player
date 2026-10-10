@@ -45,6 +45,9 @@ CONTROLS_STATE = r"""id => {
 # answer within the turn timer; give up only well after that.
 CONTROLS_RELOAD_AFTER = 12
 CONTROLS_GIVE_UP = 75
+# An opponent who stops choosing (often at team preview) would stall us until the
+# runner gives up; the battle timer makes the server rule against them instead.
+TIMER_AFTER = 60
 
 
 def request_key(snapshot):
@@ -468,6 +471,7 @@ class BrowserPlayer:
         previous = None
         retries = {}
         sheets_attempted = False
+        timer_claimed = False
         while True:
             snapshot = await self.snapshot(room)
             if snapshot.get('missing'):
@@ -589,6 +593,12 @@ class BrowserPlayer:
                 self.answered.add(key)
                 previous = {'key': key, 'side': side, 'log_length': len(snapshot['log'])}
                 last_progress = time.monotonic()
+            if not timer_claimed and time.monotonic() - last_progress > TIMER_AFTER:
+                timer_claimed = True
+                with suppress(Exception):
+                    await self.page.evaluate("id => { const r = app.rooms[id]; if (r && r.setTimer) r.setTimer('on'); }", room)
+                    self.log('timer_on', room=room, waited=round(time.monotonic() - last_progress, 1))
+                    last_progress = time.monotonic()  # a full window for the timer to run out
             if time.monotonic() - last_progress > timeout:
                 self.log('stalled', room=room)
                 raise TimeoutError('battle stalled; recording retained, no outcome assigned')

@@ -342,3 +342,30 @@ def test_listed_struggle_clicks_button_one_as_the_official_client_renders():
                                                      'disabled': False}]}
     asyncio.run(BrowserPlayer(page).submit(deepcopy(page.state), 'move 1, move 1'))
     assert page.clicked[0] == 'button[name="chooseMove"][value="1"]'
+
+
+def test_idle_opponent_gets_the_battle_timer_before_the_runner_gives_up(tmp_path, monkeypatch):
+    # Live 2026-10-09: an opponent never answered team preview; the runner waited
+    # 180 s, raised and restarted. Turning the timer on makes the server rule.
+    from ml.brain import Brain
+    from ml.features import Features
+    from ml.storage import Store
+    monkeypatch.setattr(browser, 'TIMER_AFTER', 0.05)
+    store = Store(tmp_path)
+    try:
+        state = snapshot()
+        state['waiting'] = True  # our choice is in; the opponent never answers
+        page = Page(state)
+        scripts = []
+        original = page.evaluate
+
+        async def evaluate(script, room=None):
+            scripts.append(script)
+            return await original(script, room)
+        page.evaluate = evaluate
+        player = BrowserPlayer(page, Brain(store, Features()))
+        with pytest.raises(TimeoutError):
+            asyncio.run(player.play(ROOM, FMT, timeout=0.3))
+        assert sum("setTimer('on')" in s for s in scripts) == 1  # once, then a full window
+    finally:
+        store.close()
