@@ -155,14 +155,7 @@ def _signal_groups(sig) -> int:
         return 0
     # Only signal groups whose leader is still one of our search programs: a
     # published pid may have been reused since the service last wrote the list.
-    import subprocess
-    try:
-        out = subprocess.run(['ps', '-o', 'pid=,command=', '-p', ','.join(map(str, pgids))],
-                             capture_output=True, text=True, timeout=5).stdout
-    except (OSError, subprocess.SubprocessError):
-        return 0
-    ours = [int(line.split(None, 1)[0]) for line in out.splitlines()
-            if line.strip() and MARKER in line]
+    ours = [pid for pid in pgids if MARKER in _command(pid)]
     sent = 0
     for pgid in ours:
         try:
@@ -171,6 +164,22 @@ def _signal_groups(sig) -> int:
         except OSError:
             pass
     return sent
+
+
+def _command(pid: int) -> str:
+    """Command line of a process ('' if gone): /proc where available, else ps."""
+    proc = Path('/proc') / str(pid) / 'cmdline'
+    if proc.parent.exists():
+        try:
+            return proc.read_bytes().replace(b'\0', b' ').decode(errors='replace')
+        except OSError:
+            return ''
+    import subprocess
+    try:
+        return subprocess.run(['ps', '-o', 'command=', '-p', str(pid)], capture_output=True, text=True,
+                              timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ''
 
 
 class LivePriority:
