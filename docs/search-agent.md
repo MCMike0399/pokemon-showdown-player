@@ -80,9 +80,14 @@ in the browser transport, all fixed in `ml/browser.py`:
 - move buttons and Mega checkboxes appear only after turn animations, so the
   transport waits for the controls (up to 90 s) before clicking.
 
+## Learning the evaluation
+
+The leaf evaluation can be a learned value trained from every live game and from
+CPU self-play, gated against this exact configuration and promoted between games.
+See `docs/value-learning.md`. The deployed configuration lives in
+`search/config.py`; the live runner and every gate build the agent from it.
+
 ## Not yet done
 
-- `search/selfplay.cjs`, `search/valuefeat.cjs`, `search/train_value.py` and
-  `search/valuenet.cjs` produce, train (MPS) and evaluate a learned value function
-  that can replace or blend with the hand evaluation (`value_path`, `value_beta`),
-  and score team-preview plans (`preview_mode='value'`). Not trained or gated yet.
+- `preview_mode='value'` (score team-preview plans with the value) is written but
+  untested.

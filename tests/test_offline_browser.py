@@ -309,3 +309,36 @@ def test_battle_ending_while_controls_are_hidden_submits_nothing():
     page.controls = {'shown': False, 'ended': True, 'waiting': False, 'rqid': 4}
     asyncio.run(BrowserPlayer(page).submit(deepcopy(page.state), 'move 1 1, move 1'))
     assert not any('chooseMove' in selector for selector in page.clicked)
+
+
+def test_detaching_skip_button_does_not_abort_the_turn():
+    # Live 2026-10-09: goToEnd resolved, then detached mid-animation; the
+    # unguarded click timed out and crashed the runner during a game.
+    page = Page(snapshot())
+    original = Locator.count, Locator.click
+
+    async def count(self):
+        return 1 if 'goToEnd' in self.selector else await original[0](self)
+
+    async def click(self, **kwargs):
+        if 'goToEnd' in self.selector:
+            raise TimeoutError('Locator.click: element was detached from the DOM')
+        return await original[1](self, **kwargs)
+    Locator.count, Locator.click = count, click
+    try:
+        asyncio.run(BrowserPlayer(page).submit(deepcopy(page.state), 'move 1 2, move 1'))
+    finally:
+        Locator.count, Locator.click = original
+    assert page.clicked[-3:] == ['button[name="chooseMove"][value="1"]',
+                                 'button[name="chooseMoveTarget"][value="2"]',
+                                 'button[name="chooseMove"][value="1"]']
+
+
+def test_listed_struggle_clicks_button_one_as_the_official_client_renders():
+    # Live 2026-10-09: the server listed Struggle as the only enabled move; the
+    # client renders it as button 1, so clicking value 0 stalled 90 s and crashed.
+    page = Page(snapshot())
+    page.state['request']['active'][0] = {'moves': [{'id': 'struggle', 'move': 'Struggle', 'target': 'randomNormal',
+                                                     'disabled': False}]}
+    asyncio.run(BrowserPlayer(page).submit(deepcopy(page.state), 'move 1, move 1'))
+    assert page.clicked[0] == 'button[name="chooseMove"][value="1"]'

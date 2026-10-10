@@ -165,6 +165,7 @@ class BrowserPlayer:
         self.page, self.brain = page, brain
         # Optional async ctx -> choice override (search agent); never recorded.
         self.decider = None
+        self.decider_trace = None  # optional () -> dict logged with each decided turn
         self.decision_interval = decision_interval
         self.last_submission = 0.0
         self.answered = set()
@@ -369,9 +370,12 @@ class BrowserPlayer:
         if not choice.startswith('team '):
             # Use the official playback control to expose the current request
             # immediately; long move animations must not consume the game timer.
+            # Optional: the button can detach mid-animation; the controls wait
+            # below handles a client that is still replaying.
             skip = root.locator('button[name="goToEnd"]:visible')
             if await skip.count():
-                await skip.click(timeout=5000)
+                with suppress(Exception):
+                    await skip.click(timeout=5000)
 
         async def click(name, value):
             await root.locator(f'button[name="{name}"][value="{value}"]').click(timeout=90000)
@@ -432,8 +436,11 @@ class BrowserPlayer:
                         elif flag in tokens:
                             raise ValueError('required evolution control is missing')
                     move = int(tokens[1])
-                    # The UI labels Struggle with zero; requests expose move one.
-                    if to_id(snapshot['request']['active'][slot]['moves'][move - 1].get('id', '')) == 'struggle':
+                    # Official client (oldclient/client-battle.js): every enabled
+                    # listed move is button i+1, including a listed Struggle; the
+                    # synthetic Struggle button value 0 exists only when all listed
+                    # moves are disabled.
+                    if not any(not m.get('disabled') for m in snapshot['request']['active'][slot]['moves']):
                         move = 0
                     clicked = True
                     await click('chooseMove', move)
@@ -556,6 +563,9 @@ class BrowserPlayer:
                     decision = {'choice': await self.decider(ctx), 'revision': pinned[0], 'recorded': False,
                                 'decider': getattr(self.decider, '__name__', 'search'),
                                 'inference_ms': round((time.perf_counter() - started) * 1000, 1)}
+                    trace = getattr(self, 'decider_trace', None)
+                    if trace is not None:
+                        decision['search'] = trace()  # top values, margin, worlds, sims: value-learning evidence
                 else:
                     decision = self.brain.decide(ctx, explore=record, record=record)
                 if not decision.get('recovered') and decision['revision'] != pinned[0]:

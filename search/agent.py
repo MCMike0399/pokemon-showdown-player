@@ -50,15 +50,30 @@ class Engine:
             msg = {**msg, 'id': next(self.counter)}
             self.proc.stdin.write((json.dumps(msg) + '\n').encode())
             await self.proc.stdin.drain()
-            line = await asyncio.wait_for(self.proc.stdout.readline(), timeout)
+            try:
+                line = await asyncio.wait_for(self.proc.stdout.readline(), timeout)
+            except (TimeoutError, asyncio.TimeoutError):
+                # The engine is still computing this request; its late answer
+                # would be read as the NEXT request's result. Restart it instead.
+                await self._kill()
+                raise TimeoutError(f'search engine exceeded {timeout:.0f} s; restarted')
             if not line:
                 err = (await self.proc.stderr.read()).decode()[:2000]
                 self.proc = None
                 raise RuntimeError('search engine died: ' + err)
             out = json.loads(line)
+            if out.get('id') != msg['id']:
+                await self._kill()
+                raise RuntimeError(f"engine answered request {out.get('id')} for {msg['id']}; restarted")
             if 'error' in out and 'results' not in out:
                 raise RuntimeError(out['error'])
             return out
+
+    async def _kill(self):
+        proc, self.proc = self.proc, None
+        if proc and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
 
     async def close(self):
         if self.proc and self.proc.returncode is None:
@@ -91,7 +106,9 @@ class SearchAgent:
     def __init__(self, fmt: str = 'gen9championsvgc2026regmc', worlds: int = 4, engines: int = 1,
                  seeds: int = 1, alpha: float = 0.5, opp_tau: float = 1.0, max_opp: int | None = None,
                  preview=None, seed: int = 0, usage_cutoff: str = '0', opp_no_switch: bool = False,
-                 keep_nonmega: bool = False, log=None, screen=None, value_path=None, value_beta=0.0, value_scale=8.0, preview_mode='incumbent', preview_worlds=6):
+                 keep_nonmega: bool = False, log=None, screen=None, value_path=None, value_beta=0.0, value_scale=8.0, preview_mode='incumbent', preview_worlds=6,
+                 crn: bool = False, adaptive_margin: float | None = None, adaptive_worlds: int = 0,
+                 adaptive_max_ms: float = 6000.0, engine_timeout: float = 120.0):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -109,7 +126,23 @@ class SearchAgent:
         self.preview_mode = preview_mode
         self.preview_worlds = preview_worlds
         self.value = {'value_path': value_path, 'value_beta': value_beta, 'value_scale': value_scale}
+        self.crn = crn
+        # Close decisions get a second batch of fresh worlds (search/measure_noise.py
+        # measures how often a decision flips at K vs 2K worlds).
+        self.adaptive_margin = adaptive_margin
+        self.adaptive_worlds = adaptive_worlds
+        self.adaptive_max_ms = adaptive_max_ms
+        self.engine_timeout = engine_timeout
         self.stats = {'decisions': 0, 'ms': 0.0, 'fallbacks': 0, 'errors': []}
+        self.last_trace = None
+
+    def set_value(self, path=None, beta=0.0, scale=8.0):
+        """Swap the leaf evaluation between games; engines load a path once and cache it."""
+        self.value = {'value_path': str(path) if path else None, 'value_beta': float(beta or 0), 'value_scale': scale}
+
+    def reseed(self, seed):
+        """Deterministic world sampling per game, so paired arms see the same worlds."""
+        self.rng = random.Random(seed)
 
     async def close(self):
         for e in self.engines:
@@ -284,6 +317,7 @@ class SearchAgent:
                 return await self.preview(ctx)
             return choices[0]
         started = time.perf_counter()
+        self.last_trace = None
         try:
             if request.get('forceSwitch'):
                 choice = await self._force_switch(ctx)
@@ -293,8 +327,13 @@ class SearchAgent:
             self.stats['fallbacks'] += 1
             self.stats['errors'].append(repr(error)[:300])
             choice = self._fallback(ctx)
+            self.last_trace = {'fallback': repr(error)[:200]}
+        elapsed = (time.perf_counter() - started) * 1000
         self.stats['decisions'] += 1
-        self.stats['ms'] += (time.perf_counter() - started) * 1000
+        self.stats['ms'] += elapsed
+        if self.last_trace is not None:
+            self.last_trace['ms'] = round(elapsed, 1)
+            self.last_trace['choice'] = choice
         return choice
 
     async def _value_preview(self, ctx: dict) -> str:
@@ -329,21 +368,24 @@ class SearchAgent:
         pruned = self._prune_ours(ctx)
         return pruned[0]
 
-    async def _search(self, ctx: dict, tracker: Tracker, our_side: list[dict], our_choices: list[str] | None):
+    async def _search(self, ctx: dict, tracker: Tracker, our_side: list[dict], our_choices: list[str] | None,
+                      n_worlds: int | None = None):
         rng = self.rng
         worlds = []
-        for _ in range(self.n_worlds):
+        for _ in range(n_worlds or self.n_worlds):
             worlds.append({'p1': our_side, 'p2': self._their_side(tracker, rng)})
         field = self._field(tracker)
         base = {'type': 'search', 'format': self.fmt, 'field': field, 'our_choices': our_choices,
                 'seeds': self.seeds, 'alpha': self.alpha, 'opp_tau': self.opp_tau,
-                'max_opp': self.max_opp, 'opp_no_switch': self.opp_no_switch, 'screen': self.screen, **self.value}
+                'max_opp': self.max_opp, 'opp_no_switch': self.opp_no_switch, 'screen': self.screen, 'crn': self.crn,
+                **self.value}
         n = len(self.engines)
         chunks = [worlds[i::n] for i in range(n)]
         calls = []
         for k, (engine, chunk) in enumerate(zip(self.engines, chunks)):
             if chunk:
-                calls.append(engine.call({**base, 'worlds': chunk, 'world_offset': k * 1000 + rng.randrange(1000)}))
+                calls.append(engine.call({**base, 'worlds': chunk, 'world_offset': k * 1000 + rng.randrange(1000)},
+                                         timeout=self.engine_timeout))
         outs = await asyncio.gather(*calls)
         results = [r for out in outs for r in out['results']]
         return results
@@ -359,23 +401,51 @@ class SearchAgent:
         for c in our_choices:
             sim_map.setdefault(self._to_sim(c, active, tracker), c)
         our_side = self._our_side(ctx, tracker)
-        results = await self._search(ctx, tracker, our_side, list(sim_map))
-        for r in results:
-            if 'values' in r:
-                r['values'] = {sim_map.get(k, k): v for k, v in r['values'].items()}
-        totals: dict[str, list[float]] = {}
-        errors = []
-        for r in results:
-            if 'error' in r:
-                errors.append(r['error'])
-                continue
-            for c, v in r['values'].items():
-                totals.setdefault(c, []).append(v)
-        if not totals:
-            raise RuntimeError('all worlds failed: ' + '; '.join(errors)[:500])
-        good = len([r for r in results if 'error' not in r])
-        scored = {c: sum(v) / len(v) - (0.5 if len(v) < good else 0.0) for c, v in totals.items()}
+        started = time.perf_counter()
+
+        async def batch(n=None):
+            out = await self._search(ctx, tracker, our_side, list(sim_map), n)
+            for r in out:
+                if 'values' in r:
+                    r['values'] = {sim_map.get(k, k): v for k, v in r['values'].items()}
+            return out
+
+        def score(results):
+            totals: dict[str, list[float]] = {}
+            for r in results:
+                if 'error' not in r:
+                    for c, v in r['values'].items():
+                        totals.setdefault(c, []).append(v)
+            good = len([r for r in results if 'error' not in r])
+            return {c: sum(v) / len(v) - (0.5 if len(v) < good else 0.0) for c, v in totals.items()}, good
+
+        results = await batch()
+        scored, good = score(results)
+        if not scored:
+            raise RuntimeError('all worlds failed: ' + '; '.join(r['error'] for r in results if 'error' in r)[:500])
+        ranked = sorted(scored.values(), reverse=True)
+        first_ms = (time.perf_counter() - started) * 1000
+        extra = 0
+        if (self.adaptive_margin is not None and self.adaptive_worlds and len(ranked) > 1
+                and ranked[0] - ranked[1] < self.adaptive_margin and first_ms * 2 <= self.adaptive_max_ms):
+            more = await batch(self.adaptive_worlds)
+            if any('error' not in r for r in more):
+                results += more
+                extra = len(more)
+                scored, good = score(results)
+        errors = [r['error'] for r in results if 'error' in r]
         best = max(scored, key=scored.get)
+        ranked = sorted(scored.items(), key=lambda kv: -kv[1])
+        roots = [r['root'] for r in results if 'root' in r]
+        self.last_trace = {
+            'kind': 'move', 'turn': tracker.turn, 'worlds': len(results), 'worlds_ok': good, 'extra_worlds': extra,
+            'top': [[c, round(v, 4)] for c, v in ranked[:5]],
+            'margin': round(ranked[0][1] - ranked[1][1], 4) if len(ranked) > 1 else None,
+            'sims': sum(r.get('sims') or 0 for r in results),
+            'n_ours': max((r.get('n_ours') or 0) for r in results), 'n_theirs': max((r.get('n_theirs') or 0) for r in results),
+            'root_eq': round(sum(r['eq'] for r in roots) / len(roots), 4) if roots else None,
+            'root_hand': round(sum(r['hand'] for r in roots) / len(roots), 4) if roots else None,
+            'value': {'path': self.value.get('value_path'), 'beta': self.value.get('value_beta')}, 'crn': self.crn}
         if self.log is not None:
             top = sorted(scored.items(), key=lambda kv: -kv[1])[:5]
             self.log.append({'turn': tracker.turn, 'top': top, 'errors': errors[:2],
@@ -449,4 +519,6 @@ class SearchAgent:
                 v = sum(vals) / len(vals)
                 if v > best_v:
                     best, best_v = choice, v
+        self.last_trace = {'kind': 'switch', 'turn': tracker.turn, 'options': len(choices),
+                           'best': round(best_v, 4) if best_v > -1e9 else None}
         return best

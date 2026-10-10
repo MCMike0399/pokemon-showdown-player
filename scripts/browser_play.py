@@ -91,18 +91,24 @@ async def run(args):
                     agent = None
                     if args.search and not args.inspect:
                         from search.agent import SearchAgent
+                        from search.config import agent_kwargs
                         brain = player.brain
 
                         async def preview(ctx):
                             return brain.decide(ctx, explore=False, record=False)['choice']
-                        agent = SearchAgent(fmt=args.format, worlds=args.search_worlds, engines=args.search_engines,
-                                            screen={'probe': 4, 'keep_opp': 20, 'keep_ours': 24}, preview=preview,
-                                            seed=int(time.time()))
+                        # One deployed configuration, shared with the value gate.
+                        search_kwargs = agent_kwargs(worlds=args.search_worlds, engines=args.search_engines)
+                        agent = SearchAgent(fmt=args.format, preview=preview, seed=int(time.time()), **search_kwargs)
+
+                        from search.value_store import LivePriority
 
                         async def search_decider(ctx):
-                            return await agent.decide(ctx)
+                            # Background simulation pauses while live search runs.
+                            async with LivePriority():
+                                return await agent.decide(ctx)
                         player.decider = search_decider
-                        player.log('search_agent', worlds=args.search_worlds, engines=args.search_engines)
+                        player.decider_trace = lambda: agent.last_trace
+                        player.log('search_agent', **{k: v for k, v in search_kwargs.items()})
                     if args.inspect:
                         # Read-only transport smoke: no login, matchmaking or moves.
                         print(json.dumps(await page.evaluate("() => ({client:!!app.rooms, named:!!app.user.get('named'), title:document.title})")))
@@ -139,6 +145,14 @@ async def run(args):
                                 break
                             promotion = prepare_matchmaking(player.brain, args.format)
                             player.log('matchmaking_checkpoint', **promotion)
+                            if agent is not None:
+                                # A gated search value is adopted only between games.
+                                from search.value_store import current_value
+                                value = current_value()
+                                if value.get('sha256') != agent.value.get('sha256'):
+                                    agent.set_value(value.get('path'), value.get('beta', 0.0))
+                                    agent.value['sha256'] = value.get('sha256')
+                                    player.log('value_checkpoint', **value)
                             await player.search(args.format, team)
                             deadline = time.monotonic() + args.search_timeout
                             while time.monotonic() < deadline and not stop.is_set():
@@ -196,8 +210,8 @@ def parser():
     p.add_argument('--inspect', action='store_true', help='Read-only browser check; no login or games')
     p.add_argument('--no-record', action='store_true', help='Greedy inference without PPO recording')
     p.add_argument('--search', action='store_true', help='Decide turns with the simulator search agent (implies --no-record)')
-    p.add_argument('--search-worlds', type=int, default=6, help='Determinized opponent worlds per decision')
-    p.add_argument('--search-engines', type=int, default=3, help='Parallel search engine processes')
+    p.add_argument('--search-worlds', type=int, help='Determinized opponent worlds per decision (default: search/config.py)')
+    p.add_argument('--search-engines', type=int, help='Parallel search engine processes (default: search/config.py)')
     p.add_argument('--search-timeout', type=int, default=120)
     p.add_argument('--stall-timeout', type=int, default=180)
     p.add_argument('--game-delay', type=float, default=30, help='Seconds between completed games and the next search')
@@ -213,7 +227,8 @@ if __name__ == '__main__':
         p.error('game delay must be 0..3600 seconds')
     if args.search:
         args.no_record = True
-        if not 1 <= args.search_worlds <= 32 or not 1 <= args.search_engines <= 8:
+        if (args.search_worlds is not None and not 1 <= args.search_worlds <= 32) or \
+                (args.search_engines is not None and not 1 <= args.search_engines <= 8):
             p.error('search worlds must be 1..32 and engines 1..8')
     if not args.format.isalnum() or (args.room and not all(c.isalnum() or c == '-' for c in args.room)):
         p.error('format and room must be Showdown identifiers')

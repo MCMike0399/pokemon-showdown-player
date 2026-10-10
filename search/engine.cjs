@@ -316,7 +316,8 @@ function setValue(pathArg, beta, scale) {
 
 function evaluate(battle) {
   if (CURRENT.net && !battle.ended) {
-    const learned = CURRENT.scale * VNET.forward(CURRENT.net, valueFeatures(battle, 0));
+    const x = valueFeatures(battle, 0);
+    const learned = CURRENT.net.hand ? VNET.handUnits(CURRENT.net, x) : CURRENT.scale * VNET.forward(CURRENT.net, x);
     if (CURRENT.beta >= 1) return learned;
     return (1 - CURRENT.beta) * handEvaluate(battle) + CURRENT.beta * learned;
   }
@@ -376,9 +377,14 @@ function searchWorld(msg, world, wi) {
   const seeds = msg.seeds || 1;
   let screenSims = 0;
   const screenErr = {};
-  const sim1 = (a, b, k) => {
+  // Common random numbers (msg.crn): a cell's seed depends on the world, the
+  // seed index and the OPPONENT action only, so every one of our rows faces the
+  // same chance stream for a given reply. Without it the seed also depends on
+  // our row, and close actions are ranked partly by luck (paper, Prop. mc).
+  const crn = !!msg.crn;
+  const sim1 = (a, b, k, seed) => {
     const bb = State.deserializeBattle(baseStr);
-    bb.prng = new PRNG([wi * 131 + k * 17 + 1, a.length + 3, b.length + 5, 11]);
+    bb.prng = new PRNG(crn && seed ? seed : [wi * 131 + k * 17 + 1, a.length + 3, b.length + 5, 11]);
     if (!bb.choose('p1', a)) { screenErr.p1 = screenErr.p1 || (a + ' :: ' + bb.sides[0].choice.error); return null; }
     if (!bb.choose('p2', b)) { screenErr.p2 = screenErr.p2 || (b + ' :: ' + bb.sides[1].choice.error); return undefined; }
     screenSims++;
@@ -393,7 +399,7 @@ function searchWorld(msg, world, wi) {
     if (theirs.length > msg.screen.keep_opp) {
       const sc = theirs.map((b, j) => {
         let s = 0, n = 0;
-        for (const a of probes) { const v = sim1(a, b, j); if (v === undefined) return [b, Infinity]; if (v !== null) { s += v; n++; } }
+        for (const [pi, a] of probes.entries()) { const v = sim1(a, b, j, [wi * 131 + 1, pi + 3, 7, 13]); if (v === undefined) return [b, Infinity]; if (v !== null) { s += v; n++; } }
         return [b, n ? s / n : Infinity];
       });
       sc.sort((p, q) => p[1] - q[1]);
@@ -403,7 +409,7 @@ function searchWorld(msg, world, wi) {
       const top = theirs.slice(0, msg.screen.probe);
       const sc = ours.map((a, i) => {
         let s = 0, n = 0;
-        for (const b of top) { const v = sim1(a, b, i); if (v === null) return [a, -Infinity]; if (v !== undefined) { s += v; n++; } }
+        for (const [ti, b] of top.entries()) { const v = sim1(a, b, i, [wi * 131 + 1, 3, ti + 5, 13]); if (v === null) return [a, -Infinity]; if (v !== undefined) { s += v; n++; } }
         return [a, n ? s / n : -Infinity];
       });
       sc.sort((p, q) => q[1] - p[1]);
@@ -422,7 +428,7 @@ function searchWorld(msg, world, wi) {
       let total = 0;
       for (let k = 0; k < seeds; k++) {
         const b = State.deserializeBattle(baseStr);
-        b.prng = new PRNG([wi * 131 + k * 17 + 1, i + 3, j + 5, 11]);
+        b.prng = new PRNG([wi * 131 + k * 17 + 1, crn ? 3 : i + 3, j + 5, 11]);
         if (!b.choose('p1', ours[i])) { validOurs[i] = false; if (!firstErr.p1) firstErr.p1 = ours[i] + ' :: ' + b.sides[0].choice.error; break; }
         if (!b.choose('p2', theirs[j])) { validTheirs[j] = false; if (!firstErr.p2) firstErr.p2 = theirs[j] + ' :: ' + b.sides[1].choice.error; break; }
         total += evaluate(b);
@@ -457,8 +463,14 @@ function searchWorld(msg, world, wi) {
   const ourMix = {};
   rows.forEach((i, r) => { ourMix[ours[i]] = x[r]; });
   const topOpp = cols.map((j, c) => [theirs[j], q[c]]).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  // Root statistics for learning: the one-turn game value under the averaged
+  // strategies, and the static evaluation of the rebuilt (pre-turn) position.
+  let eq = 0;
+  rows.forEach((i, r) => { for (let c = 0; c < cols.length; c++) eq += x[r] * sub[r][c] * y[c]; });
+  const root = {eq, hand: handEvaluate(battle)};
+  if (msg.features) root.x = valueFeatures(battle, 0);
   return {values, worst, nash: nashValue, mix: ourMix, ms: Date.now() - t0, sims: sims + screenSims,
-          n_ours: rows.length, n_theirs: cols.length, top_opp: topOpp};
+          n_ours: rows.length, n_theirs: cols.length, top_opp: topOpp, root};
 }
 
 function combos(n, k) {
@@ -529,6 +541,16 @@ function handle(msg) {
     setValue(msg.value_path, msg.value_beta, msg.value_scale);
     return {id: msg.id, values: previewPlans(msg)};
   }
+  if (msg.type === 'features') {
+    // Value-learning rows for rebuilt public positions: features from our side
+    // (p1) and the hand evaluation, one entry per determinized world.
+    return {id: msg.id, results: msg.worlds.map(w => {
+      try {
+        const battle = buildBattle(msg.format, w, msg.field);
+        return {x: valueFeatures(battle, 0), hand: handEvaluate(battle)};
+      } catch (e) { return {error: String(e && e.message || e).slice(0, 400)}; }
+    })};
+  }
   if (msg.type === 'choices') {
     const battle = buildBattle(msg.format, msg.worlds[0], msg.field);
     return {id: msg.id, p1: sideChoices(battle, battle.sides[0]), p2: sideChoices(battle, battle.sides[1])};
@@ -547,7 +569,7 @@ function handle(msg) {
   throw new Error('unknown message type');
 }
 
-module.exports = {buildBattle, sideChoices, evaluate, solveZeroSum, searchWorld, handle, State, PRNG, Battle, Teams, Dex};
+module.exports = {buildBattle, sideChoices, evaluate, handEvaluate, solveZeroSum, searchWorld, handle, State, PRNG, Battle, Teams, Dex};
 
 if (require.main === module) {
 const rl = readline.createInterface({input: process.stdin});
