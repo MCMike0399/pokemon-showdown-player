@@ -319,6 +319,11 @@ class BrowserPlayer:
             }, true);
         }""", {'room': snapshot['room'], 'request': snapshot['request']})
 
+    async def _clear_choice(self, room):
+        """Official client 'Back': forget a local, unsent partial selection."""
+        with suppress(Exception):
+            await self.page.evaluate("id => { const r = app.rooms[id]; if (r && r.choice && !r.choice.waiting && r.clearChoice) r.clearChoice(); }", room)
+
     async def _await_controls(self, root, snapshot, *, may_reload):
         """True once move buttons render for this request; False if it is gone."""
         room = snapshot['room']
@@ -472,6 +477,7 @@ class BrowserPlayer:
         retries = {}
         sheets_attempted = False
         timer_claimed = False
+        failed = {}  # search mode: request key -> choices the UI could not submit
         while True:
             snapshot = await self.snapshot(room)
             if snapshot.get('missing'):
@@ -531,8 +537,17 @@ class BrowserPlayer:
                     await asyncio.sleep(delay)
                     continue  # Read a fresh request after the pacing delay.
                 if snapshot.get('partial'):
-                    raise ValueError('partially selected browser action; inspect before resuming')
+                    if self.decider is None:
+                        raise ValueError('partially selected browser action; inspect before resuming')
+                    # Search games record no PPO step: drop the half-made local
+                    # selection (client-side only) and decide this request again.
+                    await self._clear_choice(room)
+                    continue
                 ctx = context(snapshot, fmt, sets)
+                if self.decider is not None and failed.get(key):
+                    remaining = [c for c in ctx['choices'] if c not in failed[key]]
+                    if remaining:
+                        ctx = {**ctx, 'choices': remaining}
                 model = self.brain.model(fmt)
                 identity = (model.revision, model.checkpoint_sha256, model.feature_profile,
                             model.policy_temperature, model.preview_temperature)
@@ -582,9 +597,24 @@ class BrowserPlayer:
                     fresh = await self.snapshot(room)
                     if ((fresh.get('request') or {}).get('rqid') != (snapshot.get('request') or {}).get('rqid')
                             or fresh.get('waiting') or decision['choice'] not in legal_choices(fresh.get('request'))):
-                        raise ValueError('request changed during search; inspect before resuming')
+                        self.log('search_request_changed', room=room, request_id=key[0])
+                        continue  # nothing was clicked: decide the current request
                     snapshot = fresh
-                await self.submit(snapshot, decision['choice'])
+                    try:
+                        await self.submit(snapshot, decision['choice'])
+                    except Exception as error:
+                        # A UI race (request replaced mid-click, a control that never
+                        # becomes clickable) must not end the game: clear any partial
+                        # selection, never retry that choice for this request, re-decide.
+                        if 'closed' in str(error).lower() or len(failed.get(key, ())) >= 3:
+                            raise
+                        failed.setdefault(key, set()).add(decision['choice'])
+                        self.log('submit_retry', room=room, request_id=key[0], choice=decision['choice'],
+                                 error=f'{type(error).__name__}: {str(error)[:200]}')
+                        await self._clear_choice(room)
+                        continue
+                else:
+                    await self.submit(snapshot, decision['choice'])
                 self.last_submission = time.monotonic()
                 if decision.get('recorded'):
                     episode = self.brain.pending[(room, side)]

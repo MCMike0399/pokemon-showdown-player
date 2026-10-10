@@ -369,3 +369,35 @@ def test_idle_opponent_gets_the_battle_timer_before_the_runner_gives_up(tmp_path
         assert sum("setTimer('on')" in s for s in scripts) == 1  # once, then a full window
     finally:
         store.close()
+
+
+def test_search_submit_failure_redecides_without_the_failed_choice(tmp_path):
+    # Live 2026-10-10: a target button never became clickable and a forced
+    # switch's request changed mid-click; both crashed the runner mid-game.
+    from ml.brain import Brain
+    from ml.features import Features
+    from ml.storage import Store
+    store = Store(tmp_path)
+    try:
+        page = Page(snapshot())
+        player = BrowserPlayer(page, Brain(store, Features()), decision_interval=0)
+        seen = []
+
+        async def decider(ctx):
+            seen.append(list(ctx['choices']))
+            return ctx['choices'][0]
+        player.decider = decider
+        submitted = []
+
+        async def submit(state, choice):
+            if not submitted:
+                submitted.append(None)
+                raise TimeoutError('Locator.click: Timeout 90000ms exceeded.')
+            submitted.append(choice)
+            page.state['log'].append('|win|Configured')
+        player.submit = submit
+        asyncio.run(player.play(ROOM, FMT, record=False))
+        assert len(seen) == 2 and seen[0][0] not in seen[1]  # the failed choice is never retried
+        assert submitted[-1] == seen[1][0]
+    finally:
+        store.close()

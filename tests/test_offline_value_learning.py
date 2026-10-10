@@ -367,3 +367,15 @@ def test_critical_memory_pressure_stops_background_groups(tmp_path, monkeypatch)
         assert proc.returncode is not None
     finally:
         proc.kill()
+
+
+def test_gate_futility_stop_only_rejects():
+    even = []
+    for i in range(40):
+        c = i % 2 == 0
+        even += [{'pair': i, 'arm': 'cand', 'score': float(c)}, {'pair': i, 'arm': 'inc', 'score': float(not c)}]
+    s = value_gate.summarize(even, 80, 0.05)
+    assert s['complete'] and s['futility_stop'] and not s['passed']  # 20 gains / 20 losses at 40 pairs
+    ahead = [dict(r, score=1.0) if r['arm'] == 'cand' else r for r in even]
+    s = value_gate.summarize(ahead, 80, 0.05)
+    assert not s['complete'] and not s['futility_stop']  # a leading candidate always plays the full panel

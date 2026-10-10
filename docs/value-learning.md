@@ -41,7 +41,7 @@ runs the loop:
 | Ingest | CPU | Every finished live search game becomes rows: the same tracker, priors and rebuild as the live search, labelled with the verified result (`search/ledger_positions.py`). |
 | Produce | CPU (all cores) | `search/selfplay.cjs` shards of 20 games, the deployed team on one side with probability 0.6. Rows carry game id `g`, side, focus flag, hand evaluation `h` and the turn's one-turn equilibrium value `v`. Uses the promoted value. |
 | Train | MPS | `search/train_value.py`: game-level splits; older live games calibrate (temperature, blend β), the newest 40% are an untouched test; the prescreen requires the deployed blend to beat the calibrated hand evaluation there and on self-play validation. Holds `data/ml/worker.lock`, so it never overlaps the PPO learner on the GPU. |
-| Gate | CPU | `search/value_gate.py`: paired real-team games, same seeds/opponents/sides/worlds, deployed search config. Two stages (development, then confirmation on fresh seeds), one-sided exact sign test at 0.05 each, at most one promotion per day. |
+| Gate | CPU | `search/value_gate.py`: paired real-team games, same seeds/opponents/sides/worlds, deployed search config. Two stages (development, then confirmation on fresh seeds), one-sided exact sign test at 0.05 each, futility stop after 40 pairs, at most one promotion per day. |
 | Promote | - | `data/ml/value/current.json` (atomic, SHA-256 verified on every read). A damaged or edited candidate falls back to the hand evaluation. |
 
 Producers and gate games take locks from the same `data/ml/simulator-slots`
@@ -97,6 +97,27 @@ two repeats choose different actions:
 - `worlds_K/2K`: freshly sampled worlds, 6 vs 12.
 
 Results are in `artifacts/value-learning/noise-60.json` (private).
+
+## First night (2026-10-09/10): what each game bought
+
+- Live: 121 games 63-58 overnight, rating 1285 -> 1368 against a median 1314
+  opponent; each finished game added about 29 labelled positions and a search
+  trace per turn.
+- Learning: 12 hourly candidates (about 22 s each on MPS), all beating the
+  calibrated hand evaluation on the newest held-out live games; the edge grew
+  with self-play volume (log loss edge 0.012-0.015 at ~100k rows, 0.020-0.030 at
+  130-160k). The first full gate still ended 10 gains / 9 losses: a better
+  outcome predictor has not yet been a measurably better leaf evaluation. With
+  about 24% discordant pairs, an 80-pair stage only detects large effects.
+- Training on the older live games as well did not improve prediction on the
+  newest ones (about 90 games against 160k self-play rows), so live games stay
+  a calibration and test set (`--live-weight` keeps the option).
+- The GPU is nearly idle by design (each value or PPO update takes seconds);
+  simulation is the bottleneck, and the gate is its slowest consumer. Gates
+  now stop early as a rejection once a candidate has played 40 pairs without
+  more gains than losses; that rule can never cause a promotion.
+
+`search/learning_report.py --hours 24` prints this picture at any time.
 
 ## Operate
 

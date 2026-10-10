@@ -42,7 +42,7 @@ def _bucket(g: str) -> float:
 
 
 def load_rows(selfplay: list[str], live_dir: Path | None, val_frac: float, live_test: float,
-              max_rows: int = 0, live_weight: float = 0.0):
+              max_rows: int = 0, live_weight: float = 0.0, live_cal: float = 0.5):
     """Return dict split -> (X, Y, H, games, weights) with game-level splits.
 
 Self-play shards are read newest first until `max_rows` (0 = all), so a long
@@ -87,14 +87,17 @@ run trains on a recent window of the improving self-play distribution.
         block = (np.asarray([r['x'] for r in rows], np.float32), np.asarray([r['y'] for r in rows], np.float32),
                  np.asarray([r['h'] for r in rows], np.float32), [r['g'] for r in rows],
                  np.full(len(rows), 1.0 if test else live_weight, np.float32))
+        # Time order: [oldest: training (if live_weight > 0)] [calibration] [newest: test].
+        # With live_weight 0 every non-test game calibrates. Calibration games are
+        # never trained on, so the fitted temperature and blend are honest.
+        n_old = len(live_games) - n_test
+        cal_start = int(round(n_old * (1 - live_cal))) if live_weight > 0 else 0
         if test:
             parts['live_test'].append(block)
-        else:
-            # Older live games calibrate the net to real ladder games (temperature
-            # and blend weight); optionally they also join training.
+        elif k >= cal_start:
             parts['live_cal'].append(block)
-            if live_weight > 0:
-                parts['train'].append(block)
+        else:
+            parts['train'].append(block)
     out = {}
     for split, blocks in parts.items():
         if blocks:
@@ -105,7 +108,7 @@ run trains on a recent window of the improving self-play distribution.
             out[split] = (np.zeros((0, width or 1), np.float32), np.zeros(0, np.float32), np.zeros(0, np.float32),
                           [], np.zeros(0, np.float32))
     return out, manifest, {'live_games': len(live_games), 'live_test_games': n_test,
-                           'live_cal_games': len(live_games) - n_test, 'selfplay_rows': total}
+                           'live_cal_games': len({g for b in parts['live_cal'] for g in b[3]}), 'selfplay_rows': total}
 
 
 def logloss(p, y):
@@ -208,7 +211,9 @@ def main(argv=None):
     ap.add_argument('--out', type=Path, default=ROOT / 'data' / 'ml' / 'value' / 'candidates')
     ap.add_argument('--val-frac', type=float, default=0.1)
     ap.add_argument('--live-test', type=float, default=0.4, help='newest fraction of live games held out')
-    ap.add_argument('--live-weight', type=float, default=0.0, help='weight of older live games in training (they always calibrate)')
+    ap.add_argument('--live-weight', type=float, default=0.0, help='weight of the oldest live games in training')
+    ap.add_argument('--live-cal', type=float, default=0.5,
+                    help='with --live-weight > 0: newest fraction of non-test live games kept for calibration')
     ap.add_argument('--max-rows', type=int, default=1_500_000, help='newest self-play rows to use (0 = all)')
     ap.add_argument('--hidden', type=int, default=256)
     ap.add_argument('--layers', type=int, default=2)
@@ -227,7 +232,7 @@ def main(argv=None):
         args.selfplay = [str(ROOT / 'data' / 'ml' / 'value' / 'selfplay' / '*.jsonl')]
     started = time.time()
     data, manifest, live_info = load_rows(args.selfplay, args.live, args.val_frac, args.live_test,
-                                          args.max_rows, args.live_weight)
+                                          args.max_rows, args.live_weight, args.live_cal)
     if len(data['train'][0]) < 1000:
         raise SystemExit(json.dumps({'error': 'not enough training rows', 'rows': int(len(data['train'][0]))}))
     device = args.device

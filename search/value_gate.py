@@ -41,6 +41,11 @@ def sign_test(gains: int, losses: int) -> float:
 
 
 MAX_ATTEMPTS = 3
+# Futility: from this many complete pairs on, a candidate with no more gains
+# than losses is rejected without finishing the panel. The rule can only end a
+# stage as a rejection, so it never raises the false-promotion rate; it frees
+# hours of gate compute for the next candidate.
+FUTILITY_FROM = 40
 
 
 def _score(r: dict):
@@ -74,12 +79,13 @@ different seed, which would break the pairing), so a gate always terminates.
     gains = sum(1 for c, i in complete if c > i)
     losses = sum(1 for c, i in complete if i > c)
     p = sign_test(gains, losses)
-    done = len(complete) + void >= pairs
+    futile = len(complete) >= min(FUTILITY_FROM, pairs) and gains <= losses and len(complete) + void < pairs
+    done = len(complete) + void >= pairs or futile
     return {'pairs_complete': len(complete), 'pairs_void': void, 'pairs_planned': pairs,
             'candidate_score': sum(c for c, _ in complete), 'incumbent_score': sum(i for _, i in complete),
             'gains': gains, 'losses': losses, 'p_one_sided': round(p, 5),
-            'errors': sum(1 for r in rows if r.get('error')), 'complete': done,
-            'passed': bool(done and p <= alpha and gains > losses)}
+            'errors': sum(1 for r in rows if r.get('error')), 'complete': done, 'futility_stop': futile,
+            'passed': bool(done and not futile and p <= alpha and gains > losses)}
 
 
 async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, concurrency: int, seed: int,
@@ -99,6 +105,8 @@ async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, conc
 
     async def one(pair: int, arm: str):
         while attempts.get((pair, arm), 0) < MAX_ATTEMPTS:
+            if summarize(rows, pairs, alpha)['complete']:
+                return  # decided (futility stop): skip games not yet started
             attempts[(pair, arm)] = attempts.get((pair, arm), 0) + 1
             if await attempt(pair, arm):
                 return

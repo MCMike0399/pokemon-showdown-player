@@ -22,13 +22,14 @@ LIVE = {
     # the same worlds re-searched with new seeds flipped the decision 13/19 times
     # without CRN and 8/19 with it, at the same latency (measure_noise.py).
     'crn': True,
-    # Close decisions (top-2 margin below 0.5 hand units, about half of turns)
-    # get 6 more fresh worlds: world-sampling flips fell from 7/19 at 6 worlds to
-    # 5/19 at 12. Skipped when the first batch took over half the 6 s budget; the
-    # ladder turn timer is 55 s with a 420 s bank.
+    # Close decisions (top-2 margin below 0.5 hand units) get 6 more fresh worlds:
+    # world-sampling flips fell from 7/19 at 6 worlds to 5/19 at 12. Skipped when
+    # the first batch took over half the 9 s budget (with a 6 s budget only 23% of
+    # turns qualified overnight, first batches ran 3.7 s under memory pressure);
+    # the ladder turn timer is 55 s with a 420 s bank.
     'adaptive_margin': 0.5,
     'adaptive_worlds': 6,
-    'adaptive_max_ms': 6000.0,
+    'adaptive_max_ms': 9000.0,
     # A stalled search falls back to a legal move before the 55 s turn timer.
     'engine_timeout': 40.0,
 }
