@@ -1,7 +1,7 @@
 """Train the search value MLP on self-play and live positions; export an immutable candidate.
 
-    .venv/bin/python search/train_value.py --selfplay 'data/ml/value/selfplay/*.jsonl' \
-        --live data/ml/value/live --out data/ml/value/candidates
+    .venv/bin/python search/train_value.py --team Rain-Recife-special-stat-fix
+    (defaults: data/ml/value/teams/<team>/{selfplay/*.jsonl, live, candidates}, see search/team_data.py)
 
 Splits are by game (`g`), never by row: adjacent positions of one game share an
 outcome, so a row split leaks labels into validation. Self-play games are split
@@ -207,8 +207,10 @@ def predict(net, mean, std, X):
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--selfplay', action='append', default=[], help='glob of self-play shards (repeatable)')
-    ap.add_argument('--live', type=Path, default=ROOT / 'data' / 'ml' / 'value' / 'live')
-    ap.add_argument('--out', type=Path, default=ROOT / 'data' / 'ml' / 'value' / 'candidates')
+    ap.add_argument('--team', default='Rain-Recife-special-stat-fix',
+                    help='team whose data is used when --selfplay/--live/--out are not given')
+    ap.add_argument('--live', type=Path)
+    ap.add_argument('--out', type=Path)
     ap.add_argument('--val-frac', type=float, default=0.1)
     ap.add_argument('--live-test', type=float, default=0.4, help='newest fraction of live games held out')
     ap.add_argument('--live-weight', type=float, default=0.0, help='weight of the oldest live games in training')
@@ -228,8 +230,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
     import torch
     torch.set_num_threads(args.threads)
-    if not args.selfplay:
-        args.selfplay = [str(ROOT / 'data' / 'ml' / 'value' / 'selfplay' / '*.jsonl')]
+    if not (args.selfplay and args.live and args.out):
+        from search.team_data import team_dir
+        tdir = team_dir(args.team)  # data/ml/value/teams/<slug>/
+        args.selfplay = args.selfplay or [str(tdir / 'selfplay' / '*.jsonl')]
+        args.live = args.live or tdir / 'live'
+        args.out = args.out or tdir / 'candidates'
     started = time.time()
     data, manifest, live_info = load_rows(args.selfplay, args.live, args.val_frac, args.live_test,
                                           args.max_rows, args.live_weight, args.live_cal)

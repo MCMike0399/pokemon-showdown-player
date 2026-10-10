@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 
 from search.arena import BrainAgent, play_game  # noqa: E402
 from search.config import agent_kwargs  # noqa: E402
+from search.team_data import DEFAULT_TEAM  # noqa: E402
 
 FROZEN = ROOT / 'artifacts' / 'search-breakthrough' / 'frozen'
 FMT = 'gen9championsvgc2026regmc'
@@ -174,7 +175,7 @@ def main():
     ap.add_argument('--engines', type=int, default=1, help='engines per searching agent (memory)')
     ap.add_argument('--seed', type=int, default=20261009)
     ap.add_argument('--alpha', type=float, default=0.05)
-    ap.add_argument('--team', default='Rain-Recife-special-stat-fix')
+    ap.add_argument('--team', default=DEFAULT_TEAM)
     ap.add_argument('--pool', type=Path, default=ROOT / 'data' / 'ml' / 'value' / 'pool-teams.json')
     ap.add_argument('--out', type=Path, required=True)
     args = ap.parse_args()

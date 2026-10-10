@@ -43,13 +43,15 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from search.value_store import (BACKGROUND_PGIDS, VALUE_ROOT, POINTER, _command, atomic_json,  # noqa: E402
-                                current_value, dir_bytes, pack_shard, promote, resume_if_stale)
+                                current_value, dir_bytes, pack_shard, promote, resume_if_stale, team_pointer)
+from search.team_data import DEFAULT_TEAM, ensure_team  # noqa: E402
 
 DATA = ROOT / 'data' / 'ml'
 PY = sys.executable
 TASKPOLICY = '/usr/sbin/taskpolicy'
 DEFAULTS = {
     'enabled': True,
+    'team': DEFAULT_TEAM,           # the deployed team: its data lives in data/ml/value/teams/<slug>/
     'interval_seconds': 20,
     'producers': 4,                 # max concurrent self-play processes
     'games_per_shard': 20,          # ~20 min per shard on efficiency cores: yields slots promptly
@@ -138,7 +140,7 @@ class Service:
     def __init__(self, data: Path = DATA):
         self.data = data
         self.vroot = VALUE_ROOT
-        for sub in ('selfplay', 'live', 'candidates', 'gates', 'logs'):
+        for sub in ('logs',):  # team data lives under teams/<slug>/ (search/team_data.py)
             (self.vroot / sub).mkdir(parents=True, exist_ok=True)
         self.state_path = self.vroot / 'service-state.json'
         try:
@@ -155,6 +157,24 @@ class Service:
         self.policy = None
         self.last_ingest = 0.0
         self.events: list[str] = []
+        self.set_team(load_config()['team'])
+
+    def set_team(self, name: str):
+        """All data of the deployed team: live positions, self-play, candidates, gates, pointer."""
+        if getattr(self, 'team', None) == name:
+            return
+        self.team = name
+        self.tdir = ensure_team(name)
+        if self.state.get('team') not in (None, name):
+            # Another team: its own counters, candidates and gates; nothing carries over.
+            self.note(f"team changed {self.state.get('team')} -> {name}")
+            for key in ('gate', 'pending_train', 'train_failed_at'):
+                self.state.pop(key, None)
+            self.state.update(trained_rows=0, trained_live_games=0)
+        self.state['team'] = name
+
+    def pointer(self) -> Path:
+        return team_pointer(self.team)
 
     # ------------------------------------------------------------ helpers
     def save(self):
@@ -199,7 +219,7 @@ class Service:
 (the trainer reads both; a partial last line is skipped)."""
         rows = 0
         known = self.state.get('shard_rows', {})
-        for p in (self.vroot / 'selfplay').glob('*.jsonl'):
+        for p in (self.tdir / 'selfplay').glob('*.jsonl'):
             if p.name in known:
                 rows += known[p.name] or 0
             else:
@@ -208,7 +228,7 @@ class Service:
         return rows
 
     def live_games(self) -> int:
-        return len(list((self.vroot / 'live').glob('live-*.jsonl')))
+        return len(list((self.tdir / 'live').glob('live-*.jsonl')))
 
     # ------------------------------------------------------------ 1. ingest
     def ingest(self):
@@ -232,30 +252,32 @@ class Service:
             return
         if self.state.get('gate') and 'gate' not in self.children and not self.state['gate'].get('pid'):
             return  # a gate is waiting for slots: let running shards finish and free them
-        if dir_bytes(self.vroot / 'selfplay') > cfg['max_selfplay_gb'] * 2**30:
+        if dir_bytes(self.tdir / 'selfplay') > cfg['max_selfplay_gb'] * 2**30:
             return
         handles = self.slots.acquire(res['slot_pool'] + cfg['slot_limit_extra'], 1)
         if not handles:
             return
         self.state['shard_seq'] += 1
         seq = self.state['shard_seq']
-        shard = self.vroot / 'selfplay' / f'sp-{seq}.jsonl'
+        shard = self.tdir / 'selfplay' / f'sp-{seq}.jsonl'
         argv = ['node', '--max-old-space-size=768', str(ROOT / 'search' / 'selfplay.cjs'),
-                str(self.vroot / 'pool-teams.json'), str(self.vroot / 'focus-team.json'),
+                str(self.vroot / 'pool-teams.json'), str(self.tdir / 'team.json'),
                 str(cfg['games_per_shard']), str(seq % 2_000_000_000), str(shard),
                 '--focus-prob', str(cfg['focus_prob']), '--tag', f'sp{seq}']
-        value = current_value() if cfg['selfplay_uses_current'] else {'path': None}
+        value = current_value(self.pointer()) if cfg['selfplay_uses_current'] else {'path': None}
         if value.get('path'):
             argv += [value['path'], '--value-beta', str(value['beta'])]  # optional 6th positional
         proc = self.spawn(f'prod-{seq}', argv, handles, self.vroot / 'logs' / 'selfplay.log', nice=10,
                           qos=cfg['qos']['producer'])
-        self.state['producers'][str(seq)] = {'pid': proc.pid, 'shard': shard.name, 'started': time.time(),
+        self.state['producers'][str(seq)] = {'pid': proc.pid, 'shard': str(shard), 'started': time.time(),
                                              'value': value.get('sha256')}
 
     def finish_producer(self, name: str, code: int):
         seq = name.split('-', 1)[1]
         info = self.state['producers'].pop(seq, {})
-        shard = self.vroot / 'selfplay' / info.get('shard', f'sp-{seq}.jsonl')
+        shard = Path(info.get('shard') or f'sp-{seq}.jsonl')
+        if not shard.is_absolute():
+            shard = self.tdir / 'selfplay' / shard  # records from before per-team data
         if shard.exists():
             cache = pack_shard(shard)
             rows = sum(1 for _ in shard.open())
@@ -281,8 +303,8 @@ class Service:
             return
         self.state['pending_train'] = {'rows': rows, 'live': live, 'started': time.time()}
         out = self.vroot / 'logs' / f'train-{int(time.time())}.json'
-        argv = [PY, str(ROOT / 'search' / 'train_value.py'), '--selfplay', str(self.vroot / 'selfplay' / '*.jsonl'),
-                '--live', str(self.vroot / 'live'), '--out', str(self.vroot / 'candidates'),
+        argv = [PY, str(ROOT / 'search' / 'train_value.py'), '--selfplay', str(self.tdir / 'selfplay' / '*.jsonl'),
+                '--live', str(self.tdir / 'live'), '--out', str(self.tdir / 'candidates'),
                 '--max-rows', str(cfg['train_max_rows']), *cfg['train_args']]
         self.state['pending_train']['report'] = str(out)
         self.spawn('train', ['/bin/sh', '-c', 'exec ' + ' '.join(_q(a) for a in argv) + ' > ' + _q(str(out))], [lock],
@@ -303,7 +325,7 @@ class Service:
             return
         self.state['trained_rows'] = pending['rows']
         self.state['trained_live_games'] = pending['live']
-        cand = {'path': report['path'], 'sha256': report['sha256'], 'useful': report['useful'],
+        cand = {'team': self.team, 'path': report['path'], 'sha256': report['sha256'], 'useful': report['useful'],
                 'beta': report.get('recommended_beta', 1.0), 'val': report.get('val'), 'live_test': report.get('live_test'),
                 'rows': report.get('rows'), 'trained_at': time.time(), 'status': 'trained'}
         if not cand['useful'] or not cand['beta']:
@@ -325,17 +347,19 @@ class Service:
             self.finish_gate(-1, cfg)
             gate = self.state.get('gate')
         if gate is None:
-            waiting = [c for c in self.state['candidates'] if c['status'] == 'trained']
+            waiting = [c for c in self.state['candidates'] if c['status'] == 'trained'
+                       and c.get('team', DEFAULT_TEAM) == self.team]
             if not waiting:
                 return
             day = time.time() - 86400
-            promos = [c for c in self.state['candidates'] if c.get('promoted_at', 0) > day]
+            promos = [c for c in self.state['candidates'] if c.get('promoted_at', 0) > day
+                      and c.get('team', DEFAULT_TEAM) == self.team]
             if len(promos) >= cfg['max_promotions_per_day']:
                 return
             cand = waiting[-1]  # newest data wins; older trained candidates are superseded
             for c in waiting[:-1]:
                 c['status'] = 'superseded'
-            gate = {'sha256': cand['sha256'], 'stage': 'dev', 'incumbent': current_value()}
+            gate = {'sha256': cand['sha256'], 'stage': 'dev', 'incumbent': current_value(self.pointer())}
             self.state['gate'] = gate
         if not res['training_allowed'] or res['allowed_workers'] < 1:
             return
@@ -346,11 +370,11 @@ class Service:
                 h.close()
             return
         inc = gate['incumbent']
-        out = self.vroot / 'gates' / f"{gate['sha256'][:16]}-{gate['stage']}.jsonl"
+        out = self.tdir / 'gates' / f"{gate['sha256'][:16]}-{gate['stage']}.jsonl"
         seed = int(gate['sha256'][:8], 16) + (0 if gate['stage'] == 'dev' else 7_777_777)
         argv = [PY, str(ROOT / 'search' / 'value_gate.py'), '--candidate', cand['path'], '--beta', str(cand['beta']),
                 '--pairs', str(cfg['gate_pairs']), '--concurrency', str(len(handles)), '--engines', str(cfg['gate_engines']),
-                '--alpha', str(cfg['gate_alpha']), '--seed', str(seed), '--out', str(out)]
+                '--alpha', str(cfg['gate_alpha']), '--seed', str(seed), '--out', str(out), '--team', self.team]
         if inc.get('path'):
             argv += ['--incumbent', inc['path'], '--incumbent-beta', str(inc['beta'])]
         report = self.vroot / 'logs' / f"gate-{gate['sha256'][:16]}-{gate['stage']}.json"
@@ -389,12 +413,12 @@ class Service:
             cand['status'] = 'trained'  # keeps it eligible; the gate record carries the stage
             self.note(f"candidate {cand['sha256'][:12]} passed development; confirming on fresh seeds")
             return
-        if current_value().get('sha256') != (gate['incumbent'] or {}).get('sha256'):
+        if current_value(self.pointer()).get('sha256') != (gate['incumbent'] or {}).get('sha256'):
             cand['status'] = 'stale: incumbent changed during gating'
             self.state.pop('gate', None)
             return
-        record = promote(Path(cand['path']), cand['beta'], {'gates': cand['gates'], 'val': cand['val'],
-                                                            'live_test': cand['live_test']})
+        record = promote(Path(cand['path']), cand['beta'], {'team': self.team, 'gates': cand['gates'], 'val': cand['val'],
+                                                            'live_test': cand['live_test']}, self.pointer())
         cand['status'] = 'promoted'
         cand['promoted_at'] = record['promoted_at']
         self.state.pop('gate', None)
@@ -460,9 +484,9 @@ from its results file. New work starts again once admission allows it."""
 
     def scan_shards(self):
         """Count and cache shards written outside this supervisor (or before a restart)."""
-        active = {i.get('shard') for i in self.state['producers'].values()}
+        active = {Path(i.get('shard') or '').name for i in self.state['producers'].values()}
         known = self.state.setdefault('shard_rows', {})
-        for shard in sorted((self.vroot / 'selfplay').glob('*.jsonl')):
+        for shard in sorted((self.tdir / 'selfplay').glob('*.jsonl')):
             if shard.name in known or shard.name in active:
                 continue
             if time.time() - shard.stat().st_mtime < 120:
@@ -474,9 +498,10 @@ from its results file. New work starts again once admission allows it."""
         return {'pid': os.getpid(), 'updated_at': time.time(), 'enabled': cfg['enabled'],
                 'children': {n: p.pid for n, p in self.children.items()},
                 'orphan_producers': [s for s, i in self.state['producers'].items() if f'prod-{s}' not in self.children],
-                'selfplay_rows': self.selfplay_rows(), 'selfplay_gb': round(dir_bytes(self.vroot / 'selfplay') / 2**30, 3),
+                'team': self.team, 'team_dir': str(self.tdir),
+                'selfplay_rows': self.selfplay_rows(), 'selfplay_gb': round(dir_bytes(self.tdir / 'selfplay') / 2**30, 3),
                 'live_games': self.live_games(), 'trained_rows': self.state['trained_rows'],
-                'gate': self.state.get('gate'), 'current': current_value(),
+                'gate': self.state.get('gate'), 'current': current_value(self.pointer()),
                 'candidates': [{k: c.get(k) for k in ('sha256', 'status', 'beta', 'trained_at')} for c in self.state['candidates'][-8:]],
                 'resources': {k: res.get(k) for k in ('available_gb', 'system_cpu_percent', 'allowed_workers',
                                                       'memory_pressure', 'training_allowed', 'slot_pool')},
@@ -496,6 +521,7 @@ from its results file. New work starts again once admission allows it."""
         self.note('value service started')
         while not stop['flag']:
             cfg = load_config()
+            self.set_team(cfg['team'])
             res = self.resources()
             self.reap(cfg)
             # Orphaned producers from a previous supervisor: finish when they exit.

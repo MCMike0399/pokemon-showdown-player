@@ -70,8 +70,8 @@ def live_section(since: float) -> dict:
     for room, game in games.items():
         if 'win' not in game:
             continue
-        path = VALUE / 'live' / ('live-' + room + '.jsonl')
-        positions.append(sum(1 for _ in path.open()) if path.exists() else 0)
+        found = glob.glob(str(VALUE / 'teams' / '*' / 'live' / ('live-' + room + '.jsonl')))
+        positions.append(sum(1 for _ in open(found[0])) if found else 0)
     ratings = [g['rating'] for g in finished if g.get('rating')]
     wins = sum(g['win'] for g in finished)
     return {'games': len(finished), 'wins': wins, 'losses': len(finished) - wins,
@@ -116,13 +116,14 @@ def value_section(since: float) -> dict:
                            'auc_edge': round(blend['auc'] - hand['auc'], 4), 'useful': report.get('useful')})
     from search.value_gate import summarize
     gates = []
-    for path in sorted(glob.glob(str(VALUE / 'gates' / '*.jsonl')), key=os.path.getmtime):
+    for path in sorted(glob.glob(str(VALUE / 'teams' / '*' / 'gates' / '*.jsonl')), key=os.path.getmtime):
         rows = [json.loads(x) for x in open(path) if x.strip()]
         s = summarize(rows, 80, 0.05)
-        gates.append({'gate': Path(path).stem, **{k: s[k] for k in ('pairs_complete', 'gains', 'losses', 'p_one_sided',
+        gates.append({'team': Path(path).parents[1].name, 'gate': Path(path).stem, **{k: s[k] for k in ('pairs_complete', 'gains', 'losses', 'p_one_sided',
                                                                      'complete', 'passed', 'futility_stop')}})
     edges = [c['logloss_edge'] for c in candidates]
-    return {'selfplay_rows': status.get('selfplay_rows'), 'live_games_ingested': status.get('live_games'),
+    return {'team': status.get('team'), 'selfplay_rows': status.get('selfplay_rows'),
+            'live_games_ingested': status.get('live_games'),
             'candidates_trained': len(candidates), 'candidates_beating_hand': sum(1 for c in candidates if c['useful']),
             'mean_logloss_edge_last5': round(statistics.mean(edges[-5:]), 4) if edges else None,
             'recent_candidates': candidates[-5:], 'gates': gates[-4:],
@@ -154,7 +155,12 @@ def main():
     ap.add_argument('--json', action='store_true')
     args = ap.parse_args()
     since = time.time() - args.hours * 3600
-    report = {'window_hours': args.hours, 'live': live_section(since), 'value_learning': value_section(since),
+    try:
+        teams = json.loads((VALUE / 'teams' / 'index.json').read_text())['teams']
+    except (OSError, ValueError, KeyError):
+        teams = {}
+    report = {'window_hours': args.hours, 'teams_all_time': teams, 'live': live_section(since),
+              'value_learning': value_section(since),
               'ppo': ppo_section(since)}
     if args.json:
         print(json.dumps(report, indent=2))

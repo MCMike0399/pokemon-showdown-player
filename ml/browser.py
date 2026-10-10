@@ -500,7 +500,8 @@ class BrowserPlayer:
                             features=self.brain.features)}
                     except Exception as error:
                         saved = {**(saved or {}), 'public_experience': {'imported': False, 'error': type(error).__name__}}
-                self.log('terminal', result=outcome, side=side, experience=saved, log=snapshot['log'])
+                self.log('terminal', result=outcome, side=side, experience=saved, log=snapshot['log'],
+                         team=getattr(self, 'team_name', None))
                 return outcome
             key = request_key(snapshot)
             rejected = previous and (any(line.startswith('|error|') for line in snapshot['log'][previous['log_length']:]) or

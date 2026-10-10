@@ -119,6 +119,47 @@ Results are in `artifacts/value-learning/noise-60.json` (private).
 
 `search/learning_report.py --hours 24` prints this picture at any time.
 
+## Data organised by team
+
+Everything is stored per team (`search/team_data.py`), so a new team never
+mixes into an old team's data:
+
+```
+data/ml/value/teams/index.json        every team: games, wins, losses, positions, dates
+data/ml/value/teams/<team-slug>/
+    team.json                         name, format, team_id (fingerprint), exact sets
+    games.jsonl                       one line per finished live game: room, time, result,
+                                      our and the opponent's rating, turns, opponent preview,
+                                      open team sheets, decisions, positions
+    live/live-<room>.jsonl            labelled live positions (rows carry `team`)
+    selfplay/sp-<n>.jsonl (+ .npz)    self-play with this team as the focus side
+    candidates/value-<sha>.json       value nets trained for this team
+    gates/<sha>-<stage>.jsonl         their paired gates
+    current.json                      the gated value live search uses for this team
+data/ml/browser-runs/<run>/events.jsonl   raw ledgers; each run logs a `team` event and
+                                          every terminal event names its team
+```
+
+Older runs (before the `team` event existed) are identified exactly: several
+saved teams share species and items and differ only in stat points, so a game
+is matched by the exact stats in our requests against each saved team's
+simulator stats. All 308 games through 2026-10-10 are
+`Rain-Recife-special-stat-fix`. `python search/team_data.py` rebuilds the
+catalog; the service does so after every ingest.
+
+### Switching to another team
+
+1. Save the team in `teams.json`.
+2. Live: change `--team` in the `dev.pokemon-showdown.browser-player` plist and
+   reload it between games (SIGTERM finishes the current game first).
+3. Value learning: set `"team"` in `data/ml/value/config.json`. The service
+   starts that team's own self-play, candidates, gates and pointer; the old
+   team's data stays untouched.
+4. PPO preview training: set `training_teams` in `data/ml/autopilot.json`.
+
+For offline training elsewhere, copy `data/ml/value/teams/<slug>/` and
+`data/ml/browser-runs/`.
+
 ## Operate
 
 ```

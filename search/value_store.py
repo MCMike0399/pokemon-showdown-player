@@ -21,7 +21,15 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 VALUE_ROOT = ROOT / 'data' / 'ml' / 'value'
-POINTER = VALUE_ROOT / 'current.json'
+POINTER = VALUE_ROOT / 'current.json'  # legacy, before per-team data (search/team_data.py)
+
+
+def team_pointer(name: str | None) -> Path:
+    """The promotion pointer of one team; values are trained and gated per team."""
+    if not name:
+        return POINTER
+    from search.team_data import TEAMS_ROOT, slug
+    return TEAMS_ROOT / slug(name) / 'current.json'
 
 
 def atomic_json(path: Path, value) -> None:

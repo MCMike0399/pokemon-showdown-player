@@ -191,19 +191,18 @@ def test_ledger_reader_keeps_search_turns_with_outcomes(tmp_path):
 
 
 def test_service_gate_state_machine_promotes_only_after_confirmation(tmp_path, monkeypatch):
+    from search import team_data
     vroot = tmp_path / 'value'
     monkeypatch.setattr(value_service, 'VALUE_ROOT', vroot)
-    monkeypatch.setattr(value_service, 'POINTER', vroot / 'current.json')
-    pointer = vroot / 'current.json'
-    monkeypatch.setattr(value_store, 'POINTER', pointer)
-    monkeypatch.setattr(value_service, 'current_value', lambda: value_store.current_value(pointer))
-    monkeypatch.setattr(value_service, 'promote', lambda c, b, e: value_store.promote(c, b, e, pointer))
+    monkeypatch.setattr(team_data, 'TEAMS_ROOT', vroot / 'teams')
     svc = value_service.Service(tmp_path)
-    cand = vroot / 'candidates' / 'value-x.json'
+    pointer = svc.pointer()
+    assert pointer == vroot / 'teams' / team_data.slug(svc.team) / 'current.json'  # promotions are per team
+    cand = svc.tdir / 'candidates' / 'value-x.json'
     cand.write_text(json.dumps({'layers': [], 'mean': [], 'std': []}))
     sha = value_store.weights_sha(cand)
     svc.state['candidates'] = [{'path': str(cand), 'sha256': sha, 'beta': 0.5, 'status': 'gating:dev',
-                                'val': {}, 'live_test': {}}]
+                                'val': {}, 'live_test': {}, 'team': svc.team}]
     report = tmp_path / 'r.json'
 
     def finish(passed):
@@ -355,7 +354,9 @@ def test_critical_memory_pressure_stops_background_groups(tmp_path, monkeypatch)
     script.parent.mkdir()
     script.write_text('import time\nwhile True: time.sleep(0.05)\n')
     proc = subprocess.Popen([sys.executable, str(script)], start_new_session=True)
+    from search import team_data
     monkeypatch.setattr(value_service, 'VALUE_ROOT', tmp_path / 'value')
+    monkeypatch.setattr(team_data, 'TEAMS_ROOT', tmp_path / 'value' / 'teams')
     svc = value_service.Service(tmp_path)
     svc.state['producers'] = {'1': {'pid': proc.pid, 'shard': 'sp-1.jsonl'}}
     try:
@@ -379,3 +380,35 @@ def test_gate_futility_stop_only_rejects():
     ahead = [dict(r, score=1.0) if r['arm'] == 'cand' else r for r in even]
     s = value_gate.summarize(ahead, 80, 0.05)
     assert not s['complete'] and not s['futility_stop']  # a leading candidate always plays the full panel
+
+
+def test_team_data_is_organised_per_team(tmp_path, monkeypatch):
+    from search import team_data
+    teams = {'Rain A': {'format': FMT, 'sets': OURS}, 'Sun B': {'format': FMT, 'sets': THEIRS}}
+    monkeypatch.setattr(team_data, 'load_teams', lambda: teams)
+    monkeypatch.setattr(team_data, 'team_stats', lambda t: {
+        'Rain A': [('politoed', {'spa': 100, 'hp': 167}), ('archaludon', {'spa': 120, 'hp': 167})],
+        'Sun B': [('garchomp', {'atk': 150}), ('sylveon', {'spa': 130})]})
+    path = team_data.ensure_team('Rain A', tmp_path)
+    assert path == tmp_path / 'rain-a' and all((path / d).is_dir() for d in team_data.SUBDIRS)
+    assert json.loads((path / 'team.json').read_text())['sets'] == OURS
+    request = {'side': {'id': 'p1', 'pokemon': [
+        {'details': 'Politoed, L50, M', 'condition': '167/167', 'stats': {'spa': 100}},
+        {'details': 'Archaludon, L50, F', 'condition': '0 fnt', 'stats': {'spa': 120}}]}}
+    assert team_data.identify(request) == 'Rain A'
+    request['side']['pokemon'][0]['stats'] = {'spa': 99}  # a different spread is a different team
+    assert team_data.identify(request) is None
+    # A run's team event and terminal tag decide ownership; each team gets its own catalog.
+    run = tmp_path / 'runs' / 'r1'
+    run.mkdir(parents=True)
+    log = ['|player|p1|Me|1|1200', '|player|p2|Foe|2|1250', '|poke|p2|Gardevoir, L50, F|', '|turn|1', '|win|Me']
+    events = [{'kind': 'team', 'name': 'Sun B'},
+              {'kind': 'decision', 'room': 'battle-9', 'time': 1, 'request': {'side': {'id': 'p1'}},
+               'decision': {'decider': 'search'}},
+              {'kind': 'terminal', 'time': 2, 'side': 'p1', 'result': {'room': 'battle-9', 'winner': 'Me'},
+               'log': log, 'team': 'Sun B'}]
+    (run / 'events.jsonl').write_text(''.join(json.dumps(e) + '\n' for e in events))
+    index = team_data.build_catalog(tmp_path / 'teams', tmp_path / 'runs')
+    assert index['teams']['Sun B']['games'] == 1 and index['teams']['Sun B']['wins'] == 1
+    game = json.loads((tmp_path / 'teams' / 'sun-b' / 'games.jsonl').read_text())
+    assert game['rating'] == 1200 and game['opp_rating'] == 1250 and game['opp_preview'] == ['Gardevoir']

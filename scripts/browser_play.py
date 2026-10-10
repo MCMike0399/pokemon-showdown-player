@@ -88,6 +88,12 @@ async def run(args):
                     await page.goto('https://play.pokemonshowdown.com/', wait_until='domcontentloaded')
                     await page.wait_for_function('window.app && app.user && window.BattleFormats')
                     player = BrowserPlayer(page, None if args.inspect else Brain(Store(args.root)), log_path=output / 'events.jsonl')
+                    if team:
+                        # Every run and every result names its team: data is organised per
+                        # team (search/team_data.py), so other teams never mix into Rain's.
+                        from ml.teams import team_id
+                        player.team_name = args.team
+                        player.log('team', name=args.team, format=args.format, team_id=team_id(args.format, team['sets']))
                     agent = None
                     if args.search and not args.inspect:
                         from search.agent import SearchAgent
@@ -147,8 +153,8 @@ async def run(args):
                             player.log('matchmaking_checkpoint', **promotion)
                             if agent is not None:
                                 # A gated search value is adopted only between games.
-                                from search.value_store import current_value
-                                value = current_value()
+                                from search.value_store import current_value, team_pointer
+                                value = current_value(team_pointer(args.team))
                                 if value.get('sha256') != agent.value.get('sha256'):
                                     agent.set_value(value.get('path'), value.get('beta', 0.0))
                                     agent.value['sha256'] = value.get('sha256')

@@ -7,8 +7,9 @@ the same tracker, the same usage-prior determinization and the same simulator
 rebuild as `SearchAgent`, then labels it with the game's verified result.
 
 Rows (one per decision per sampled world) are appended to
-`<out>/live-<room>.jsonl`:
-    {x, y, t, g, s, h, w, src: 'live', time, rating}
+`data/ml/value/teams/<team>/live/live-<room>.jsonl` (search/team_data.py):
+    {x, y, t, g, s, h, w, src: 'live', time, rating, team}
+Each game is rebuilt with the exact sets of the team that played it.
 `g` is the room, so training and evaluation can split by game. A room is
 processed once; its file is written atomically.
 
@@ -34,7 +35,6 @@ from search.agent import SearchAgent  # noqa: E402
 from search.tracker import Tracker  # noqa: E402
 
 FMT = 'gen9championsvgc2026regmc'
-DEFAULT_OUT = ROOT / 'data' / 'ml' / 'value' / 'live'
 
 
 def _as_list(log):
@@ -144,38 +144,48 @@ async def game_rows(agent: SearchAgent, room: str, game: dict, team_sets: list[d
 
 
 async def main():
+    from search.team_data import TEAMS_ROOT, build_catalog, ensure_team, load_teams, scan_ledgers
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('--runs', type=Path, default=ROOT / 'data' / 'ml' / 'browser-runs')
-    ap.add_argument('--out', type=Path, default=DEFAULT_OUT)
-    ap.add_argument('--team', default='Rain-Recife-special-stat-fix')
+    ap.add_argument('--teams-root', type=Path, default=TEAMS_ROOT)
+    ap.add_argument('--team', help='only this team (default: every team, each into its own directory)')
     ap.add_argument('--worlds', type=int, default=4)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--force', action='store_true', help='rebuild rooms that already have a file')
     args = ap.parse_args()
-    team = json.loads((ROOT / 'teams.json').read_text())[args.team]['sets']
-    args.out.mkdir(parents=True, exist_ok=True)
+    teams = load_teams()
+    owners = {room: g.get('team') for room, g in scan_ledgers(args.runs).items()}
     agent = SearchAgent(fmt=FMT, worlds=args.worlds, engines=1, seed=args.seed)
-    summary = {'rooms': 0, 'rows': 0, 'skipped': {}, 'new_rooms': 0}
+    summary = {'rooms': 0, 'rows': 0, 'skipped': {}, 'new_rooms': 0, 'by_team': {}}
     try:
         for room, game in load_games(args.runs).items():
             summary['rooms'] += 1
-            path = args.out / ('live-' + room.replace('/', '_') + '.jsonl')
+            name = owners.get(room)
+            if name not in teams or (args.team and name != args.team):
+                summary['skipped']['unknown_team' if name not in teams else 'other_team'] = \
+                    summary['skipped'].get('unknown_team' if name not in teams else 'other_team', 0) + 1
+                continue
+            path = ensure_team(name, args.teams_root) / 'live' / ('live-' + room.replace('/', '_') + '.jsonl')
             if path.exists() and not args.force:
                 continue
             agent.rng = random.Random(f'{args.seed}:{room}')
-            rows, skipped = await game_rows(agent, room, game, team, args.worlds)
+            rows, skipped = await game_rows(agent, room, game, teams[name]['sets'], args.worlds)
             for k, v in skipped.items():
                 if k != 'errors':
                     summary['skipped'][k] = summary['skipped'].get(k, 0) + v
             if not rows:
                 continue
+            for row in rows:
+                row['team'] = name
             tmp = path.with_suffix('.tmp')
             tmp.write_text(''.join(json.dumps(r) + '\n' for r in rows))
             tmp.replace(path)
             summary['rows'] += len(rows)
             summary['new_rooms'] += 1
+            summary['by_team'][name] = summary['by_team'].get(name, 0) + 1
     finally:
         await agent.close()
+    summary['catalog'] = {n: t['games'] for n, t in build_catalog(args.teams_root, args.runs)['teams'].items()}
     print(json.dumps(summary))
 
 
