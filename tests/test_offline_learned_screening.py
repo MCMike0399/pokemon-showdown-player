@@ -227,6 +227,8 @@ def test_service_trains_ranker_after_enough_logged_worlds(tmp_path, monkeypatch)
     assert [n for n, _ in spawned].count('train-screen') == 1
 
 
+@pytest.mark.skipif(not (ROOT / 'cache' / 'dex' / 'gen9championsvgc2026regmc' / 'moves.json').exists(),
+                    reason='needs the local format dex cache (gitignored)')
 def test_agent_collects_records_and_sends_the_ranker(monkeypatch):
     import asyncio
     from search.agent import SearchAgent
