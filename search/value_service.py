@@ -23,6 +23,13 @@ Every tick (default 20 s) it does whatever the host can afford:
 5. Promote: atomic pointer `data/ml/value/current.json`; the live runner reads
    it at the next matchmaking boundary. At most `max_promotions_per_day`.
 
+The same loop learns the search's screening (docs/learned-screening.md): gates
+and live games log the probe screening's results; once enough new worlds are
+logged, `search/train_screen.py` trains a ranker on MPS; a useful one is gated
+for non-inferior play at fewer simulations, ahead of value candidates (it saves
+CPU for every later gate, shard and live turn), and promoted to its own pointer
+`teams/<slug>/screen-current.json`. Every gate plays the deployed screening.
+
 Child processes inherit their lock file descriptors, so a slot stays held for
 exactly the life of the child, even if this supervisor restarts.
 """
@@ -45,12 +52,26 @@ sys.path.insert(0, str(ROOT))
 from search.value_store import (BACKGROUND_PGIDS, VALUE_ROOT, POINTER, _command, atomic_json,  # noqa: E402
                                 current_value, dir_bytes, pack_shard, promote, resume_if_stale, team_pointer)
 from search.team_data import DEFAULT_TEAM, ensure_team  # noqa: E402
+from search.screen_data import current_screen, promote_screen, screen_pointer, screen_root  # noqa: E402
+from search.mlops import SHARD_PREFIX, deploy_inbox, export_bundle, play_fingerprint  # noqa: E402
 
 DATA = ROOT / 'data' / 'ml'
 PY = sys.executable
 TASKPOLICY = '/usr/sbin/taskpolicy'
 DEFAULTS = {
     'enabled': True,
+    # 'full': this host ingests, trains, gates and promotes. 'live': ingest only
+    # (training moved to a trainer host). 'trainer': no ingest, works only inside
+    # a batch campaign (below); a candidate that passes both gates is exported
+    # for the live host to deploy (search/mlops.py).
+    'role': 'full',
+    # Trainer only, written by `mlops campaign start`: {'id', 'selfplay_games'}.
+    # Self-play until that many games, train value + screening once on all data,
+    # gate both, export what passes, then idle until the next campaign.
+    'campaign': None,
+    # Live host: a campaign is due once this many live games arrived since the last
+    # one (`mlops status`, OpenClaw's ps_training_status). Nothing is pushed or notified.
+    'campaign_every_games': 1000,
     'team': DEFAULT_TEAM,           # the deployed team: its data lives in data/ml/value/teams/<slug>/
     'interval_seconds': 20,
     'producers': 4,                 # max concurrent self-play processes
@@ -71,6 +92,14 @@ DEFAULTS = {
     'gate_min_slots': 2,
     'gate_engines': 1,
     'max_promotions_per_day': 1,
+    # Learned screening: train after this many newly logged worlds, gate for
+    # equal results at >= screen_min_sim_saving fewer simulations per decision.
+    'screen_enabled': True,
+    'screen_min_records': 3000,          # first ranker
+    'screen_train_every_records': 6000,  # retrains: more than one two-stage gate logs
+    'screen_max_gb': 6.0,           # stop logging above this (data kept, never deleted)
+    'screen_min_sim_saving': 0.2,
+    'screen_retry_seconds': 3600,
     # Normal QoS uses every core; the live runner pauses these process groups while
     # it decides (search.value_store.LivePriority). 'background' confines a role to
     # the efficiency cores; 'utility' was measured to starve (priority 4, ~17% core).
@@ -152,6 +181,8 @@ class Service:
         self.state.setdefault('trained_rows', 0)
         self.state.setdefault('trained_live_games', 0)
         self.state.setdefault('shard_seq', int(time.time()))
+        self.state.setdefault('screen_candidates', [])
+        self.state.setdefault('screen_trained_records', 0)
         self.children: dict[str, subprocess.Popen] = {}
         self.slots = Slots(data / 'simulator-slots')
         self.policy = None
@@ -168,9 +199,9 @@ class Service:
         if self.state.get('team') not in (None, name):
             # Another team: its own counters, candidates and gates; nothing carries over.
             self.note(f"team changed {self.state.get('team')} -> {name}")
-            for key in ('gate', 'pending_train', 'train_failed_at'):
+            for key in ('gate', 'pending_train', 'train_failed_at', 'pending_screen_train', 'screen_failed_at', 'screen_files'):
                 self.state.pop(key, None)
-            self.state.update(trained_rows=0, trained_live_games=0)
+            self.state.update(trained_rows=0, trained_live_games=0, screen_trained_records=0)
         self.state['team'] = name
 
     def pointer(self) -> Path:
@@ -246,8 +277,10 @@ class Service:
 
     # ------------------------------------------------------------ 2. produce
     def produce(self, cfg: dict, res: dict):
-        running = [s for s, i in self.state['producers'].items()
-                   if f'prod-{s}' in self.children or _alive(i.get('pid'))]
+        camp = self.state.get('campaign') if cfg['role'] == 'trainer' else None
+        if camp and (camp['phase'] != 'selfplay' or camp['scheduled_games'] >= camp['selfplay_games']):
+            return
+        running = self.running_producers()
         if len(running) >= cfg['producers'] or not res['training_allowed'] or res['allowed_workers'] < 1:
             return
         if self.state.get('gate') and 'gate' not in self.children and not self.state['gate'].get('pid'):
@@ -259,7 +292,9 @@ class Service:
             return
         self.state['shard_seq'] += 1
         seq = self.state['shard_seq']
-        shard = self.tdir / 'selfplay' / f'sp-{seq}.jsonl'
+        # Trainer shards get their own prefix: both hosts' shards end up in one directory.
+        prefix = SHARD_PREFIX if cfg['role'] == 'trainer' else 'sp'
+        shard = self.tdir / 'selfplay' / f'{prefix}-{seq}.jsonl'
         argv = ['node', '--max-old-space-size=768', str(ROOT / 'search' / 'selfplay.cjs'),
                 str(self.vroot / 'pool-teams.json'), str(self.tdir / 'team.json'),
                 str(cfg['games_per_shard']), str(seq % 2_000_000_000), str(shard),
@@ -271,6 +306,11 @@ class Service:
                           qos=cfg['qos']['producer'])
         self.state['producers'][str(seq)] = {'pid': proc.pid, 'shard': str(shard), 'started': time.time(),
                                              'value': value.get('sha256')}
+        if camp:
+            camp['scheduled_games'] += cfg['games_per_shard']
+
+    def running_producers(self) -> list[str]:
+        return [s for s, i in self.state['producers'].items() if f'prod-{s}' in self.children or _alive(i.get('pid'))]
 
     def finish_producer(self, name: str, code: int):
         seq = name.split('-', 1)[1]
@@ -291,10 +331,15 @@ class Service:
         if time.time() - self.state.get('train_failed_at', 0) < cfg['train_retry_seconds']:
             return  # a failed run reloads up to train_max_rows: never retry in a tight loop
         rows, live = self.selfplay_rows(), self.live_games()
-        new_rows = rows - self.state['trained_rows']
-        new_live = live - self.state['trained_live_games']
-        if new_rows < cfg['train_every_rows'] and not (new_live >= cfg['train_every_live_games'] and rows >= 20000):
-            return
+        camp = self.state.get('campaign') if cfg['role'] == 'trainer' else None
+        if camp:
+            if camp['phase'] != 'train' or camp['value_trained']:
+                return  # one training run per campaign, on all of its data
+        else:
+            new_rows = rows - self.state['trained_rows']
+            new_live = live - self.state['trained_live_games']
+            if new_rows < cfg['train_every_rows'] and not (new_live >= cfg['train_every_live_games'] and rows >= 20000):
+                return
         lock = (self.data / 'worker.lock').open('a')  # the PPO learner's lock: one GPU learner at a time
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -319,6 +364,9 @@ class Service:
             self.note(f'training failed code={code}; retry after backoff')
             self.state['train_failed_at'] = time.time()
             return
+        camp = self.state.get('campaign')
+        if camp and camp.get('phase') == 'train':
+            camp['value_trained'] = True  # a run that finished, useful or not, is the campaign's one run
         if 'path' not in report:
             self.note(f"training produced no candidate: {str(report)[:200]}")
             self.state['train_failed_at'] = time.time()
@@ -335,61 +383,201 @@ class Service:
         self.note(f"candidate {cand['sha256'][:12]} {cand['status']} beta={cand['beta']} "
                   f"live_test={(cand['live_test'] or {}).get('learned')}")
 
+    # ------------------------------------------------------------ 3b. screening ranker
+    def screen_records(self) -> int:
+        """Logged worlds in this team's screen dir (per-file counts cached in the state)."""
+        import numpy as np
+        known = self.state.setdefault('screen_files', {})
+        total = 0
+        present = set()
+        for path in screen_root(self.team).glob('*.npz'):
+            if path.name.endswith('.tmp.npz'):
+                continue
+            present.add(path.name)
+            if path.name not in known:
+                try:
+                    with np.load(path, allow_pickle=False) as data:
+                        known[path.name] = int(len(data['turn']))
+                except (OSError, ValueError, KeyError, EOFError):
+                    known[path.name] = 0
+            total += known[path.name]
+        for name in set(known) - present:
+            del known[name]
+        return total
+
+    def screen_log_allowed(self, cfg: dict) -> bool:
+        return bool(cfg['screen_enabled']) and dir_bytes(screen_root(self.team)) <= cfg['screen_max_gb'] * 2**30
+
+    def maybe_train_screen(self, cfg: dict, res: dict):
+        if not cfg['screen_enabled'] or 'train' in self.children or 'train-screen' in self.children:
+            return
+        if not res['training_allowed']:
+            return
+        if time.time() - self.state.get('screen_failed_at', 0) < cfg['screen_retry_seconds']:
+            return
+        records = self.screen_records()
+        trained = self.state['screen_trained_records']
+        camp = self.state.get('campaign') if cfg['role'] == 'trainer' else None
+        if camp:
+            if camp['phase'] != 'train' or camp['screen_trained']:
+                return
+            if records < cfg['screen_min_records']:
+                camp['screen_trained'] = True
+                self.note(f'campaign: {records} logged worlds, too few for a screening ranker; skipped')
+                return
+        elif records - trained < (cfg['screen_train_every_records'] if trained else cfg['screen_min_records']):
+            return
+        lock = (self.data / 'worker.lock').open('a')  # one GPU learner at a time, as for values
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            lock.close()
+            return
+        out = self.vroot / 'logs' / f'train-screen-{int(time.time())}.json'
+        self.state['pending_screen_train'] = {'records': records, 'started': time.time(), 'report': str(out)}
+        argv = [PY, str(ROOT / 'search' / 'train_screen.py'), '--team', self.team]
+        self.spawn('train-screen', ['/bin/sh', '-c', 'exec ' + ' '.join(_q(a) for a in argv) + ' > ' + _q(str(out))],
+                   [lock], self.vroot / 'logs' / 'train-screen.log', nice=5, qos=None)
+        self.note(f'training screening ranker on {records} logged worlds')
+
+    def finish_train_screen(self, code: int):
+        pending = self.state.pop('pending_screen_train', {})
+        try:
+            report = json.loads(Path(pending['report']).read_text().strip().splitlines()[-1])
+        except (OSError, ValueError, KeyError, IndexError):
+            report = {}
+        if 'path' not in report:
+            self.note(f'screen training failed code={code}; retry after backoff')
+            self.state['screen_failed_at'] = time.time()
+            return
+        camp = self.state.get('campaign')
+        if camp and camp.get('phase') == 'train':
+            camp['screen_trained'] = True
+        self.state['screen_trained_records'] = pending['records']
+        cand = {'kind': 'screen', 'team': self.team, 'path': report['path'], 'sha256': report['sha256'],
+                'useful': report['useful'], 'prefilter': report.get('prefilter'),
+                'estimated_sim_saving': report.get('estimated_sim_saving'), 'records': pending['records'],
+                'trained_at': time.time(), 'status': 'trained'}
+        if not cand['useful']:
+            cand['status'] = 'rejected: prefilter loses probe choices or saves too little'
+        self.state['screen_candidates'] = (self.state['screen_candidates'] + [cand])[-30:]
+        self.note(f"screen candidate {cand['sha256'][:12]} {cand['status']} prefilter={cand['prefilter']} "
+                  f"saving={cand['estimated_sim_saving']}")
+
     # ------------------------------------------------------------ 4. gate / 5. promote
+    def _promotions_today(self, items: list[dict]) -> int:
+        day = time.time() - 86400
+        return len([c for c in items if max(c.get('promoted_at', 0), c.get('exported_at', 0)) > day
+                    and c.get('team', DEFAULT_TEAM) == self.team])
+
+    def _next_gate(self, cfg: dict) -> dict | None:
+        """Screening candidates first (a promoted ranker makes every later gate cheaper),
+but never twice in a row while a value candidate waits, so neither loop starves."""
+        kinds = [('screen', self.state['screen_candidates']), ('value', self.state['candidates'])]
+        if self.state.get('last_gate_kind') == 'screen':
+            kinds.reverse()
+        for kind, items in kinds:
+            if kind == 'screen' and not cfg['screen_enabled']:
+                continue
+            waiting = [c for c in items if c['status'] == 'trained' and c.get('team', DEFAULT_TEAM) == self.team]
+            if not waiting or self._promotions_today(items) >= cfg['max_promotions_per_day']:
+                continue
+            cand = waiting[-1]  # newest data wins; older trained candidates are superseded
+            for c in waiting[:-1]:
+                c['status'] = 'superseded'
+            return {'kind': kind, 'sha256': cand['sha256'], 'stage': 'dev', 'incumbent': current_value(self.pointer()),
+                    'screen_incumbent': current_screen(screen_pointer(self.team))}
+        return None
+
+    def _gate_candidate(self, gate: dict) -> dict | None:
+        items = self.state['screen_candidates'] if gate.get('kind') == 'screen' else self.state['candidates']
+        return next((c for c in items if c['sha256'] == gate.get('sha256')), None)
+
     def maybe_gate(self, cfg: dict, res: dict):
         if 'gate' in self.children:
             return
+        camp = self.state.get('campaign') if cfg['role'] == 'trainer' else None
+        if camp and camp['phase'] != 'gate':
+            return  # a campaign gates only after all its training, so its gates chain
         gate = self.state.get('gate')
         if gate and gate.get('pid'):
             if _alive(gate['pid']):
+                if gate.get('code') and gate['code'] != play_fingerprint():
+                    # Adopted after a code update: its result could never be deployed.
+                    try:
+                        os.killpg(gate['pid'], signal.SIGCONT)
+                        os.killpg(gate['pid'], signal.SIGTERM)
+                    except OSError:
+                        pass
+                    cand = self._gate_candidate(gate)
+                    if cand is not None:
+                        cand['status'] = 'stale: play code changed during gating'
+                    self.state.pop('gate', None)
+                    self.note(f"gate {gate['sha256'][:12]} stopped: play code changed")
                 return  # a gate started by a previous supervisor still owns its slots and results file
             gate.pop('pid')
             self.finish_gate(-1, cfg)
             gate = self.state.get('gate')
         if gate is None:
-            waiting = [c for c in self.state['candidates'] if c['status'] == 'trained'
-                       and c.get('team', DEFAULT_TEAM) == self.team]
-            if not waiting:
+            gate = self._next_gate(cfg)
+            if gate is None:
                 return
-            day = time.time() - 86400
-            promos = [c for c in self.state['candidates'] if c.get('promoted_at', 0) > day
-                      and c.get('team', DEFAULT_TEAM) == self.team]
-            if len(promos) >= cfg['max_promotions_per_day']:
-                return
-            cand = waiting[-1]  # newest data wins; older trained candidates are superseded
-            for c in waiting[:-1]:
-                c['status'] = 'superseded'
-            gate = {'sha256': cand['sha256'], 'stage': 'dev', 'incumbent': current_value(self.pointer())}
             self.state['gate'] = gate
         if not res['training_allowed'] or res['allowed_workers'] < 1:
             return
-        cand = next(c for c in self.state['candidates'] if c['sha256'] == gate['sha256'])
+        cand = self._gate_candidate(gate)
+        if cand is None:
+            self.state.pop('gate', None)
+            return
+        code = play_fingerprint()
+        if gate.setdefault('code', code) != code:
+            # Both stages must measure the play code that will be deployed.
+            cand['status'] = 'stale: play code changed during gating'
+            self.state.pop('gate', None)
+            self.note(f"gate {gate['sha256'][:12]} discarded: play code changed")
+            return
         handles = self.slots.acquire(res['slot_pool'] + cfg['slot_limit_extra'], cfg['gate_slots'])
         if len(handles) < cfg['gate_min_slots']:
             for h in handles:
                 h.close()
             return
         inc = gate['incumbent']
+        # Gates started before learned screening existed ran under probe screening.
+        screen_inc = gate.setdefault('screen_incumbent', {'path': None, 'sha256': None})
         out = self.tdir / 'gates' / f"{gate['sha256'][:16]}-{gate['stage']}.jsonl"
         seed = int(gate['sha256'][:8], 16) + (0 if gate['stage'] == 'dev' else 7_777_777)
-        argv = [PY, str(ROOT / 'search' / 'value_gate.py'), '--candidate', cand['path'], '--beta', str(cand['beta']),
-                '--pairs', str(cfg['gate_pairs']), '--concurrency', str(len(handles)), '--engines', str(cfg['gate_engines']),
-                '--alpha', str(cfg['gate_alpha']), '--seed', str(seed), '--out', str(out), '--team', self.team]
-        if inc.get('path'):
-            argv += ['--incumbent', inc['path'], '--incumbent-beta', str(inc['beta'])]
+        common = ['--pairs', str(cfg['gate_pairs']), '--concurrency', str(len(handles)), '--engines', str(cfg['gate_engines']),
+                  '--alpha', str(cfg['gate_alpha']), '--seed', str(seed), '--out', str(out), '--team', self.team]
+        if gate.get('kind') == 'screen':
+            # Same value in both arms (the deployed one); only the screening differs.
+            argv = [PY, str(ROOT / 'search' / 'value_gate.py'), *common, '--cand-screen', cand['path'],
+                    '--rule', 'noninferior', '--min-sim-saving', str(cfg['screen_min_sim_saving'])]
+            if inc.get('path'):
+                argv += ['--candidate', inc['path'], '--beta', str(inc['beta']),
+                         '--incumbent', inc['path'], '--incumbent-beta', str(inc['beta'])]
+            if screen_inc.get('path'):
+                argv += ['--inc-screen', screen_inc['path']]
+        else:
+            argv = [PY, str(ROOT / 'search' / 'value_gate.py'), '--candidate', cand['path'], '--beta', str(cand['beta']), *common]
+            if inc.get('path'):
+                argv += ['--incumbent', inc['path'], '--incumbent-beta', str(inc['beta'])]
+            if screen_inc.get('path'):  # both arms and the opponent play the deployed screening
+                argv += ['--cand-screen', screen_inc['path'], '--inc-screen', screen_inc['path']]
+        if self.screen_log_allowed(cfg):
+            argv += ['--screen-log-dir', str(screen_root(self.team))]
         report = self.vroot / 'logs' / f"gate-{gate['sha256'][:16]}-{gate['stage']}.json"
         gate['report'] = str(report)
         cand['status'] = 'gating:' + gate['stage']
         proc = self.spawn('gate', ['/bin/sh', '-c', 'exec ' + ' '.join(_q(a) for a in argv) + ' > ' + _q(str(report))],
                           handles, self.vroot / 'logs' / 'gate.log', nice=5, qos=cfg['qos']['gate'])
         gate['pid'] = proc.pid
-        self.note(f"gate {gate['stage']} {gate['sha256'][:12]} with {len(handles)} slots vs "
-                  f"{(inc.get('sha256') or 'hand')[:12]}")
+        self.note(f"gate {gate.get('kind', 'value')} {gate['stage']} {gate['sha256'][:12]} with {len(handles)} slots vs "
+                  f"{(inc.get('sha256') or 'hand')[:12]} / screening {(screen_inc.get('sha256') or 'probe')[:12]}")
 
     def finish_gate(self, code: int, cfg: dict):
         gate = self.state.get('gate') or {}
         gate.pop('pid', None)
-        cand = next((c for c in self.state['candidates'] if c['sha256'] == gate.get('sha256')), None)
+        cand = self._gate_candidate(gate)
         try:
             result = json.loads(Path(gate['report']).read_text().strip().splitlines()[-1])
         except (OSError, ValueError, KeyError, IndexError):
@@ -398,6 +586,7 @@ class Service:
         if not result.get('complete'):
             self.note('gate incomplete; will resume')
             return
+        self.state['last_gate_kind'] = gate.get('kind', 'value')
         if cand is None:
             self.state.pop('gate', None)
             return
@@ -413,16 +602,81 @@ class Service:
             cand['status'] = 'trained'  # keeps it eligible; the gate record carries the stage
             self.note(f"candidate {cand['sha256'][:12]} passed development; confirming on fresh seeds")
             return
-        if current_value(self.pointer()).get('sha256') != (gate['incumbent'] or {}).get('sha256'):
+        screen_now = current_screen(screen_pointer(self.team)).get('sha256')
+        if (current_value(self.pointer()).get('sha256') != (gate['incumbent'] or {}).get('sha256')
+                or screen_now != (gate.get('screen_incumbent') or {}).get('sha256')):
             cand['status'] = 'stale: incumbent changed during gating'
             self.state.pop('gate', None)
             return
-        record = promote(Path(cand['path']), cand['beta'], {'team': self.team, 'gates': cand['gates'], 'val': cand['val'],
-                                                            'live_test': cand['live_test']}, self.pointer())
-        cand['status'] = 'promoted'
-        cand['promoted_at'] = record['promoted_at']
+        # Every promotion goes through search/mlops.deploy_inbox: one locked check-and-move
+        # and one promotion ledger, whether the bundle came from here or from the trainer.
+        kind = gate.get('kind', 'value')
+        trainer = cfg['role'] == 'trainer'
+        bundle = export_bundle(kind, cand, gate, self.team, value_root=self.vroot, box='outbox' if trainer else 'inbox')
+        cand['exported_at'] = time.time()
         self.state.pop('gate', None)
-        self.note(f"PROMOTED {cand['sha256'][:12]} beta={cand['beta']}")
+        if trainer:
+            # The trainer's own pointer (overwritten by the live host's at the next campaign
+            # start) makes it the incumbent of this campaign's later gates. The live host
+            # deploys bundles in export order, so each one's incumbents still match.
+            if kind == 'screen':
+                promote_screen(Path(cand['path']), {'team': self.team, 'campaign_incumbent': True}, self.tdir / 'screen-current.json')
+            else:
+                promote(Path(cand['path']), cand['beta'], {'team': self.team, 'campaign_incumbent': True}, self.tdir / 'current.json')
+            cand['status'] = 'exported'
+            self.note(f"EXPORTED {kind} {cand['sha256'][:12]} -> {bundle.name} for the live host")
+            return
+        results = deploy_inbox(value_root=self.vroot, only=bundle.name)
+        outcome = results[0]['status'] if results else 'exported'
+        cand['status'] = 'promoted' if outcome == 'deployed' else outcome
+        if outcome == 'deployed':
+            cand['promoted_at'] = time.time()
+        self.note(f"{'PROMOTED' if outcome == 'deployed' else 'NOT PROMOTED'} {kind} {cand['sha256'][:12]}: {outcome}")
+
+    # ------------------------------------------------------------ batch campaign (trainer)
+    def campaign(self, cfg: dict) -> dict | None:
+        """The trainer's campaign from its config; a new id starts a fresh one."""
+        spec = cfg.get('campaign')
+        if cfg['role'] != 'trainer' or not spec:
+            return None
+        camp = self.state.get('campaign')
+        if not camp or camp.get('id') != spec['id']:
+            # Only this campaign's candidates are trained, gated and exported.
+            for items in (self.state['candidates'], self.state['screen_candidates']):
+                for c in items:
+                    if c['status'] == 'trained' or c['status'].startswith('gating'):
+                        c['status'] = 'superseded'
+            gate = self.state.pop('gate', None) or {}
+            if gate.get('pid') and _alive(gate['pid']):
+                try:
+                    os.killpg(gate['pid'], signal.SIGTERM)
+                except OSError:
+                    pass
+            camp = {'id': spec['id'], 'selfplay_games': int(spec['selfplay_games']), 'scheduled_games': 0,
+                    'phase': 'selfplay', 'started_at': time.time(), 'value_trained': False, 'screen_trained': False}
+            self.state['campaign'] = camp
+            self.note(f"campaign {camp['id']} started: {camp['selfplay_games']} self-play games, then train and gate")
+        return camp
+
+    def advance_campaign(self, camp: dict, cfg: dict):
+        if camp['phase'] == 'selfplay' and camp['scheduled_games'] >= camp['selfplay_games'] \
+                and not self.running_producers():
+            camp['phase'] = 'train'
+            self.scan_shards()
+            self.note(f"campaign {camp['id']}: self-play done ({self.selfplay_rows()} rows); training")
+        if camp['phase'] == 'train' and camp['value_trained'] and (camp['screen_trained'] or not cfg['screen_enabled']) \
+                and 'train' not in self.children and 'train-screen' not in self.children:
+            camp['phase'] = 'gate'
+            self.note(f"campaign {camp['id']}: trained; gating")
+        if camp['phase'] == 'gate' and not self.state.get('gate'):
+            waiting = [c for items in (self.state['candidates'], self.state['screen_candidates'])
+                       for c in items if c['status'] == 'trained' and c.get('team', DEFAULT_TEAM) == self.team]
+            if not waiting:
+                camp['phase'] = 'done'
+                camp['finished_at'] = time.time()
+                camp['exported'] = [c['sha256'][:16] for items in (self.state['candidates'], self.state['screen_candidates'])
+                                    for c in items if c.get('exported_at', 0) >= camp['started_at']]
+                self.note(f"campaign {camp['id']} DONE: exported {camp['exported'] or 'nothing'}")
 
     # ------------------------------------------------------------ loop
     def reap(self, cfg: dict):
@@ -435,6 +689,8 @@ class Service:
                 self.finish_producer(name, code)
             elif name == 'train':
                 self.finish_train(code)
+            elif name == 'train-screen':
+                self.finish_train_screen(code)
             elif name == 'gate':
                 self.finish_gate(code, cfg)
             elif name == 'ingest':
@@ -480,6 +736,7 @@ from its results file. New work starts again once admission allows it."""
             if not _alive(info.get('pid')):
                 self.finish_producer('prod-' + seq, -1)
         self.state.pop('pending_train', None)
+        self.state.pop('pending_screen_train', None)
         self.scan_shards()
 
     def scan_shards(self):
@@ -498,10 +755,16 @@ from its results file. New work starts again once admission allows it."""
         return {'pid': os.getpid(), 'updated_at': time.time(), 'enabled': cfg['enabled'],
                 'children': {n: p.pid for n, p in self.children.items()},
                 'orphan_producers': [s for s, i in self.state['producers'].items() if f'prod-{s}' not in self.children],
-                'team': self.team, 'team_dir': str(self.tdir),
+                'role': cfg['role'], 'campaign': self.state.get('campaign'), 'team': self.team, 'team_dir': str(self.tdir),
                 'selfplay_rows': self.selfplay_rows(), 'selfplay_gb': round(dir_bytes(self.tdir / 'selfplay') / 2**30, 3),
                 'live_games': self.live_games(), 'trained_rows': self.state['trained_rows'],
                 'gate': self.state.get('gate'), 'current': current_value(self.pointer()),
+                'screen': {'current': current_screen(screen_pointer(self.team)),
+                           'logged_worlds': self.screen_records(),
+                           'trained_worlds': self.state['screen_trained_records'],
+                           'gb': round(dir_bytes(screen_root(self.team)) / 2**30, 3),
+                           'candidates': [{k: c.get(k) for k in ('sha256', 'status', 'prefilter', 'estimated_sim_saving')}
+                                          for c in self.state['screen_candidates'][-5:]]},
                 'candidates': [{k: c.get(k) for k in ('sha256', 'status', 'beta', 'trained_at')} for c in self.state['candidates'][-8:]],
                 'resources': {k: res.get(k) for k in ('available_gb', 'system_cpu_percent', 'allowed_workers',
                                                       'memory_pressure', 'training_allowed', 'slot_pool')},
@@ -531,13 +794,20 @@ from its results file. New work starts again once admission allows it."""
             self.shed(res)
             self.publish_pgids()
             resume_if_stale()
-            self.ingest()
+            if cfg['role'] != 'trainer':  # the trainer receives live positions with each campaign
+                self.ingest()
             if int(time.time()) % 300 < cfg['interval_seconds']:
                 self.scan_shards()
-            if cfg['enabled']:
+            camp = self.campaign(cfg)
+            # The trainer works only inside a campaign; between campaigns it idles.
+            working = cfg['role'] == 'full' or (cfg['role'] == 'trainer' and camp and camp['phase'] != 'done')
+            if cfg['enabled'] and working:
                 self.maybe_gate(cfg, res)
                 self.maybe_train(cfg, res)
+                self.maybe_train_screen(cfg, res)
                 self.produce(cfg, res)
+                if camp:
+                    self.advance_campaign(camp, cfg)
             self.save()
             atomic_json(self.vroot / 'service-status.json', self.status(res, cfg))
             if once:

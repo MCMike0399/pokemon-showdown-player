@@ -108,7 +108,8 @@ class SearchAgent:
                  preview=None, seed: int = 0, usage_cutoff: str = '0', opp_no_switch: bool = False,
                  keep_nonmega: bool = False, log=None, screen=None, value_path=None, value_beta=0.0, value_scale=8.0, preview_mode='incumbent', preview_worlds=6,
                  crn: bool = False, adaptive_margin: float | None = None, adaptive_worlds: int = 0,
-                 adaptive_max_ms: float = 6000.0, engine_timeout: float = 120.0):
+                 adaptive_max_ms: float = 6000.0, engine_timeout: float = 120.0, screen_model=None,
+                 screen_log: float = 0.0):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -133,16 +134,36 @@ class SearchAgent:
         self.adaptive_worlds = adaptive_worlds
         self.adaptive_max_ms = adaptive_max_ms
         self.engine_timeout = engine_timeout
-        self.stats = {'decisions': 0, 'ms': 0.0, 'fallbacks': 0, 'errors': []}
+        # Learned screening (search/screen_data.py): a ranker replaces most probe
+        # simulations. `screen_log` is the chance that a decision logs one world's
+        # full probe results as training labels; a separate RNG keeps the world
+        # samples identical with and without logging.
+        self.screen_model = None
+        self.set_screen(screen_model)
+        self.screen_log = float(screen_log or 0.0)
+        self.log_rng = random.Random(seed + 7919)
+        self.screen_records: list[dict] = []
+        self.stats = {'decisions': 0, 'ms': 0.0, 'fallbacks': 0, 'errors': [], 'sims': 0}
         self.last_trace = None
 
     def set_value(self, path=None, beta=0.0, scale=8.0):
         """Swap the leaf evaluation between games; engines load a path once and cache it."""
         self.value = {'value_path': str(path) if path else None, 'value_beta': float(beta or 0), 'value_scale': scale}
 
+    def set_screen(self, model=None):
+        """Swap probe screening for a learned ranker (or back, with None) between games."""
+        from search.screen_data import engine_model
+        learned = engine_model(model)
+        self.screen_model = {**learned, 'sha256': (model or {}).get('sha256')} if learned else None
+
+    def take_screen_records(self) -> list[dict]:
+        out, self.screen_records = self.screen_records, []
+        return out
+
     def reseed(self, seed):
         """Deterministic world sampling per game, so paired arms see the same worlds."""
         self.rng = random.Random(seed)
+        self.log_rng = random.Random(seed + 7919)
 
     async def close(self):
         for e in self.engines:
@@ -375,19 +396,32 @@ class SearchAgent:
         for _ in range(n_worlds or self.n_worlds):
             worlds.append({'p1': our_side, 'p2': self._their_side(tracker, rng)})
         field = self._field(tracker)
+        screen = self.screen
+        if screen and self.screen_model:
+            screen = {**screen, 'learned': {k: self.screen_model[k] for k in ('path', 'pre_opp', 'pre_ours')}}
+        log = 1 if screen and self.screen_log and self.log_rng.random() < self.screen_log else 0
+        # The logged world runs full probes under a ranker: spread it over the
+        # engines, so one engine does not always set the decision's wall time.
+        log_engine = self.log_rng.randrange(len(self.engines)) if log else -1
         base = {'type': 'search', 'format': self.fmt, 'field': field, 'our_choices': our_choices,
                 'seeds': self.seeds, 'alpha': self.alpha, 'opp_tau': self.opp_tau,
-                'max_opp': self.max_opp, 'opp_no_switch': self.opp_no_switch, 'screen': self.screen, 'crn': self.crn,
+                'max_opp': self.max_opp, 'opp_no_switch': self.opp_no_switch, 'screen': screen, 'crn': self.crn,
                 **self.value}
         n = len(self.engines)
         chunks = [worlds[i::n] for i in range(n)]
         calls = []
         for k, (engine, chunk) in enumerate(zip(self.engines, chunks)):
             if chunk:
-                calls.append(engine.call({**base, 'worlds': chunk, 'world_offset': k * 1000 + rng.randrange(1000)},
+                calls.append(engine.call({**base, 'worlds': chunk, 'world_offset': k * 1000 + rng.randrange(1000),
+                                          'screen_log': log if k == log_engine else 0},
                                          timeout=self.engine_timeout))
         outs = await asyncio.gather(*calls)
         results = [r for out in outs for r in out['results']]
+        for r in results:
+            record = r.pop('screen_record', None)
+            if record is not None:
+                self.screen_records.append({'turn': tracker.turn, 'record': record})
+            self.stats['sims'] += r.get('sims') or 0
         return results
 
     async def _move(self, ctx: dict) -> str:
@@ -445,7 +479,9 @@ class SearchAgent:
             'n_ours': max((r.get('n_ours') or 0) for r in results), 'n_theirs': max((r.get('n_theirs') or 0) for r in results),
             'root_eq': round(sum(r['eq'] for r in roots) / len(roots), 4) if roots else None,
             'root_hand': round(sum(r['hand'] for r in roots) / len(roots), 4) if roots else None,
-            'value': {'path': self.value.get('value_path'), 'beta': self.value.get('value_beta')}, 'crn': self.crn}
+            'value': {'path': self.value.get('value_path'), 'beta': self.value.get('value_beta')}, 'crn': self.crn,
+            'screen_sims': sum(r.get('screen_sims') or 0 for r in results),
+            'screen': (self.screen_model or {}).get('sha256')}
         if self.log is not None:
             top = sorted(scored.items(), key=lambda kv: -kv[1])[:5]
             self.log.append({'turn': tracker.turn, 'top': top, 'errors': errors[:2],

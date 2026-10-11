@@ -11,6 +11,14 @@ the frozen incumbent actor, as live.
 Decision rule (preregistered, no peeking): play all `--pairs`; one-sided exact
 sign test on discordant pairs; pass iff p <= alpha AND gains > losses. Results
 are appended to `<out>` (JSONL) and the run resumes after interruption.
+
+The same harness gates a learned screening ranker (`--cand-screen`), where the
+arms differ ONLY in screening. Its purpose is to save simulator CPU at equal
+strength, so it uses `--rule noninferior`: pass iff the panel completes with
+gains >= losses AND the candidate's simulations per decision are at most
+(1 - --min-sim-saving) of the incumbent's; reject early once losses exceed
+gains by 5 after 40 pairs. Both stages (development, confirmation on fresh
+seeds) must pass, as for values.
 """
 from __future__ import annotations
 
@@ -58,7 +66,10 @@ def _score(r: dict):
     return None if r.get('win') is None else float(r['win'])
 
 
-def summarize(rows: list[dict], pairs: int, alpha: float) -> dict:
+NONINFERIOR_FUTILITY = 5
+
+
+def summarize(rows: list[dict], pairs: int, alpha: float, rule: str = 'superior', min_sim_saving: float = 0.0) -> dict:
     """A pair counts once both arms have a result; ties are concordant.
 
 An arm that errored MAX_ATTEMPTS times voids its pair (never retried with a
@@ -80,18 +91,37 @@ different seed, which would break the pairing), so a gate always terminates.
     gains = sum(1 for c, i in complete if c > i)
     losses = sum(1 for c, i in complete if i > c)
     p = sign_test(gains, losses)
-    futile = len(complete) >= min(FUTILITY_FROM, pairs) and gains <= losses and len(complete) + void < pairs
+    early = len(complete) >= min(FUTILITY_FROM, pairs) and len(complete) + void < pairs
+    if rule == 'noninferior':
+        futile = early and losses - gains >= NONINFERIOR_FUTILITY
+    else:
+        futile = early and gains <= losses
     done = len(complete) + void >= pairs or futile
+    sims = {arm: [r['sims'] / r['decisions'] for r in rows if r.get('arm') == arm and _score(r) is not None
+                  and r.get('sims') and r.get('decisions')] for arm in ('cand', 'inc')}
+    ratio = (sum(sims['cand']) / len(sims['cand'])) / (sum(sims['inc']) / len(sims['inc'])) \
+        if sims['cand'] and sims['inc'] else None
+    if rule == 'noninferior':
+        passed = done and not futile and gains >= losses and ratio is not None and ratio <= 1 - min_sim_saving
+    else:
+        passed = done and not futile and p <= alpha and gains > losses
     return {'pairs_complete': len(complete), 'pairs_void': void, 'pairs_planned': pairs,
             'candidate_score': sum(c for c, _ in complete), 'incumbent_score': sum(i for _, i in complete),
-            'gains': gains, 'losses': losses, 'p_one_sided': round(p, 5),
+            'gains': gains, 'losses': losses, 'p_one_sided': round(p, 5), 'rule': rule,
+            'sims_ratio': round(ratio, 4) if ratio is not None else None,
             'errors': sum(1 for r in rows if r.get('error')), 'complete': done, 'futility_stop': futile,
-            'passed': bool(done and not futile and p <= alpha and gains > losses)}
+            'passed': bool(passed)}
 
 
 async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, concurrency: int, seed: int,
-                   team: list[dict], pool: list[list[dict]], engines: int, alpha: float, log=print) -> dict:
+                   team: list[dict], pool: list[list[dict]], engines: int, alpha: float, log=print,
+                   rule: str = 'superior', min_sim_saving: float = 0.0, screen_log_dir: Path | None = None) -> dict:
+    """`candidate`/`incumbent`: {'path', 'beta', 'screen'}; 'screen' is a learned
+screening model (search.screen_data) or None for probe screening. The opponent
+always plays the incumbent's screening and the hand evaluation."""
     from search.agent import SearchAgent
+    from search.screen_data import write_records
+    summary = lambda: summarize(rows, pairs, alpha, rule, min_sim_saving)  # noqa: E731
     out.parent.mkdir(parents=True, exist_ok=True)
     rows = [json.loads(line) for line in out.read_text().splitlines() if line.strip()] if out.exists() else []
     attempts: dict = {}
@@ -106,7 +136,7 @@ async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, conc
 
     async def one(pair: int, arm: str):
         while attempts.get((pair, arm), 0) < MAX_ATTEMPTS:
-            if summarize(rows, pairs, alpha)['complete']:
+            if summary()['complete']:
                 return  # decided (futility stop): skip games not yet started
             attempts[(pair, arm)] = attempts.get((pair, arm), 0) + 1
             if await attempt(pair, arm):
@@ -123,9 +153,11 @@ async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, conc
             # background cores, so lift the bound to measure the intended policy.
             us = SearchAgent(fmt=FMT, preview=preview, seed=game_seed,
                              **agent_kwargs(engines=engines, adaptive_max_ms=1e9, engine_timeout=900.0),
-                             value_path=value.get('path'), value_beta=value.get('beta', 0.0))
+                             value_path=value.get('path'), value_beta=value.get('beta', 0.0),
+                             screen_model=value.get('screen'))
             them = SearchAgent(fmt=FMT, preview=preview, seed=game_seed + 1,
-                               **agent_kwargs(engines=1, adaptive_max_ms=1e9, engine_timeout=900.0))
+                               **agent_kwargs(engines=1, adaptive_max_ms=1e9, engine_timeout=900.0),
+                               screen_model=incumbent.get('screen'))
             us.reseed(game_seed * 2 + 1)
             them.reseed(game_seed * 2 + 2)
             t0 = time.time()
@@ -138,7 +170,14 @@ async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, conc
                        'unfinished': bool(r.get('unfinished')), 'turns': r.get('turns'),
                        'side': us_side, 'opp_team': order[pair % len(order)], 'seconds': round(time.time() - t0, 1),
                        'fallbacks': us.stats['fallbacks'], 'decisions': us.stats['decisions'],
+                       'sims': us.stats['sims'],
                        'ms': round(us.stats['ms'] / max(1, us.stats['decisions']), 1)}
+                if screen_log_dir is not None:
+                    # Probe results are free labels for the screening ranker.
+                    for who, agent in (('us', us), ('them', them)):
+                        write_records(agent.take_screen_records(),
+                                      Path(screen_log_dir) / f'gate-{out.stem}-{pair}-{arm}-{who}.npz',
+                                      f'gate-{out.stem}-{pair}-{arm}-{who}')
                 if us.stats['fallbacks'] or them.stats['fallbacks']:
                     # A fallback move is an infrastructure failure, not the policy under
                     # test: retry this pair's seed (void after MAX_ATTEMPTS).
@@ -154,19 +193,19 @@ async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, conc
                 with out.open('a') as fh:
                     fh.write(json.dumps(rec) + '\n')
                 rows.append(rec)
-                s = summarize(rows, pairs, alpha)
+                s = summary()
                 log(json.dumps({'pair': pair, 'arm': arm, 'win': rec.get('win'), 'seconds': rec.get('seconds'),
                                 'gains': s['gains'], 'losses': s['losses'], 'complete': s['pairs_complete']}))
             return 'error' not in rec
 
     # Interleave arms so an interruption leaves complete pairs, not one long arm.
     await asyncio.gather(*(one(p, arm) for p in range(pairs) for arm in ('cand', 'inc')))
-    return summarize(rows, pairs, alpha)
+    return summary()
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument('--candidate', required=True, help='value json path')
+    ap.add_argument('--candidate', help='value json path (default: hand evaluation)')
     ap.add_argument('--beta', type=float, default=0.5)
     ap.add_argument('--incumbent', help='incumbent value json (default: hand evaluation)')
     ap.add_argument('--incumbent-beta', type=float, default=0.0)
@@ -178,13 +217,22 @@ def main():
     ap.add_argument('--team', default=DEFAULT_TEAM)
     ap.add_argument('--pool', type=Path, default=ROOT / 'data' / 'ml' / 'value' / 'pool-teams.json')
     ap.add_argument('--out', type=Path, required=True)
+    ap.add_argument('--cand-screen', type=Path, help='learned screening candidate for the candidate arm')
+    ap.add_argument('--inc-screen', type=Path, help='learned screening of the incumbent arm and the opponent')
+    ap.add_argument('--rule', choices=['superior', 'noninferior'], default='superior')
+    ap.add_argument('--min-sim-saving', type=float, default=0.0)
+    ap.add_argument('--screen-log-dir', type=Path, help='write probe results of every game here')
     args = ap.parse_args()
     team = json.loads((ROOT / 'teams.json').read_text())[args.team]['sets']
     pool = [t['sets'] if isinstance(t, dict) else t for t in json.loads(args.pool.read_text())]
-    cand = {'path': args.candidate, 'beta': args.beta}
-    inc = {'path': args.incumbent, 'beta': args.incumbent_beta if args.incumbent else 0.0}
+    from search.screen_data import model_from_file
+    cand = {'path': args.candidate, 'beta': args.beta if args.candidate else 0.0,
+            'screen': model_from_file(args.cand_screen)}
+    inc = {'path': args.incumbent, 'beta': args.incumbent_beta if args.incumbent else 0.0,
+           'screen': model_from_file(args.inc_screen)}
     result = asyncio.run(run_gate(cand, inc, args.out, args.pairs, args.concurrency, args.seed, team, pool,
-                                  args.engines, args.alpha))
+                                  args.engines, args.alpha, rule=args.rule, min_sim_saving=args.min_sim_saving,
+                                  screen_log_dir=args.screen_log_dir))
     print(json.dumps({'candidate': cand, 'incumbent': inc, **result}))
 
 

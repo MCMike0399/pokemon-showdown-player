@@ -363,15 +363,44 @@ function solveZeroSum(M, iters) {
   return {x: norm(rs), y: norm(cs)};
 }
 
+// ------------------------------------------------------------------ learned screening
+// A ranker trained on MPS from logged probe results (search/train_screen.py)
+// orders candidate actions without simulating them. With prefilter sizes above
+// the screening keeps, the usual probes run only on the survivors; at the keeps
+// themselves no probe runs at all (docs/learned-screening.md).
+const SF = require('./screenfeat.cjs');
+const SCREEN_NETS = {};
+function screenNet(p) {
+  if (!SCREEN_NETS[p]) SCREEN_NETS[p] = VNET.load(p);
+  return SCREEN_NETS[p];
+}
+function rankLearned(net, battle, sideIdx, choices) {
+  const s = SF.stateFeatures(battle, sideIdx);
+  return choices.map(c => [c, VNET.logit(net, [...s, ...SF.actionFeatures(battle, sideIdx, c), sideIdx])])
+    .sort((p, q) => q[1] - p[1]).map(p => p[0]);
+}
+const r4 = v => (Number.isFinite(v) ? Math.round(v * 1e4) / 1e4 : null);
+
 // ------------------------------------------------------------------ search
-function searchWorld(msg, world, wi) {
+function searchWorld(msg, world, wi, opts) {
   const t0 = Date.now();
+  const log = !!(opts && opts.log);
   const battle = buildBattle(msg.format, world, msg.field, [wi + 1, 7, 13, 19]);
   const ours = (msg.our_choices || sideChoices(battle, battle.sides[0])).slice();
   let theirs = sideChoices(battle, battle.sides[1], {noSwitch: !!msg.opp_no_switch});
   if (msg.max_opp && theirs.length > msg.max_opp) {
     theirs = theirs.slice(0, msg.max_opp);
   }
+  // A logged world always runs the full probes: its probe scores are the labels.
+  const learned = msg.screen && msg.screen.learned && msg.screen.learned.path && !log ? msg.screen.learned : null;
+  let screened = msg.screen ? 'probe' : 'none';
+  if (learned) {
+    const net = screenNet(learned.path);
+    if (theirs.length > learned.pre_opp) theirs = rankLearned(net, battle, 1, theirs).slice(0, learned.pre_opp);
+    if (ours.length > learned.pre_ours) ours.splice(0, ours.length, ...rankLearned(net, battle, 0, ours).slice(0, learned.pre_ours));
+    screened = 'learned';
+  }
+  const record = log ? {} : null;
   const base = State.serializeBattle(battle);
   const baseStr = JSON.stringify(base);
   const seeds = msg.seeds || 1;
@@ -402,6 +431,7 @@ function searchWorld(msg, world, wi) {
         for (const [pi, a] of probes.entries()) { const v = sim1(a, b, j, [wi * 131 + 1, pi + 3, 7, 13]); if (v === undefined) return [b, Infinity]; if (v !== null) { s += v; n++; } }
         return [b, n ? s / n : Infinity];
       });
+      if (record) record.theirs = {a: theirs.map(b => SF.actionFeatures(battle, 1, b).map(r4)), s: sc.map(p => r4(p[1]))};
       sc.sort((p, q) => p[1] - q[1]);
       theirs = sc.filter(p => p[1] !== Infinity).slice(0, msg.screen.keep_opp).map(p => p[0]);
     }
@@ -412,6 +442,7 @@ function searchWorld(msg, world, wi) {
         for (const [ti, b] of top.entries()) { const v = sim1(a, b, i, [wi * 131 + 1, 3, ti + 5, 13]); if (v === null) return [a, -Infinity]; if (v !== undefined) { s += v; n++; } }
         return [a, n ? s / n : -Infinity];
       });
+      if (record) record.ours = {a: ours.map(a => SF.actionFeatures(battle, 0, a).map(r4)), s: sc.map(p => r4(p[1])), c: ours.slice()};
       sc.sort((p, q) => q[1] - p[1]);
       ours.splice(0, ours.length, ...sc.filter(p => p[1] !== -Infinity).slice(0, msg.screen.keep_ours).map(p => p[0]));
     }
@@ -469,8 +500,21 @@ function searchWorld(msg, world, wi) {
   rows.forEach((i, r) => { for (let c = 0; c < cols.length; c++) eq += x[r] * sub[r][c] * y[c]; });
   const root = {eq, hand: handEvaluate(battle)};
   if (msg.features) root.x = valueFeatures(battle, 0);
-  return {values, worst, nash: nashValue, mix: ourMix, ms: Date.now() - t0, sims: sims + screenSims,
-          n_ours: rows.length, n_theirs: cols.length, top_opp: topOpp, root};
+  const out = {values, worst, nash: nashValue, mix: ourMix, ms: Date.now() - t0, sims: sims + screenSims,
+               screen_sims: screenSims, screened, n_ours: rows.length, n_theirs: cols.length, top_opp: topOpp, root};
+  if (record && (record.ours || record.theirs)) {
+    // Probe results of every candidate, for the learned screening ranker. `best`
+    // is this world's final choice, which a prefilter must never drop.
+    record.sx = [SF.stateFeatures(battle, 0).map(r4), SF.stateFeatures(battle, 1).map(r4)];
+    record.version = SF.VERSION;
+    if (record.ours) {
+      const best = Object.keys(values).reduce((a, b) => (values[b] > values[a] ? b : a));
+      record.ours.best = record.ours.c.indexOf(best);
+      delete record.ours.c;
+    }
+    out.screen_record = record;
+  }
+  return out;
 }
 
 function combos(n, k) {
@@ -533,7 +577,7 @@ function handle(msg) {
   if (msg.type === 'search') {
     setValue(msg.value_path, msg.value_beta, msg.value_scale);
     const results = msg.worlds.map((w, i) => {
-      try { return searchWorld(msg, w, (msg.world_offset || 0) + i); } catch (e) { return {error: String(e && e.stack || e).slice(0, 800)}; }
+      try { return searchWorld(msg, w, (msg.world_offset || 0) + i, {log: i < (msg.screen_log || 0)}); } catch (e) { return {error: String(e && e.stack || e).slice(0, 800)}; }
     });
     return {id: msg.id, results};
   }

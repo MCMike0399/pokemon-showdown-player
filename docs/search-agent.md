@@ -87,6 +87,12 @@ CPU self-play, gated against this exact configuration and promoted between games
 See `docs/value-learning.md`. The deployed configuration lives in
 `search/config.py`; the live runner and every gate build the agent from it.
 
+## Learned screening
+
+About half of a decision's simulations are the probe screening that only ranks
+candidates. A ranker trained on MPS from logged probe results can replace most of
+them, gated for equal results at fewer simulations. See `docs/learned-screening.md`.
+
 ## Not yet done
 
 - `preview_mode='value'` (score team-preview plans with the value) is written but

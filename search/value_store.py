@@ -46,6 +46,21 @@ def weights_sha(path: Path) -> str:
     return hashlib.sha256(json.dumps(weights, separators=(',', ':')).encode()).hexdigest()
 
 
+def localize(path) -> Path:
+    """A pointer's path in this checkout. Pointers hold absolute paths, and a trainer
+checkout (search/mlops.py) receives the live host's pointers: re-root anything
+under data/ml/value/. Integrity is still the caller's weights-hash check."""
+    p = Path(path)
+    parts = p.parts
+    for i in range(len(parts) - 2):  # this checkout first: never another checkout's copy
+        if parts[i:i + 3] == ('data', 'ml', 'value'):
+            alt = ROOT.joinpath(*parts[i:])
+            if alt.exists():
+                return alt
+            break
+    return p
+
+
 def current_value(pointer: Path = POINTER) -> dict:
     """The promoted value for live search, verified; hand evaluation if none.
 
@@ -61,6 +76,7 @@ a damaged candidate can never reach live play.
     beta = float(data.get('beta') or 0)
     if not path or not beta:
         return {'path': None, 'beta': 0.0, 'sha256': None}
+    path = localize(path)
     try:
         if weights_sha(Path(path)) != data.get('sha256'):
             return {'path': None, 'beta': 0.0, 'sha256': None, 'rejected': 'sha mismatch'}

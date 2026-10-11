@@ -32,6 +32,11 @@ LIVE = {
     'adaptive_max_ms': 9000.0,
     # A stalled search falls back to a legal move before the 55 s turn timer.
     'engine_timeout': 40.0,
+    # Chance that a decision logs one world's full probe screening: training
+    # labels for the learned screening ranker (docs/learned-screening.md). Free
+    # under probe screening; under a learned ranker that world skips the
+    # prefilter, so it is part of the deployed policy and gated with it.
+    'screen_log': 0.5,
 }
 
 

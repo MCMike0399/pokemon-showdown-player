@@ -29,6 +29,24 @@ def credentials():
     return tuple(os.environ.get(key) or values.get(key) for key in ('PS_USERNAME', 'PS_PASSWORD'))
 
 
+def save_screen_records(agent, team, room):
+    """Keep a finished game's probe screening results as ranker labels; never raises."""
+    records = agent.take_screen_records()  # always drained: a long run must not accumulate them
+    if not team:
+        return
+    try:
+        from search.screen_data import screen_root, write_records
+        from search.value_service import load_config
+        from search.value_store import dir_bytes
+        root = screen_root(team)
+        cfg = load_config()
+        if records and room and cfg['screen_enabled'] and dir_bytes(root) <= cfg['screen_max_gb'] * 2**30:
+            name = str(room).removeprefix('battle-')
+            write_records(records, root / f'live-{name}.npz', f'live-{name}')
+    except Exception as error:  # data logging must never cost a live game
+        print(json.dumps({'screen_records_error': repr(error)[:300]}), flush=True)
+
+
 def prepare_matchmaking(brain, fmt):
     """Adopt an evaluated candidate only before starting a new game."""
     from ml.promotion import promote_ready
@@ -159,6 +177,12 @@ async def run(args):
                                     agent.set_value(value.get('path'), value.get('beta', 0.0))
                                     agent.value['sha256'] = value.get('sha256')
                                     player.log('value_checkpoint', **value)
+                                # A gated screening ranker, likewise only between games.
+                                from search.screen_data import current_screen, screen_pointer
+                                screen = current_screen(screen_pointer(args.team))
+                                if screen.get('sha256') != (agent.screen_model or {}).get('sha256'):
+                                    agent.set_screen(screen)
+                                    player.log('screen_checkpoint', **screen)
                             await player.search(args.format, team)
                             deadline = time.monotonic() + args.search_timeout
                             while time.monotonic() < deadline and not stop.is_set():
@@ -180,6 +204,8 @@ async def run(args):
                                 raise TimeoutError('matchmaking timed out; search cancelled')
                         outcome = await player.play(room, args.format, sets=team['sets'] if team else None,
                                                     timeout=args.stall_timeout, record=not args.no_record)
+                        if agent is not None:
+                            save_screen_records(agent, args.team, room)
                         print(json.dumps({'game': game + 1, 'result': outcome}), flush=True)
                     if agent is not None:
                         player.log('search_stats', **{k: v for k, v in agent.stats.items() if k != 'errors'},

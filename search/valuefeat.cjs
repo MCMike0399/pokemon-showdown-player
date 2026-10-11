@@ -104,4 +104,4 @@ function features(battle, sideIdx) {
   return f;
 }
 
-module.exports = {features, damageProxy};
+module.exports = {features, damageProxy, effSpeed, boostMul};

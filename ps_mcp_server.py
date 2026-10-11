@@ -545,6 +545,21 @@ async def ps_team_variants(name: str) -> str:
         from ml.teams import suggest_variants
         return json.dumps(suggest_variants(_ml().store, teams.get(name)), indent=2)
 
+
+@mcp.tool()
+async def ps_training_status(include_trainer: bool = False) -> str:
+    """Read-only: live record (24 h), the models live search uses, and whether a
+    training campaign is due (every 1000 new live games, docs/mlops.md).
+    include_trainer=true also asks Macintosh for campaign progress (ssh, slower).
+    Starting or finishing a campaign is the user's call; this never changes anything."""
+    def read():
+        from search import mlops
+        out = mlops.status()
+        if include_trainer:
+            out['campaign_progress'] = mlops.campaign_status()
+        return out
+    return json.dumps(await asyncio.to_thread(read), indent=2, default=str)
+
 if __name__ == "__main__":
     from ml.reload import source_generation, pin_runtime
     pin_runtime(os.environ.get('PS_SOURCE_GENERATION') or source_generation())

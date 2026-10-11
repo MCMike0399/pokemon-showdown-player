@@ -160,6 +160,12 @@ catalog; the service does so after every ingest.
 For offline training elsewhere, copy `data/ml/value/teams/<slug>/` and
 `data/ml/browser-runs/`.
 
+## Learned screening in the same service
+
+The service also trains, gates and promotes the search's screening ranker
+(`docs/learned-screening.md`). Screening candidates are gated before value
+candidates, and every value gate plays the deployed screening in all seats.
+
 ## Operate
 
 ```
