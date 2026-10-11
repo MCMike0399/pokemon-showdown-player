@@ -59,6 +59,12 @@ MAX_LOST_CHOICE_RECOVERIES = 3
 INACTIVE_US = re.compile(r'^\|inactive\|(.+?) (?:reconnected and )?has \d+ seconds? left')
 
 
+# One-shot live drill (docs: ml/browser.py _recover_lost_choice): while this file
+# exists, the next team-preview choice is marked sent in the client but never
+# sent, exactly like the 2026-10-10 loss; the file is deleted when it fires.
+LOST_CHOICE_DRILL = Path(__file__).resolve().parents[1] / 'data' / 'ml' / 'drill-lost-choice'
+
+
 def server_waits_for(lines, name):
     """True if any of these battle-log lines is the server's timer warning to `name`."""
     me = to_id(name)
@@ -474,6 +480,13 @@ class BrowserPlayer:
         await self.page.wait_for_function("s => {const r=app.rooms[s.room];return r && ((r.choice && r.choice.waiting) || r.battle.ended || (r.request && r.request.rqid !== s.rqid));}", arg={'room': room, 'rqid': key}, timeout=10000)
         self.log('submitted', room=room, request_id=key, choice=choice)
 
+    def _consume_drill(self) -> bool:
+        try:
+            LOST_CHOICE_DRILL.unlink()
+            return True
+        except OSError:
+            return False
+
     async def _recover_lost_choice(self, room, snapshot, key, sent, recoveries, started, observed_from) -> bool:
         """The client believes our choice is in, but the server keeps warning OUR clock.
 Re-send the choice we made for this request over the protocol, or, after a
@@ -659,7 +672,11 @@ the loop decides this request again. Returns True if it acted."""
                         continue  # nothing was clicked: decide the current request
                     snapshot = fresh
                     try:
-                        await self.submit(snapshot, decision['choice'])
+                        if snapshot['request'].get('teamPreview') and self._consume_drill():
+                            await self.page.evaluate("id => { const r = app.rooms[id]; if (r) r.choice = {waiting: true}; }", room)
+                            self.log('drill_lost_choice', room=room, request_id=key[0], choice=decision['choice'])
+                        else:
+                            await self.submit(snapshot, decision['choice'])
                     except Exception as error:
                         # A UI race (request replaced mid-click, a control that never
                         # becomes clickable) must not end the game: clear any partial

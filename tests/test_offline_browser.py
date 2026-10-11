@@ -499,3 +499,29 @@ def test_opponent_clock_warnings_never_trigger_recovery_and_recovery_is_bounded(
             asyncio.run(player.play(ROOM, FMT, record=False, timeout=5))
     finally:
         store.close()
+
+
+def test_lost_choice_drill_drops_one_preview_choice_and_recovery_resends_it(tmp_path, monkeypatch):
+    drill = tmp_path / 'drill-lost-choice'
+    drill.touch()
+    monkeypatch.setattr(browser, 'LOST_CHOICE_DRILL', drill)
+    store, page, player, calls, decided = _lost_choice_player(tmp_path, monkeypatch, snapshot(preview=True))
+    try:
+        submitted = []
+
+        async def submit(state, choice):
+            submitted.append(choice)
+        player.submit = submit
+        original = page.evaluate
+
+        async def evaluate(script, room=None):
+            if 'r.choice = {waiting: true}' in script:  # the drill: client thinks it sent
+                page.state['waiting'] = True
+                page.state['log'].append('|inactive|Configured has 60 seconds left.')
+            return await original(script, room)
+        page.evaluate = evaluate
+        asyncio.run(player.play(ROOM, FMT, record=False, timeout=5))
+        assert submitted == [] and not drill.exists()  # nothing clicked; one-shot
+        assert [room['msg'] for script, room in calls if 'r.send(a.msg)' in script] == [f'/choose {decided[0]}|4']
+    finally:
+        store.close()
