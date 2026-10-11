@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded browser games: local PyTorch inference, Playwright clicks, no OpenClaw."""
+"""Live games: local model decisions; Playwright clicks (IPlayer default), OpenClaw's MCP harness as the fallback transport."""
 from __future__ import annotations
 
 import argparse
@@ -105,7 +105,13 @@ async def run(args):
                     page = browser.pages[0] if browser.pages else await browser.new_page()
                     await page.goto('https://play.pokemonshowdown.com/', wait_until='domcontentloaded')
                     await page.wait_for_function('window.app && app.user && window.BattleFormats')
-                    player = BrowserPlayer(page, None if args.inspect else Brain(Store(args.root)), log_path=output / 'events.jsonl')
+                    fallback = None
+                    if args.fallback == 'mcp' and not args.inspect:
+                        # Started only if Chrome fails to deliver a choice (ml/players.py).
+                        from ml.players import McpPlayer
+                        fallback = McpPlayer()
+                    player = BrowserPlayer(page, None if args.inspect else Brain(Store(args.root)),
+                                           log_path=output / 'events.jsonl', fallback=fallback)
                     if team:
                         # Every run and every result names its team: data is organised per
                         # team (search/team_data.py), so other teams never mix into Rain's.
@@ -142,7 +148,7 @@ async def run(args):
                     if not username or not password:
                         raise ValueError('configured account credentials are required')
                     await player.login(username, password)
-                    active = await page.evaluate("() => Object.values(app.rooms).filter(r => r.id.startsWith('battle-') && r.request && r.request.side && !r.battle.ended).map(r => r.id)")
+                    active = await player.active_battles()
                     if args.resume_active and not args.room and len(active) == 1:
                         args.room = active[0]
                     if active and active != [args.room]:
@@ -158,8 +164,7 @@ async def run(args):
                                 pass
                         room = args.room if game == 0 else None
                         if room:
-                            await page.goto('https://play.pokemonshowdown.com/' + room, wait_until='domcontentloaded')
-                            await page.wait_for_function('id => {const r=app.rooms[id];return r && (r.request || (r.battle && r.battle.stepQueue.some(l => l.startsWith("|win|") || l === "|tie" || l === "|tie|")));}', arg=room)
+                            await player.enter_room(room)
                         else:
                             disk = storage_status(args.root, LearningConfig.load(args.root).resource['max_disk_gb'])
                             # An explicit room resume and active finalization remain allowed.
@@ -183,22 +188,8 @@ async def run(args):
                                 if screen.get('sha256') != (agent.screen_model or {}).get('sha256'):
                                     agent.set_screen(screen)
                                     player.log('screen_checkpoint', **screen)
-                            await player.search(args.format, team)
-                            deadline = time.monotonic() + args.search_timeout
-                            while time.monotonic() < deadline and not stop.is_set():
-                                rooms = await page.evaluate("() => Object.values(app.rooms).filter(r => r.id.startsWith('battle-') && r.request && r.request.side && !r.battle.ended).map(r => r.id)")
-                                if len(rooms) > 1:
-                                    raise ValueError('multiple active battles; refuse ambiguous ownership')
-                                if rooms:
-                                    room = rooms[0]
-                                    break
-                                popup = page.locator('.ps-popup:visible')
-                                if await popup.count():
-                                    player.log('search_rejected', popups=[text[:1000] for text in (await popup.all_text_contents())[:4]])
-                                    raise ValueError('server rejected matchmaking; inspect browser before retrying')
-                                await asyncio.sleep(.25)
+                            room = await player.find_battle(args.format, team, args.search_timeout, stop=stop)
                             if not room:
-                                await player.cancel_search()
                                 if stop.is_set():
                                     break
                                 raise TimeoutError('matchmaking timed out; search cancelled')
@@ -211,11 +202,14 @@ async def run(args):
                         player.log('search_stats', **{k: v for k, v in agent.stats.items() if k != 'errors'},
                                    errors=agent.stats['errors'][-20:])
                         await agent.close()
+                    await player.close()
                     player.log('stopped', finish_active_game=True)
                     print('Browser run stopped; evidence: ' + str(output), flush=True)
                 except Exception:
                     if 'player' in locals():
                         player.log('interrupted', room=locals().get('room'))
+                        with __import__('contextlib').suppress(Exception):
+                            await player.close()
                     raise
                 finally:
                     await browser.close()
@@ -246,6 +240,8 @@ def parser():
     p.add_argument('--search-engines', type=int, help='Parallel search engine processes (default: search/config.py)')
     p.add_argument('--search-timeout', type=int, default=120)
     p.add_argument('--stall-timeout', type=int, default=180)
+    p.add_argument('--fallback', choices=('mcp', 'none'), default='mcp',
+                   help="Transport for choices Chrome can't deliver: OpenClaw's MCP harness (default) or none")
     p.add_argument('--game-delay', type=float, default=30, help='Seconds between completed games and the next search')
     return p
 

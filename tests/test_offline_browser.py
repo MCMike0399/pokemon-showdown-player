@@ -366,7 +366,7 @@ def test_idle_opponent_gets_the_battle_timer_before_the_runner_gives_up(tmp_path
         player = BrowserPlayer(page, Brain(store, Features()))
         with pytest.raises(TimeoutError):
             asyncio.run(player.play(ROOM, FMT, timeout=0.3))
-        assert sum("setTimer('on')" in s for s in scripts) == 1  # once, then a full window
+        assert sum('setTimer(' in s for s in scripts) == 1  # once, then a full window
     finally:
         store.close()
 

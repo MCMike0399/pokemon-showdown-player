@@ -14,6 +14,7 @@ import uuid
 from pathlib import Path
 
 from battle_state import legal_choices, observe, to_id
+from ml.players import IPlayer
 from ml.storage import fingerprint
 from ml.teams import team_id
 
@@ -56,6 +57,13 @@ TIMER_AFTER = 60
 # A warning this long after we sent means the choice was lost.
 LOST_CHOICE_GRACE = 8
 MAX_LOST_CHOICE_RECOVERIES = 3
+# From this attempt on, a lost choice goes through the fallback transport (the
+# MCP harness) when one is configured: Chrome already failed to deliver it once.
+FALLBACK_FROM_ATTEMPT = 2
+FALLBACK_BUDGET = 12  # seconds for one fallback delivery (cold start + login measured ~3-4 s)
+# Choices the UI fails to submit this many times for one request go to the fallback.
+MAX_SUBMIT_FAILURES = 3
+ACTIVE_BATTLES = "() => Object.values(app.rooms).filter(r => r.id.startsWith('battle-') && r.request && r.request.side && !r.battle.ended).map(r => r.id)"
 INACTIVE_US = re.compile(r'^\|inactive\|(.+?) (?:reconnected and )?has \d+ seconds? left')
 
 
@@ -182,11 +190,21 @@ def team_text(sets):
     return '\n\n'.join(blocks)
 
 
-class BrowserPlayer:
-    def __init__(self, page, brain=None, *, log_path=None, decision_interval=1.0):
+class PlaywrightPlayer(IPlayer):
+    """The official classic client in Chrome, driven by programmatic clicks (the default IPlayer).
+
+It also runs the game loop (`play`): local decisions, recording, recovery. When
+Chrome cannot deliver a choice, `fallback` (another IPlayer, the MCP harness)
+sends that same choice."""
+
+    name = 'playwright'
+
+    def __init__(self, page, brain=None, *, log_path=None, decision_interval=1.0, fallback: IPlayer | None = None):
         if decision_interval < 0:
             raise ValueError('decision interval must be nonnegative')
         self.page, self.brain = page, brain
+        self.fallback = fallback
+        self.username = None
         # Optional async ctx -> choice override (search agent); never recorded.
         self.decider = None
         self.decider_trace = None  # optional () -> dict logged with each decided turn
@@ -227,6 +245,7 @@ class BrowserPlayer:
             await asyncio.sleep(.2)
 
     async def login(self, username, password):
+        self.username = username
         # A persistent profile re-authenticates on its own a few seconds after
         # load; let that finish instead of racing it with the login form.
         try:
@@ -254,6 +273,11 @@ class BrowserPlayer:
             raise ValueError('browser account login failed') from None
 
     async def search(self, fmt, team=None):
+        await self.select_team(fmt, team)
+        await self.page.locator('[id="room-"]').locator('button[name="search"]').click()
+
+    async def select_team(self, fmt, team=None):
+        """Format + exact team in the official teambuilder (imported once, then reused)."""
         await self.page.locator('a[href="/"]:visible').first.click()
         home = self.page.locator('[id="room-"]')
         await home.locator('button[name="format"]').click()
@@ -306,7 +330,80 @@ class BrowserPlayer:
                 return home?.curFormat===s.format && team?.name===s.name &&
                     typeof team.team==='string' && team.team.length>0;
             }""", arg={'format': fmt, 'name': self.imported_team[1]}, timeout=10000)
-        await home.locator('button[name="search"]').click()
+
+    async def find_battle(self, fmt, team, timeout, stop=None):
+        await self.search(fmt, team)
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline and not (stop and stop.is_set()):
+            rooms = await self.active_battles()
+            if len(rooms) > 1:
+                raise ValueError('multiple active battles; refuse ambiguous ownership')
+            if rooms:
+                return rooms[0]
+            popup = self.page.locator('.ps-popup:visible')
+            if await popup.count():
+                self.log('search_rejected', popups=[text[:1000] for text in (await popup.all_text_contents())[:4]])
+                raise ValueError('server rejected matchmaking; inspect browser before retrying')
+            await asyncio.sleep(.25)
+        await self.cancel_search()
+        return None
+
+    async def active_battles(self):
+        return await self.page.evaluate(ACTIVE_BATTLES)
+
+    async def enter_room(self, room):
+        await self.page.goto('https://play.pokemonshowdown.com/' + room, wait_until='domcontentloaded')
+        await self.page.wait_for_function('id => {const r=app.rooms[id];return r && (r.request || (r.battle && r.battle.stepQueue.some(l => l.startsWith("|win|") || l === "|tie" || l === "|tie|")));}', arg=room)
+
+    async def set_timer(self, room, on=True):
+        await self.page.evaluate("a => { const r = app.rooms[a.room]; if (r && r.setTimer) r.setTimer(a.on ? 'on' : 'off'); }",
+                                 {'room': room, 'on': on})
+
+    async def forfeit(self, room):
+        await self.page.evaluate("id => { const r = app.rooms[id]; if (r) r.send('/forfeit'); }", room)
+
+    async def leave(self, room):
+        await self.page.evaluate("id => { if (window.app && app.rooms[id]) app.send('/leave ' + id); }", room)
+
+    async def close(self):
+        # The runner owns the browser context and closes it; the fallback is ours.
+        if self.fallback is not None:
+            with suppress(Exception):
+                await self.fallback.close()
+
+    async def fallback_submit(self, room, rqid, choice, reason):
+        """Deliver `choice` for request `rqid` through the fallback transport (MCP harness).
+Returns True if it was sent; False if there is no fallback or the server moved on."""
+        fb = self.fallback
+        if fb is None:
+            return False
+
+        async def deliver():
+            # Logged in as our account every time (cheap when healthy): a harness
+            # socket that dropped would otherwise rejoin as a guest and see nothing.
+            await fb.login(self.username, None)
+            await fb.enter_room(room)
+            snap = await fb.snapshot(room)
+            if (snap.get('request') or {}).get('rqid') != rqid or snap.get('ended'):
+                return (snap.get('request') or {}).get('rqid')
+            await fb.submit(snap, choice)
+            return 'sent'
+        started = time.monotonic()
+        try:
+            # Bounded: the turn clock keeps running while the harness works.
+            outcome = await asyncio.wait_for(deliver(), FALLBACK_BUDGET)
+        except Exception as error:  # the fallback must never be worse than no fallback
+            self.log('fallback_failed', transport=fb.name, room=room, request_id=rqid,
+                     error=f'{type(error).__name__}: {str(error)[:200]}')
+            return False
+        elapsed = round(time.monotonic() - started, 2)
+        if outcome != 'sent':
+            self.log('fallback_skipped', transport=fb.name, room=room, request_id=rqid, server_rqid=outcome,
+                     reason='server moved on', seconds=elapsed)
+            return False
+        self.log('fallback_submit', transport=fb.name, room=room, request_id=rqid, choice=choice, reason=reason,
+                 seconds=elapsed)
+        return True
 
     async def cancel_search(self):
         button = self.page.locator('[id="room-"] button[name="cancelSearch"]')
@@ -482,10 +579,19 @@ class BrowserPlayer:
 
     def _consume_drill(self) -> bool:
         try:
+            mode = LOST_CHOICE_DRILL.read_text().strip()
             LOST_CHOICE_DRILL.unlink()
-            return True
         except OSError:
             return False
+        # 'fallback': Chrome's re-send is suppressed too, so only the fallback can deliver it.
+        self._drill_mode = mode or 'resend'
+        return True
+
+    def _drill_blocks_resend(self, rqid) -> bool:
+        if getattr(self, '_drill_mode', None) == 'fallback' and getattr(self, '_drill_rqid', None) == rqid:
+            self.log('drill_blocked_resend', request_id=rqid)
+            return True
+        return False
 
     async def _recover_lost_choice(self, room, snapshot, key, sent, recoveries, started, observed_from) -> bool:
         """The client believes our choice is in, but the server keeps warning OUR clock.
@@ -505,12 +611,19 @@ the loop decides this request again. Returns True if it acted."""
         recoveries[rqid] = recoveries.get(rqid, 0) + 1
         if recoveries[rqid] > MAX_LOST_CHOICE_RECOVERIES:
             raise ValueError('the server keeps waiting for a choice it never receives; inspect the room')
-        if mark:
-            await self.page.evaluate("a => { const r = app.rooms[a.room]; if (r) r.send(a.msg); }",
-                                     {'room': room, 'msg': f"/choose {mark['choice']}|{rqid}"})
+        if mark and recoveries[rqid] >= FALLBACK_FROM_ATTEMPT and await self.fallback_submit(
+                room, rqid, mark['choice'], 'lost choice: Chrome re-send did not reach the server'):
             mark['at'], mark['log_length'] = time.monotonic(), len(snapshot.get('log', []))
-            self.log('choice_lost', room=room, request_id=rqid, action='resent', choice=mark['choice'],
+            self.log('choice_lost', room=room, request_id=rqid, action='fallback', choice=mark['choice'],
                      attempt=recoveries[rqid])
+        elif mark:
+            blocked = self._drill_blocks_resend(rqid)
+            if not blocked:
+                await self.page.evaluate("a => { const r = app.rooms[a.room]; if (r) r.send(a.msg); }",
+                                         {'room': room, 'msg': f"/choose {mark['choice']}|{rqid}"})
+            mark['at'], mark['log_length'] = time.monotonic(), len(snapshot.get('log', []))
+            self.log('choice_lost', room=room, request_id=rqid, action='resend-blocked-by-drill' if blocked else 'resent',
+                     choice=mark['choice'], attempt=recoveries[rqid])
         else:
             await self.page.evaluate("id => { const r = app.rooms[id]; if (r) { r.choice = null; "
                                      "if (r.updateControls) r.updateControls(); } }", room)
@@ -538,6 +651,7 @@ the loop decides this request again. Returns True if it acted."""
         timer_claimed = False
         failed = {}  # search mode: request key -> choices the UI could not submit
         started = time.monotonic()
+        self._drill_mode = self._drill_rqid = None  # a drill applies to the game it fired in only
         observed_from = None  # log length when this process started watching the room
         sent = {}  # rqid -> {'choice', 'at', 'log_length'} of what we submitted
         recoveries = {}
@@ -674,15 +788,32 @@ the loop decides this request again. Returns True if it acted."""
                     try:
                         if snapshot['request'].get('teamPreview') and self._consume_drill():
                             await self.page.evaluate("id => { const r = app.rooms[id]; if (r) r.choice = {waiting: true}; }", room)
-                            self.log('drill_lost_choice', room=room, request_id=key[0], choice=decision['choice'])
+                            self._drill_rqid = key[0]
+                            self.log('drill_lost_choice', room=room, request_id=key[0], choice=decision['choice'],
+                                     mode=self._drill_mode)
                         else:
                             await self.submit(snapshot, decision['choice'])
                     except Exception as error:
                         # A UI race (request replaced mid-click, a control that never
                         # becomes clickable) must not end the game: clear any partial
                         # selection, never retry that choice for this request, re-decide.
-                        if 'closed' in str(error).lower() or len(failed.get(key, ())) >= 3:
+                        if 'closed' in str(error).lower():
                             raise
+                        if len(failed.get(key, ())) >= MAX_SUBMIT_FAILURES - 1:
+                            # Chrome failed this request repeatedly: the fallback sends this choice.
+                            await self._clear_choice(room)
+                            if not await self.fallback_submit(room, key[0], decision['choice'],
+                                                              f'Chrome submit failed: {type(error).__name__}'):
+                                fresh = await self.snapshot(room)
+                                if (fresh.get('request') or {}).get('rqid') != key[0] or not result(fresh).get('ongoing'):
+                                    continue  # the server moved on: decide whatever it asks now
+                                raise
+                            self.last_submission = time.monotonic()
+                            self.answered.add(key)
+                            sent[key[0]] = {'choice': decision['choice'], 'at': time.monotonic(),
+                                            'log_length': len(snapshot['log'])}
+                            last_progress = time.monotonic()
+                            continue
                         failed.setdefault(key, set()).add(decision['choice'])
                         self.log('submit_retry', room=room, request_id=key[0], choice=decision['choice'],
                                  error=f'{type(error).__name__}: {str(error)[:200]}')
@@ -703,10 +834,13 @@ the loop decides this request again. Returns True if it acted."""
             if not timer_claimed and time.monotonic() - last_progress > TIMER_AFTER:
                 timer_claimed = True
                 with suppress(Exception):
-                    await self.page.evaluate("id => { const r = app.rooms[id]; if (r && r.setTimer) r.setTimer('on'); }", room)
+                    await self.set_timer(room, True)
                     self.log('timer_on', room=room, waited=round(time.monotonic() - last_progress, 1))
                     last_progress = time.monotonic()  # a full window for the timer to run out
             if time.monotonic() - last_progress > timeout:
                 self.log('stalled', room=room)
                 raise TimeoutError('battle stalled; recording retained, no outcome assigned')
             await asyncio.sleep(.25)
+
+
+BrowserPlayer = PlaywrightPlayer  # the name the runner and older tests use
