@@ -401,3 +401,101 @@ def test_search_submit_failure_redecides_without_the_failed_choice(tmp_path):
         assert submitted[-1] == seen[1][0]
     finally:
         store.close()
+
+
+def _lost_choice_player(tmp_path, monkeypatch, state):
+    from ml.brain import Brain
+    from ml.features import Features
+    from ml.storage import Store
+    monkeypatch.setattr(browser, 'LOST_CHOICE_GRACE', 0)
+    store = Store(tmp_path)
+    page = Page(state)
+    calls = []
+    original = page.evaluate
+
+    async def evaluate(script, room=None):
+        calls.append((script, room))
+        if script.startswith('a => { const r = app.rooms[a.room]; if (r) r.send(a.msg)'):
+            page.state['log'].append('|win|Configured')  # the resent choice reaches the server
+        if 'r.choice = null' in script:
+            page.state['waiting'] = False
+        return await original(script, room)
+    page.evaluate = evaluate
+    player = BrowserPlayer(page, Brain(store, Features()), decision_interval=0)
+    decided = []
+
+    async def decider(ctx):
+        decided.append(ctx['choices'][0])
+        return ctx['choices'][0]
+    player.decider = decider
+    return store, page, player, calls, decided
+
+
+def test_choice_lost_in_transit_is_resent_when_the_server_warns_our_clock(tmp_path, monkeypatch):
+    # Live 2026-10-10: the team-preview choice was marked sent but never reached the
+    # server; its timer warnings were for us while the runner waited for 3 hours.
+    store, page, player, calls, decided = _lost_choice_player(tmp_path, monkeypatch, snapshot(preview=True))
+    try:
+        async def submit(state, choice):
+            page.state['waiting'] = True
+            page.state['log'] += ['|inactive|Battle timer is ON', '|inactive|Configured has 60 seconds left.']
+        player.submit = submit
+        asyncio.run(player.play(ROOM, FMT, record=False, timeout=5))
+        sends = [room for script, room in calls if 'r.send(a.msg)' in script]
+        assert sends == [{'room': ROOM, 'msg': f'/choose {decided[0]}|4'}] and len(decided) == 1
+    finally:
+        store.close()
+
+
+def test_after_a_restart_a_lost_choice_is_decided_again(tmp_path, monkeypatch):
+    state = snapshot(preview=True)
+    state['waiting'] = True  # the reloaded client says waiting; the server says otherwise
+    store, page, player, calls, decided = _lost_choice_player(tmp_path, monkeypatch, state)
+    try:
+        submitted = []
+
+        async def submit(state, choice):
+            submitted.append(choice)
+            page.state['log'].append('|win|Configured')
+        player.submit = submit
+        warned = {'done': False}
+        original = page.evaluate
+
+        async def evaluate(script, room=None):
+            if script == SNAPSHOT and not warned['done']:
+                warned['done'] = True  # first read is the baseline; the warning arrives after
+                result = await original(script, room)
+                page.state['log'].append('|inactive|Configured reconnected and has 0 seconds left.')
+                return result
+            return await original(script, room)
+        page.evaluate = evaluate
+        asyncio.run(player.play(ROOM, FMT, record=False, timeout=5))
+        assert submitted == decided and len(decided) == 1
+        assert any('r.choice = null' in script for script, _ in calls)
+    finally:
+        store.close()
+
+
+def test_opponent_clock_warnings_never_trigger_recovery_and_recovery_is_bounded(tmp_path, monkeypatch):
+    assert browser.server_waits_for(['|inactive|Configured has 5 seconds left.'], 'configured')
+    assert not browser.server_waits_for(['|inactive|Opponent has 5 seconds left.',
+                                         '|inactive|Configured disconnected and has a minute to reconnect!'], 'Configured')
+    store, page, player, calls, decided = _lost_choice_player(tmp_path, monkeypatch, snapshot(preview=True))
+    try:
+        async def submit(state, choice):
+            page.state['waiting'] = True
+        player.submit = submit
+        original = page.evaluate
+
+        async def evaluate(script, room=None):
+            if 'r.send(a.msg)' in script:  # the server never accepts it
+                page.state['log'].append('|inactive|Configured has 10 seconds left.')
+                return None
+            if script == SNAPSHOT and page.state['waiting'] and not any('seconds left' in l for l in page.state['log']):
+                page.state['log'].append('|inactive|Configured has 30 seconds left.')
+            return await original(script, room)
+        page.evaluate = evaluate
+        with pytest.raises(ValueError, match='never receives'):
+            asyncio.run(player.play(ROOM, FMT, record=False, timeout=5))
+    finally:
+        store.close()

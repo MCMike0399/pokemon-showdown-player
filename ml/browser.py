@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 import json
+import re
 import time
 import uuid
 from pathlib import Path
@@ -48,6 +49,20 @@ CONTROLS_GIVE_UP = 75
 # An opponent who stops choosing (often at team preview) would stall us until the
 # runner gives up; the battle timer makes the server rule against them instead.
 TIMER_AFTER = 60
+# The server's own word that it waits for OUR choice: with the timer on it warns
+# the player who hasn't chosen. Live 2026-10-10: a team-preview choice the client
+# marked as sent never reached the server; the runner waited, crashed and
+# reconnected for three hours (each reconnect reset the server's grace).
+# A warning this long after we sent means the choice was lost.
+LOST_CHOICE_GRACE = 8
+MAX_LOST_CHOICE_RECOVERIES = 3
+INACTIVE_US = re.compile(r'^\|inactive\|(.+?) (?:reconnected and )?has \d+ seconds? left')
+
+
+def server_waits_for(lines, name):
+    """True if any of these battle-log lines is the server's timer warning to `name`."""
+    me = to_id(name)
+    return any((m := INACTIVE_US.match(line)) and to_id(m.group(1)) == me for line in lines)
 
 
 def request_key(snapshot):
@@ -459,6 +474,37 @@ class BrowserPlayer:
         await self.page.wait_for_function("s => {const r=app.rooms[s.room];return r && ((r.choice && r.choice.waiting) || r.battle.ended || (r.request && r.request.rqid !== s.rqid));}", arg={'room': room, 'rqid': key}, timeout=10000)
         self.log('submitted', room=room, request_id=key, choice=choice)
 
+    async def _recover_lost_choice(self, room, snapshot, key, sent, recoveries, started, observed_from) -> bool:
+        """The client believes our choice is in, but the server keeps warning OUR clock.
+Re-send the choice we made for this request over the protocol, or, after a
+restart (we never saw what was sent), drop the client's stale waiting state so
+the loop decides this request again. Returns True if it acted."""
+        request = snapshot.get('request') or {}
+        rqid = request.get('rqid')
+        if rqid is None or not (snapshot.get('waiting') or key in self.answered):
+            return False
+        mark = sent.get(rqid)
+        since, at = (mark['log_length'], mark['at']) if mark else (observed_from, started)
+        if time.monotonic() - at < LOST_CHOICE_GRACE:
+            return False
+        if not server_waits_for(snapshot.get('log', [])[since:], snapshot['user']['name']):
+            return False
+        recoveries[rqid] = recoveries.get(rqid, 0) + 1
+        if recoveries[rqid] > MAX_LOST_CHOICE_RECOVERIES:
+            raise ValueError('the server keeps waiting for a choice it never receives; inspect the room')
+        if mark:
+            await self.page.evaluate("a => { const r = app.rooms[a.room]; if (r) r.send(a.msg); }",
+                                     {'room': room, 'msg': f"/choose {mark['choice']}|{rqid}"})
+            mark['at'], mark['log_length'] = time.monotonic(), len(snapshot.get('log', []))
+            self.log('choice_lost', room=room, request_id=rqid, action='resent', choice=mark['choice'],
+                     attempt=recoveries[rqid])
+        else:
+            await self.page.evaluate("id => { const r = app.rooms[id]; if (r) { r.choice = null; "
+                                     "if (r.updateControls) r.updateControls(); } }", room)
+            self.answered.discard(key)
+            self.log('choice_lost', room=room, request_id=rqid, action='redecide', attempt=recoveries[rqid])
+        return True
+
     async def play(self, room, fmt, *, sets=None, timeout=180, record=True):
         observer = asyncio.create_task(self.watch(room))
         try:
@@ -478,10 +524,16 @@ class BrowserPlayer:
         sheets_attempted = False
         timer_claimed = False
         failed = {}  # search mode: request key -> choices the UI could not submit
+        started = time.monotonic()
+        observed_from = None  # log length when this process started watching the room
+        sent = {}  # rqid -> {'choice', 'at', 'log_length'} of what we submitted
+        recoveries = {}
         while True:
             snapshot = await self.snapshot(room)
             if snapshot.get('missing'):
                 raise ValueError('battle room disappeared; rejoin before resuming')
+            if observed_from is None:
+                observed_from = len(snapshot.get('log', []))
             outcome = result(snapshot)
             if not outcome.get('ongoing'):
                 side = watch_frame(snapshot)['side'] or self.brain.room_side(room)
@@ -513,6 +565,11 @@ class BrowserPlayer:
                 previous = None
                 if retries[key[0]] >= 3:
                     raise ValueError('repeated server rejection; inspect this request before resuming')
+            if await self._recover_lost_choice(room, snapshot, key, sent, recoveries,
+                                               started, observed_from):
+                last_progress = time.monotonic()
+                observed_from = len(snapshot.get('log', []))
+                continue
             if not snapshot.get('waiting') and legal_choices(snapshot.get('request')) and key not in self.answered:
                 if not sheets_attempted:
                     offer = self.page.locator(f'[id="room-{room}"] button[name="send"][value="/acceptopenteamsheets"]:visible')
@@ -623,6 +680,8 @@ class BrowserPlayer:
                     self.brain.store.save_episode(episode)
                 self.answered.add(key)
                 previous = {'key': key, 'side': side, 'log_length': len(snapshot['log'])}
+                sent[(snapshot.get('request') or {}).get('rqid')] = {
+                    'choice': decision['choice'], 'at': time.monotonic(), 'log_length': len(snapshot['log'])}
                 last_progress = time.monotonic()
             if not timer_claimed and time.monotonic() - last_progress > TIMER_AFTER:
                 timer_claimed = True
