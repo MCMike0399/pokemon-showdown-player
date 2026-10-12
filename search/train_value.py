@@ -43,12 +43,17 @@ def _bucket(g: str) -> float:
 
 def load_rows(selfplay: list[str], live_dir: Path | None, val_frac: float, live_test: float,
               max_rows: int = 0, live_weight: float = 0.0, live_cal: float = 0.5):
-    """Return dict split -> (X, Y, H, games, weights) with game-level splits.
+    """Return dict split -> (X, Y, H, games, weights, V, F, K, SRC) with game-level splits.
 
-Self-play shards are read newest first until `max_rows` (0 = all), so a long
-run trains on a recent window of the improving self-play distribution.
+V is the self-play turn's search value (hand units, NaN when absent), F 1 for the
+focus team's rows, K the game's opponent style (0 search, 1 noisy, 2 random) and
+SRC 0 self-play / 1 live. Self-play shards are read newest first until
+`max_rows` (0 = all), so a long run trains on a recent window of the improving
+self-play distribution. `live_sel` (newest half of the non-test live games, a
+subset of the calibration or training games) is where competing settings are
+compared, so the newest live games stay an untouched test.
 """
-    from search.value_store import load_shard
+    from search.value_store import load_shard_columns
     files = []
     for pattern in selfplay:
         files.extend(glob.glob(pattern))
@@ -58,7 +63,8 @@ run trains on a recent window of the improving self-play distribution.
     for path in files:
         if max_rows and total >= max_rows:
             break
-        x, y, h, g = load_shard(Path(path))
+        x, g, cols = load_shard_columns(Path(path))
+        y, h = cols['y'], cols['h']
         if not len(y):
             continue
         if width is None:
@@ -71,7 +77,9 @@ run trains on a recent window of the improving self-play distribution.
         garr = np.asarray(g)
         for split, mask in (('val', val), ('train', ~val)):
             if mask.any():
-                parts[split].append((x[mask], y[mask], h[mask], garr[mask].tolist(), np.ones(int(mask.sum()), np.float32)))
+                parts[split].append((x[mask], y[mask], h[mask], garr[mask].tolist(), np.ones(int(mask.sum()), np.float32),
+                                     cols['v'][mask], cols['f'][mask], np.nan_to_num(cols['k'][mask]),
+                                     np.zeros(int(mask.sum()), np.float32)))
     live_games = []
     if live_dir and Path(live_dir).exists():
         for path in sorted(Path(live_dir).glob('live-*.jsonl')):
@@ -81,16 +89,19 @@ run trains on a recent window of the improving self-play distribution.
                 live_games.append((min(r.get('time') or 0 for r in rows), path, rows))
         live_games.sort(key=lambda item: item[0])
     n_test = int(round(len(live_games) * live_test)) if live_games else 0
+    n_old = len(live_games) - n_test
+    sel_games = {r['g'] for _, _, rows in live_games[n_old - n_old // 2:n_old] for r in rows}
     for k, (_, path, rows) in enumerate(live_games):
         manifest.append({'path': os.path.relpath(path, ROOT), 'bytes': path.stat().st_size, 'rows': len(rows)})
         test = k >= len(live_games) - n_test
         block = (np.asarray([r['x'] for r in rows], np.float32), np.asarray([r['y'] for r in rows], np.float32),
                  np.asarray([r['h'] for r in rows], np.float32), [r['g'] for r in rows],
-                 np.full(len(rows), 1.0 if test else live_weight, np.float32))
+                 np.full(len(rows), 1.0 if test else live_weight, np.float32),
+                 np.full(len(rows), np.nan, np.float32), np.ones(len(rows), np.float32),
+                 np.zeros(len(rows), np.float32), np.ones(len(rows), np.float32))
         # Time order: [oldest: training (if live_weight > 0)] [calibration] [newest: test].
         # With live_weight 0 every non-test game calibrates. Calibration games are
         # never trained on, so the fitted temperature and blend are honest.
-        n_old = len(live_games) - n_test
         cal_start = int(round(n_old * (1 - live_cal))) if live_weight > 0 else 0
         if test:
             parts['live_test'].append(block)
@@ -101,12 +112,14 @@ run trains on a recent window of the improving self-play distribution.
     out = {}
     for split, blocks in parts.items():
         if blocks:
-            out[split] = (np.concatenate([b[0] for b in blocks]), np.concatenate([b[1] for b in blocks]),
-                          np.concatenate([b[2] for b in blocks]), [g for b in blocks for g in b[3]],
-                          np.concatenate([b[4] for b in blocks]))
+            out[split] = tuple([g for b in blocks for g in b[3]] if i == 3 else np.concatenate([b[i] for b in blocks])
+                               for i in range(9))
         else:
-            out[split] = (np.zeros((0, width or 1), np.float32), np.zeros(0, np.float32), np.zeros(0, np.float32),
-                          [], np.zeros(0, np.float32))
+            out[split] = tuple([] if i == 3 else np.zeros((0, width or 1) if i == 0 else 0, np.float32) for i in range(9))
+    # live_sel: rows of the selection games, wherever they fell (training or calibration).
+    sel = [(blk, np.array([g in sel_games for g in blk[3]], dtype=bool)) for name in ('train', 'live_cal') for blk in [out[name]]]
+    out['live_sel'] = tuple([g for blk, m in sel for g, keep in zip(blk[3], m) if keep] if i == 3
+                            else np.concatenate([blk[i][m] for blk, m in sel]) for i in range(9))
     return out, manifest, {'live_games': len(live_games), 'live_test_games': n_test,
                            'live_cal_games': len({g for b in parts['live_cal'] for g in b[3]}), 'selfplay_rows': total}
 
@@ -152,7 +165,7 @@ def train(data, hidden, layers, epochs, lr, wd, batch, device, seed, patience):
     import torch
     import torch.nn as nn
     torch.manual_seed(seed)
-    Xtr, Ytr, _, _, Wtr = data['train']
+    Xtr, Ytr, _, _, Wtr = data['train'][:5]
     Xva, Yva = data['val'][0], data['val'][1]
     mean = Xtr.mean(0); std = Xtr.std(0) + 1e-3
     dev = torch.device(device)
@@ -195,6 +208,26 @@ def train(data, hidden, layers, epochs, lr, wd, batch, device, seed, patience):
     return net, mean, std, history
 
 
+def train_distilled(data, k, hidden, layers, epochs, lr, wd, batch, device, seed, patience):
+    """K teachers on different seeds, then one student of the same shape fitted to
+their mean logit. The engine runs a single MLP; distillation keeps the ensemble's
+lower seed variance in that one net."""
+    if k <= 1:
+        return train(data, hidden, layers, epochs, lr, wd, batch, device, seed, patience) + ({},)
+    X = data['train'][0]
+    logits, teachers = [], []
+    for i in range(k):
+        net, mean, std, history = train(data, hidden, layers, epochs, lr, wd, batch, device, seed + 1000 * (i + 1), patience)
+        p = predict(net, mean, std, X)
+        logits.append(np.log(np.clip(p, 1e-6, 1 - 1e-6) / np.clip(1 - p, 1e-6, 1)))
+        teachers.append({'seed': seed + 1000 * (i + 1), 'epochs': len(history), 'best_val': min(history)})
+    soft = (1 / (1 + np.exp(-np.mean(logits, axis=0)))).astype(np.float32)
+    student = dict(data)
+    student['train'] = (X, soft, *data['train'][2:])
+    net, mean, std, history = train(student, hidden, layers, epochs, lr, wd, batch, device, seed, patience)
+    return net, mean, std, history, {'teachers': teachers}
+
+
 def predict(net, mean, std, X):
     import torch
     if not len(X):
@@ -227,6 +260,12 @@ def main(argv=None):
     ap.add_argument('--device', default='auto', choices=['auto', 'mps', 'cpu'])
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--threads', type=int, default=2)
+    ap.add_argument('--ensemble', type=int, default=1, help='distill this many seeds into the exported net')
+    ap.add_argument('--max-style', type=int, default=2,
+                    help='drop self-play games whose opponent style exceeds this (0 search only, 1 + noisy, 2 all)')
+    ap.add_argument('--focus-weight', type=float, default=1.0, help='training weight of the focus team\'s self-play rows')
+    ap.add_argument('--target-mix', type=float, default=0.0,
+                    help='self-play target (1-L)*outcome + L*calibrated search value of the turn (search-vs-search rows)')
     args = ap.parse_args(argv)
     import torch
     torch.set_num_threads(args.threads)
@@ -239,6 +278,24 @@ def main(argv=None):
     started = time.time()
     data, manifest, live_info = load_rows(args.selfplay, args.live, args.val_frac, args.live_test,
                                           args.max_rows, args.live_weight, args.live_cal)
+    for split in ('train', 'val'):
+        keep = data[split][7] <= args.max_style
+        if not keep.all():
+            data[split] = tuple([g for g, m in zip(data[split][3], keep) if m] if i == 3 else data[split][i][keep]
+                                for i in range(9))
+    train_data = dict(data)
+    X, Y, H, G, W, V, F, K, SRC = data['train']
+    W = W * np.where((SRC == 0) & (F == 1), args.focus_weight, 1.0).astype(np.float32)
+    mixed = 0
+    if args.target_mix > 0:
+        # The turn's equilibrium value bootstraps a lower-variance target; it is on
+        # the hand scale (self-play ran the hand evaluation), so calibrate it the same way.
+        ah, bh = fit_hand(H, Y)
+        use = (SRC == 0) & (K == 0) & np.isfinite(V)
+        pv = 1 / (1 + np.exp(-np.clip(ah * np.nan_to_num(V) + bh, -30, 30)))
+        Y = np.where(use, (1 - args.target_mix) * Y + args.target_mix * pv, Y).astype(np.float32)
+        mixed = int(use.sum())
+    train_data['train'] = (X, Y, H, G, W, V, F, K, SRC)
     if len(data['train'][0]) < 1000:
         raise SystemExit(json.dumps({'error': 'not enough training rows', 'rows': int(len(data['train'][0]))}))
     device = args.device
@@ -250,20 +307,22 @@ def main(argv=None):
         except Exception:
             pass
     try:
-        net, mean, std, history = train(data, args.hidden, args.layers, args.epochs, args.lr, args.wd, args.batch,
-                                        device, args.seed, args.patience)
+        net, mean, std, history, ensemble = train_distilled(train_data, args.ensemble, args.hidden, args.layers,
+                                                            args.epochs, args.lr, args.wd, args.batch, device,
+                                                            args.seed, args.patience)
     except RuntimeError as error:
         if device == 'cpu':
             raise
         print(json.dumps({'device_error': repr(error)[:300], 'fallback': 'cpu'}), file=sys.stderr)
         device = 'cpu'
-        net, mean, std, history = train(data, args.hidden, args.layers, args.epochs, args.lr, args.wd, args.batch,
-                                        device, args.seed, args.patience)
+        net, mean, std, history, ensemble = train_distilled(train_data, args.ensemble, args.hidden, args.layers,
+                                                            args.epochs, args.lr, args.wd, args.batch, device,
+                                                            args.seed, args.patience)
     a, b = fit_hand(data['train'][2], data['train'][1])
-    report = {'device': device, 'seconds': None, 'history': history, 'hand_calibration': {'a': a, 'b': b},
+    report = {'device': device, 'seconds': None, 'history': history, **ensemble, 'hand_calibration': {'a': a, 'b': b},
               'rows': {k: int(len(v[1])) for k, v in data.items()},
-              'games': {k: len(set(v[3])) for k, v in data.items()}, **live_info}
-    for split in ('val', 'live_test'):
+              'games': {k: len(set(v[3])) for k, v in data.items()}, 'target_mixed_rows': mixed, **live_info}
+    for split in ('val', 'live_sel', 'live_test'):
         X, Y, H = data[split][0], data[split][1], data[split][2]
         report[split] = {'learned': metrics(predict(net, mean, std, X), Y),
                          'hand': metrics(1 / (1 + np.exp(-np.clip(a * H + b, -30, 30))), Y)}
@@ -288,13 +347,14 @@ def main(argv=None):
         temp = float(min(grid, key=lambda t: logloss(1 / (1 + np.exp(-zc / t)), yc)))
     betas = (0.0, 0.25, 0.5, 0.75, 1.0)
     scan = {split: {str(beta): round(logloss(blend(split, beta, temp), data[split][1]), 5) for beta in betas}
-            for split in ('val', 'live_cal', 'live_test') if len(data[split][1])}
+            for split in ('val', 'live_cal', 'live_sel', 'live_test') if len(data[split][1])}
     beta = float(min(scan[cal], key=scan[cal].get))
     report.update(temperature=round(temp, 4), calibration_split=cal, beta_scan=scan, recommended_beta=beta)
     beats = []
-    for split in ('val', 'live_test'):
+    for split in ('val', 'live_sel', 'live_test'):
         if len(data[split][1]):
             report[split]['deployed_blend'] = metrics(blend(split, beta, temp), data[split][1])
+        if split != 'live_sel' and len(data[split][1]):
             beats.append(report[split]['deployed_blend']['logloss'] < report[split]['hand']['logloss'])
     # Judge what the engine will play (the blend), not the raw net. The engine
     # divides by a (hand units); a flat or inverted fit is unusable.

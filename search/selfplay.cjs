@@ -2,9 +2,17 @@
  *
  * usage: node search/selfplay.cjs <teams.json> <focus-team.json> <games> <seed> <out.jsonl> [value.json]
  *        [--focus-prob P] [--value-beta B] [--tag NAME]
+ *        [--pool2 ladder-teams.json --pool2-prob Q] [--noisy-prob N --noisy-eps E] [--random-prob R]
  *
  * With probability P (default 0.5) one side, chosen at random, plays the focus
  * (deployed) team and the other a pool team; otherwise both come from the pool.
+ * With --pool2, each non-focus team is drawn from that second pool with
+ * probability Q (ladder replicas of the opponents actually met, one per game, so
+ * the ladder's own frequencies). Opponent styles model weaker ladder play: a
+ * non-focus side plays the equilibrium with exploration E instead of 0.08
+ * (probability N), or a uniformly random legal action (probability R). The focus
+ * side always plays the search. Rows record the game's style `k` (0 search vs
+ * search, 1 a noisy side, 2 a random side) so training can include or ablate them.
  * Each line is one turn-start position from one side's perspective:
  *   {x: features, y: outcome (1 win, 0 loss, .5 tie), t: turn index, g: game id,
  *    s: side 0/1, f: 1 if that side is the focus team, h: hand evaluation,
@@ -32,6 +40,12 @@ const focus = focusRaw.sets || focusRaw;
 const focusProb = flags['focus-prob'] === undefined ? 0.5 : +flags['focus-prob'];
 const valueBeta = flags['value-beta'] === undefined ? 1 : +flags['value-beta'];
 const tag = flags.tag || 'sp';
+const pool2 = flags.pool2 ? JSON.parse(fs.readFileSync(flags.pool2, 'utf8')).map(t => t.sets || t) : null;
+const pool2Prob = pool2 ? (flags['pool2-prob'] === undefined ? 0.5 : +flags['pool2-prob']) : 0;
+const noisyProb = +(flags['noisy-prob'] || 0);
+const noisyEps = flags['noisy-eps'] === undefined ? 0.35 : +flags['noisy-eps'];
+const randomProb = +(flags['random-prob'] || 0);
+const STYLE = {search: 0, noisy: 1, random: 2};
 const games = +gamesArg;
 let seed = +seedArg;
 const seed0 = seed;
@@ -57,10 +71,11 @@ function sample(p) {
   return p.length - 1;
 }
 
-function chooseTurn(battle) {
+function chooseTurn(battle, styles = ['search', 'search']) {
   const base = JSON.stringify(E.State.serializeBattle(battle));
   let A = E.sideChoices(battle, battle.sides[0]);
   let B = E.sideChoices(battle, battle.sides[1]);
+  const allA = A, allB = B;
   const sim = (a, b) => {
     const c = E.State.deserializeBattle(base);
     c.prng = new E.PRNG([Math.floor(rng() * 65535), 1, 2, 3]);
@@ -98,9 +113,10 @@ function chooseTurn(battle) {
   const {x, y} = E.solveZeroSum(sub, 400);
   let v = 0;
   rows.forEach((_, r) => cols.forEach((_, c) => { v += x[r] * sub[r][c] * y[c]; }));
-  const eps = 0.08;
-  const xa = x.map(p => (1 - eps) * p + eps / x.length), yb = y.map(p => (1 - eps) * p + eps / y.length);
-  return {a: A[rows[sample(xa)]], b: B[cols[sample(yb)]], v};
+  const eps = s => (styles[s] === 'noisy' ? noisyEps : 0.08);
+  const xa = x.map(p => (1 - eps(0)) * p + eps(0) / x.length), yb = y.map(p => (1 - eps(1)) * p + eps(1) / y.length);
+  return {a: styles[0] === 'random' ? pick(allA) : A[rows[sample(xa)]],
+          b: styles[1] === 'random' ? pick(allB) : B[cols[sample(yb)]], v};
 }
 
 function forced(battle, side) {
@@ -117,14 +133,25 @@ function forced(battle, side) {
   return parts.join(', ');
 }
 
+function poolTeam() { return pool2 && rng() < pool2Prob ? pick(pool2) : pick(teams); }
+
+function style() {
+  const r = rng();
+  return r < randomProb ? 'random' : r < randomProb + noisyProb ? 'noisy' : 'search';
+}
+
 function playOne(gameIndex) {
-  let t1 = pick(teams), t2 = pick(teams);
+  let t1 = poolTeam(), t2 = poolTeam();
   const isFocus = [false, false];
   if (rng() < focusProb) {
     const side = rng() < 0.5 ? 0 : 1;
     if (side === 0) t1 = focus; else t2 = focus;
     isFocus[side] = true;
   }
+  // Without style flags no random draw is spent here, so seeds replay as before.
+  const styles = noisyProb || randomProb ? isFocus.map(f => (f ? 'search' : style())) : ['search', 'search'];
+  if (!isFocus[0] && !isFocus[1] && styles[0] !== 'search' && styles[1] !== 'search') styles[rng() < 0.5 ? 0 : 1] = 'search';
+  const k = Math.max(STYLE[styles[0]], STYLE[styles[1]]);
   const g = `${tag}-${seed0}-${gameIndex}`;
   const battle = new E.Battle({formatid: FMT, seed: [Math.floor(rng() * 65535), 3, 5, 7]});
   battle.setPlayer('p1', {name: 'A', team: E.Teams.pack(t1)});
@@ -137,7 +164,7 @@ function playOne(gameIndex) {
     if (battle.requestState === 'move') {
       const hand = E.handEvaluate(battle);
       const turn = {x0: features(battle, 0), x1: features(battle, 1), h: hand, t: battle.turn};
-      const {a, b, v} = chooseTurn(battle);
+      const {a, b, v} = chooseTurn(battle, styles);
       turn.v = v;
       states.push(turn);
       if (!battle.choose('p1', a)) battle.choose('p1', 'default');
@@ -155,8 +182,9 @@ function playOne(gameIndex) {
   const r = n => (n === null || n === undefined ? null : Math.round(n * 1e4) / 1e4);
   let buf = '';
   for (const st of states) {
-    buf += JSON.stringify({x: st.x0, y, t: st.t, g, s: 0, f: isFocus[0] ? 1 : 0, h: r(st.h), v: r(st.v)}) + '\n';
-    buf += JSON.stringify({x: st.x1, y: 1 - y, t: st.t, g, s: 1, f: isFocus[1] ? 1 : 0, h: r(-st.h), v: st.v === null ? null : r(-st.v)}) + '\n';
+    const extra = k ? {k} : {};
+    buf += JSON.stringify({x: st.x0, y, t: st.t, g, s: 0, f: isFocus[0] ? 1 : 0, h: r(st.h), v: r(st.v), ...extra}) + '\n';
+    buf += JSON.stringify({x: st.x1, y: 1 - y, t: st.t, g, s: 1, f: isFocus[1] ? 1 : 0, h: r(-st.h), v: st.v === null ? null : r(-st.v), ...extra}) + '\n';
   }
   fs.appendFileSync(outPath, buf);
   return states.length * 2;

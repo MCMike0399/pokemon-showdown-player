@@ -95,7 +95,8 @@ def promote(candidate: Path, beta: float, evidence: dict, pointer: Path = POINTE
     return record
 
 
-FIELDS = ('y', 'h', 't', 's', 'f')
+FIELDS = ('y', 'h', 't', 's', 'f', 'v', 'k')
+DEFAULT_FIELD = {'k': 0.0}  # rows from before opponent styles were search vs search
 
 
 def pack_shard(path: Path) -> Path | None:
@@ -112,7 +113,7 @@ def pack_shard(path: Path) -> Path | None:
                 continue
             xs.append(r['x'])
             for k in FIELDS:
-                v = r.get(k)
+                v = r.get(k, DEFAULT_FIELD.get(k))
                 cols[k].append(np.nan if v is None else float(v))
             games.append(r['g'])
     if not xs:
@@ -124,6 +125,36 @@ def pack_shard(path: Path) -> Path | None:
              **{k: np.asarray(v, np.float32) for k, v in cols.items()})
     os.replace(tmp, out)
     return out
+
+
+def load_shard_columns(path: Path):
+    """(x, g, {field: float32 array}) for every FIELDS column; NaN where a row lacks it.
+From the cache when it matches the JSONL size and has every column."""
+    path = Path(path)
+    cache = path.with_suffix('.npz')
+    if cache.exists():
+        try:
+            data = np.load(cache, allow_pickle=False)
+            if int(data['source_bytes']) == path.stat().st_size and all(k in data.files for k in FIELDS):
+                return data['x'], data['g'].tolist(), {k: data[k] for k in FIELDS}
+        except (OSError, ValueError, KeyError):
+            pass
+    xs, gs, cols = [], [], {k: [] for k in FIELDS}
+    with path.open() as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if 'g' not in r or r.get('h') is None:
+                continue
+            xs.append(r['x']); gs.append(r['g'])
+            for k in FIELDS:
+                v = r.get(k, DEFAULT_FIELD.get(k))
+                cols[k].append(np.nan if v is None or isinstance(v, str) else float(v))
+    if not xs:
+        return np.zeros((0, 0), np.float32), [], {k: np.zeros(0, np.float32) for k in FIELDS}
+    return np.asarray(xs, np.float32), gs, {k: np.asarray(v, np.float32) for k, v in cols.items()}
 
 
 def load_shard(path: Path):

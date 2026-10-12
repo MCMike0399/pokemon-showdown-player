@@ -93,7 +93,9 @@ def _our_set(team_sets: list[dict], species: str) -> dict | None:
     for s in team_sets or []:
         if to_id(_base(s.get('species') or '')) == sid or sid.startswith(to_id(s.get('species') or '')):
             return s
-    return None
+    # A forme's Mega drops the forme name: Floette-Eternal + Floettite -> Floette-Mega.
+    formes = [s for s in team_sets or [] if to_id(s.get('species') or '').startswith(sid)]
+    return formes[0] if len(formes) == 1 else None
 
 
 def _volatiles(mon) -> dict:

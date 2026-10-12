@@ -142,3 +142,12 @@ def test_engine_searches_rebuilt_battle():
     assert all(math.isfinite(v) for v in values.values()) and len(set(values.values())) > 1
     r = result['results'][0]
     assert r['sims'] > 0 and r['n_theirs'] >= 1 and r['top_opp']
+
+
+def test_own_set_found_for_a_formes_mega():
+    from search.agent import _our_set
+    team = [{'species': 'Floette-Eternal', 'item': 'Floettite'}, {'species': 'Garchomp', 'item': 'Garchompite Z'}]
+    assert _our_set(team, 'Floette-Mega')['species'] == 'Floette-Eternal'
+    assert _our_set(team, 'Garchomp-Mega-Z')['species'] == 'Garchomp'
+    assert _our_set(team, 'Floette-Eternal')['species'] == 'Floette-Eternal'
+    assert _our_set(team, 'Politoed') is None
