@@ -8,11 +8,22 @@
  * (deployed) team and the other a pool team; otherwise both come from the pool.
  * With --pool2, each non-focus team is drawn from that second pool with
  * probability Q (ladder replicas of the opponents actually met, one per game, so
- * the ladder's own frequencies). Opponent styles model weaker ladder play: a
+ * the ladder's own frequencies). A pool2 entry may carry a weight `w` (default 1):
+ * teams are then drawn in proportion to it, e.g. heavier for the games we lost
+ * (search/build_matchup_weights.py). Opponent styles model weaker ladder play: a
  * non-focus side plays the equilibrium with exploration E instead of 0.08
  * (probability N), or a uniformly random legal action (probability R). The focus
  * side always plays the search. Rows record the game's style `k` (0 search vs
  * search, 1 a noisy side, 2 a random side) so training can include or ablate them.
+ *
+ * Sibling groups (--siblings S --sibling-out groups.jsonl [--sibling-rollouts R]
+ * [--sibling-prob P]): at a sampled turn, one side's S best actions by this
+ * search are each played against the same sampled reply with the same chance
+ * stream, and every resulting position is played out R times to the end. One
+ * line per group: siblings that differ only in our action, each with its
+ * features, hand evaluation and playout score, from the varying side's view.
+ * search/sibling_metric.py asks whether an evaluation ranks them as the
+ * playouts do: the comparison the search makes at its leaves.
  * Each line is one turn-start position from one side's perspective:
  *   {x: features, y: outcome (1 win, 0 loss, .5 tie), t: turn index, g: game id,
  *    s: side 0/1, f: 1 if that side is the focus team, h: hand evaluation,
@@ -40,12 +51,19 @@ const focus = focusRaw.sets || focusRaw;
 const focusProb = flags['focus-prob'] === undefined ? 0.5 : +flags['focus-prob'];
 const valueBeta = flags['value-beta'] === undefined ? 1 : +flags['value-beta'];
 const tag = flags.tag || 'sp';
-const pool2 = flags.pool2 ? JSON.parse(fs.readFileSync(flags.pool2, 'utf8')).map(t => t.sets || t) : null;
+const pool2Raw = flags.pool2 ? JSON.parse(fs.readFileSync(flags.pool2, 'utf8')) : null;
+const pool2 = pool2Raw ? pool2Raw.map(t => t.sets || t) : null;
+const pool2W = pool2Raw ? pool2Raw.map(t => (t.w === undefined ? 1 : Math.max(0, +t.w))) : null;
+const pool2Total = pool2W ? pool2W.reduce((a, b) => a + b, 0) : 0;
 const pool2Prob = pool2 ? (flags['pool2-prob'] === undefined ? 0.5 : +flags['pool2-prob']) : 0;
 const noisyProb = +(flags['noisy-prob'] || 0);
 const noisyEps = flags['noisy-eps'] === undefined ? 0.35 : +flags['noisy-eps'];
 const randomProb = +(flags['random-prob'] || 0);
 const STYLE = {search: 0, noisy: 1, random: 2};
+const siblings = +(flags.siblings || 0);
+const siblingOut = flags['sibling-out'];
+const siblingRollouts = +(flags['sibling-rollouts'] || 2);
+const siblingProb = flags['sibling-prob'] === undefined ? 0.25 : +flags['sibling-prob'];
 const games = +gamesArg;
 let seed = +seedArg;
 const seed0 = seed;
@@ -116,7 +134,72 @@ function chooseTurn(battle, styles = ['search', 'search']) {
   const eps = s => (styles[s] === 'noisy' ? noisyEps : 0.08);
   const xa = x.map(p => (1 - eps(0)) * p + eps(0) / x.length), yb = y.map(p => (1 - eps(1)) * p + eps(1) / y.length);
   return {a: styles[0] === 'random' ? pick(allA) : A[rows[sample(xa)]],
-          b: styles[1] === 'random' ? pick(allB) : B[cols[sample(yb)]], v};
+          b: styles[1] === 'random' ? pick(allB) : B[cols[sample(yb)]], v, m: {A, B, rows, cols, sub, x, y}};
+}
+
+// Plays a position to the end with the search on both sides; 1 side 0 wins, 0 loses, .5 tie/unfinished.
+function playOut(battle) {
+  let guard = 0;
+  while (!battle.ended && guard++ < 60) {
+    if (battle.requestState === 'move') {
+      const {a, b} = chooseTurn(battle);
+      if (!battle.choose('p1', a)) battle.choose('p1', 'default');
+      if (!battle.choose('p2', b)) battle.choose('p2', 'default');
+    } else if (battle.requestState === 'switch') {
+      for (const [i, s] of battle.sides.entries()) {
+        if (s.requestState === 'switch' && !s.isChoiceDone()) {
+          if (!battle.choose('p' + (i + 1), forced(battle, s))) battle.choose('p' + (i + 1), 'default');
+        }
+      }
+    } else break;
+  }
+  if (!battle.ended) return 0.5;
+  return battle.winner === 'A' ? 1 : battle.winner === 'B' ? 0 : 0.5;
+}
+
+function siblingGroup(battle, grp) {
+  const {m} = chooseTurn(battle);
+  if (!m || !m.sub) return null;
+  const {A, B, rows, cols, sub, x, y} = m;
+  const side = rng() < 0.5 ? 0 : 1;
+  let mine, reply;
+  if (side === 0) {
+    const val = rows.map((_, r) => sub[r].reduce((acc, v, c) => acc + v * y[c], 0));
+    mine = rows.map((i, r) => [A[i], val[r]]).sort((p, q) => q[1] - p[1]).slice(0, siblings).map(p => p[0]);
+    reply = B[cols[sample(y)]];
+  } else {
+    const val = cols.map((_, c) => rows.reduce((acc, _i, r) => acc + x[r] * sub[r][c], 0));
+    mine = cols.map((j, c) => [B[j], val[c]]).sort((p, q) => p[1] - q[1]).slice(0, siblings).map(p => p[0]);
+    reply = A[rows[sample(x)]];
+  }
+  if (mine.length < 2) return null;
+  const base = JSON.stringify(E.State.serializeBattle(battle));
+  const chance = [Math.floor(rng() * 65535), 1, 2, 3];
+  const sibs = [];
+  for (const act of mine) {
+    const leaf = E.State.deserializeBattle(base);
+    leaf.prng = new E.PRNG(chance);
+    if (!leaf.choose('p1', side === 0 ? act : reply) || !leaf.choose('p2', side === 0 ? reply : act)) continue;
+    const sign = side === 0 ? 1 : -1;
+    const sib = {c: act, x: features(leaf, side), h: Math.round(sign * E.handEvaluate(leaf) * 1e4) / 1e4};
+    if (leaf.ended) {
+      sib.y = leaf.winner === (side === 0 ? 'A' : 'B') ? 1 : leaf.winner ? 0 : 0.5;
+      sib.n = 0;
+    } else {
+      const leafStr = JSON.stringify(E.State.serializeBattle(leaf));
+      let total = 0;
+      for (let k = 0; k < siblingRollouts; k++) {
+        const copy = E.State.deserializeBattle(leafStr);
+        copy.prng = new E.PRNG([Math.floor(rng() * 65535), k + 1, 5, 7]);
+        const out = playOut(copy);
+        total += side === 0 ? out : 1 - out;
+      }
+      sib.y = total / siblingRollouts;
+      sib.n = siblingRollouts;
+    }
+    sibs.push(sib);
+  }
+  return sibs.length >= 2 ? {grp, side, turn: battle.turn, reply, sibs} : null;
 }
 
 function forced(battle, side) {
@@ -133,7 +216,13 @@ function forced(battle, side) {
   return parts.join(', ');
 }
 
-function poolTeam() { return pool2 && rng() < pool2Prob ? pick(pool2) : pick(teams); }
+// With equal weights this is exactly pick(pool2): same draw, same index.
+function pickWeighted() {
+  let r = rng() * pool2Total;
+  for (let i = 0; i < pool2.length; i++) { r -= pool2W[i]; if (r < 0) return pool2[i]; }
+  return pool2[pool2.length - 1];
+}
+function poolTeam() { return pool2 && rng() < pool2Prob ? pickWeighted() : pick(teams); }
 
 function style() {
   const r = rng();
@@ -162,6 +251,10 @@ function playOne(gameIndex) {
   let guard = 0;
   while (!battle.ended && guard++ < 60) {
     if (battle.requestState === 'move') {
+      if (siblings && siblingOut && rng() < siblingProb) {
+        const group = siblingGroup(battle, `${g}-t${battle.turn}`);
+        if (group) fs.appendFileSync(siblingOut, JSON.stringify(group) + '\n');
+      }
       const hand = E.handEvaluate(battle);
       const turn = {x0: features(battle, 0), x1: features(battle, 1), h: hand, t: battle.turn};
       const {a, b, v} = chooseTurn(battle, styles);

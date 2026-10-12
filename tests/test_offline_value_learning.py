@@ -412,3 +412,29 @@ def test_team_data_is_organised_per_team(tmp_path, monkeypatch):
     assert index['teams']['Sun B']['games'] == 1 and index['teams']['Sun B']['wins'] == 1
     game = json.loads((tmp_path / 'teams' / 'sun-b' / 'games.jsonl').read_text())
     assert game['rating'] == 1200 and game['opp_rating'] == 1250 and game['opp_preview'] == ['Gardevoir']
+
+
+@needs_sim
+def test_second_turn_rescores_only_top_actions_of_close_worlds():
+    base = {'type': 'search', 'format': FMT, 'worlds': [WORLD], 'field': FIELD, 'our_choices': CHOICES, 'crn': True}
+    d2 = {'margin': 1e9, 'top_ours': 2, 'top_opp': 3, 'keep': 4, 'probes': 2}
+    one, two, never = (r['results'][0] for r in engine(base, {**base, 'depth2': d2}, {**base, 'depth2': {**d2, 'margin': -1}}))
+    assert 'depth2' not in one and 'depth2' not in never
+    assert never['values'] == one['values'] and never['sims'] == one['sims']  # not close: plain one-turn search
+    info = two['depth2']
+    assert len(info['corr']) == 2 and info['sims'] > 0 and two['sims'] == one['sims'] + info['sims']
+    top = sorted(one['values'], key=one['values'].get, reverse=True)[:2]
+    for c, v in one['values'].items():
+        expected = v + info['corr'][c] if c in top else v
+        assert two['values'][c] == pytest.approx(expected)
+
+
+def test_weighted_ladder_pool_prefers_lost_games(tmp_path):
+    from search.build_matchup_weights import main
+    teams = [{'battle': 'own-battle-fmt-1-pw', 'sets': []}, {'battle': 'own-battle-fmt-2', 'sets': []},
+             {'battle': 'own-battle-fmt-3', 'sets': []}]
+    (tmp_path / 't.json').write_text(json.dumps(teams))
+    (tmp_path / 'g.jsonl').write_text('\n'.join(json.dumps(g) for g in (
+        {'room': 'battle-fmt-1', 'win': False}, {'room': 'battle-fmt-2-xyz', 'win': True})))
+    main([str(tmp_path / 't.json'), str(tmp_path / 'g.jsonl'), str(tmp_path / 'o.json'), '--loss-weight', '3'])
+    assert [t['w'] for t in json.loads((tmp_path / 'o.json').read_text())] == [3.0, 1.0, 1.0]

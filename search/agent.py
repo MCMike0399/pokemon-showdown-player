@@ -111,7 +111,7 @@ class SearchAgent:
                  keep_nonmega: bool = False, log=None, screen=None, value_path=None, value_beta=0.0, value_scale=8.0, preview_mode='incumbent', preview_worlds=6,
                  crn: bool = False, adaptive_margin: float | None = None, adaptive_worlds: int = 0,
                  adaptive_max_ms: float = 6000.0, engine_timeout: float = 120.0, screen_model=None,
-                 screen_log: float = 0.0):
+                 screen_log: float = 0.0, depth2: dict | None = None):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -143,6 +143,8 @@ class SearchAgent:
         self.screen_model = None
         self.set_screen(screen_model)
         self.screen_log = float(screen_log or 0.0)
+        # Selective second turn on close worlds (engine.cjs secondTurn); None = one turn.
+        self.depth2 = dict(depth2) if depth2 else None
         self.log_rng = random.Random(seed + 7919)
         self.screen_records: list[dict] = []
         self.stats = {'decisions': 0, 'ms': 0.0, 'fallbacks': 0, 'errors': [], 'sims': 0}
@@ -409,6 +411,8 @@ class SearchAgent:
                 'seeds': self.seeds, 'alpha': self.alpha, 'opp_tau': self.opp_tau,
                 'max_opp': self.max_opp, 'opp_no_switch': self.opp_no_switch, 'screen': screen, 'crn': self.crn,
                 **self.value}
+        if self.depth2:
+            base['depth2'] = self.depth2
         n = len(self.engines)
         chunks = [worlds[i::n] for i in range(n)]
         calls = []
@@ -483,6 +487,7 @@ class SearchAgent:
             'root_hand': round(sum(r['hand'] for r in roots) / len(roots), 4) if roots else None,
             'value': {'path': self.value.get('value_path'), 'beta': self.value.get('value_beta')}, 'crn': self.crn,
             'screen_sims': sum(r.get('screen_sims') or 0 for r in results),
+            'depth2_worlds': sum(1 for r in results if r.get('depth2')),
             'screen': (self.screen_model or {}).get('sha256')}
         if self.log is not None:
             top = sorted(scored.items(), key=lambda kv: -kv[1])[:5]

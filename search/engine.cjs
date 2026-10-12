@@ -381,6 +381,66 @@ function rankLearned(net, battle, sideIdx, choices) {
 }
 const r4 = v => (Number.isFinite(v) ? Math.round(v * 1e4) / 1e4 : null);
 
+// ------------------------------------------------------------------ selective second turn
+// One-turn search from a position reached inside the matrix: rank their actions
+// against `probes` evenly spaced probes of ours, ours against their best `probes`,
+// keep `keep` x `keep`, solve, return the equilibrium value. null for an ended game
+// or a forced switch (the one-turn leaf already scored those).
+function secondTurn(bb, d2, seedBase) {
+  if (bb.ended || bb.requestState !== 'move') return null;
+  let A = sideChoices(bb, bb.sides[0]);
+  let B = sideChoices(bb, bb.sides[1]);
+  if (!A.length || !B.length) return null;
+  const s = JSON.stringify(State.serializeBattle(bb));
+  const keep = d2.keep || 6, P = d2.probes || 2;
+  let n = 0;
+  // Common random numbers: a cell's seed depends on the reply only.
+  const sim = (a, b, k) => {
+    const c = State.deserializeBattle(s);
+    c.prng = new PRNG([seedBase % 65536 + 1, k + 3, 5, 11]);
+    if (!c.choose('p1', a)) return null;
+    if (!c.choose('p2', b)) return undefined;
+    n++;
+    return evaluate(c);
+  };
+  if (B.length > keep) {
+    const step = Math.max(1, Math.floor(A.length / P));
+    const probes = [];
+    for (let i = 0; i < A.length && probes.length < P; i += step) probes.push(A[i]);
+    const sc = B.map((b, j) => {
+      let t = 0, m = 0;
+      for (const a of probes) { const v = sim(a, b, j); if (v === undefined) return [b, Infinity]; if (v !== null) { t += v; m++; } }
+      return [b, m ? t / m : Infinity];
+    }).filter(p => p[1] !== Infinity).sort((p, q) => p[1] - q[1]);
+    B = sc.slice(0, keep).map(p => p[0]);
+  }
+  if (A.length > keep) {
+    const top = B.slice(0, P);
+    const sc = A.map(a => {
+      let t = 0, m = 0;
+      for (const [k, b] of top.entries()) { const v = sim(a, b, k); if (v === null) return [a, -Infinity]; if (v !== undefined) { t += v; m++; } }
+      return [a, m ? t / m : -Infinity];
+    }).filter(p => p[1] !== -Infinity).sort((p, q) => q[1] - p[1]);
+    A = sc.slice(0, keep).map(p => p[0]);
+  }
+  const okA = A.map(() => true), okB = B.map(() => true);
+  const M = A.map((a, i) => B.map((b, j) => {
+    if (!okA[i] || !okB[j]) return NaN;
+    const v = sim(a, b, j);
+    if (v === null) { okA[i] = false; return NaN; }
+    if (v === undefined) { okB[j] = false; return NaN; }
+    return v;
+  }));
+  const rows = A.map((_, i) => i).filter(i => okA[i]);
+  const cols = B.map((_, j) => j).filter(j => okB[j] && rows.every(i => Number.isFinite(M[i][j])));
+  if (!rows.length || !cols.length) return null;
+  const sub = rows.map(i => cols.map(j => M[i][j]));
+  const {x, y} = solveZeroSum(sub, d2.iters || 300);
+  let v = 0;
+  rows.forEach((_, r) => cols.forEach((_, c) => { v += x[r] * sub[r][c] * y[c]; }));
+  return {v, sims: n};
+}
+
 // ------------------------------------------------------------------ search
 function searchWorld(msg, world, wi, opts) {
   const t0 = Date.now();
@@ -491,6 +551,47 @@ function searchWorld(msg, world, wi, opts) {
     worst[ours[i]] = Math.min(...sub[r]);
     nashValue[ours[i]] = sub[r].reduce((a, v, c) => a + v * y[c], 0);
   });
+  // msg.depth2 = {margin, top_ours, top_opp, keep, probes}: when this world's two
+  // best actions are within `margin`, look one more turn ahead for its top
+  // `top_ours` actions against the `top_opp` likeliest replies. Each re-scored
+  // action gets the probability-weighted depth-2 minus depth-1 difference on those
+  // cells, so all actions stay on the one-turn scale; cells that end the game or
+  // force a switch keep their one-turn value.
+  let depth2 = null;
+  if (msg.depth2 && rows.length > 1) {
+    const d2 = msg.depth2;
+    const order = rows.slice().sort((i1, i2) => values[ours[i2]] - values[ours[i1]]);
+    const margin = values[ours[order[0]]] - values[ours[order[1]]];
+    if (margin < (d2.margin === undefined ? 0.5 : d2.margin)) {
+      const top = cols.map((j, c) => c).sort((c1, c2) => q[c2] - q[c1]).slice(0, d2.top_opp || 3);
+      const qs = top.reduce((a, c) => a + q[c], 0);
+      const corr = {};
+      let extraSims = 0, deep = 0;
+      for (const i of order.slice(0, d2.top_ours || 2)) {
+        const r = rows.indexOf(i);
+        let delta = 0;
+        for (const c of top) {
+          const j = cols[c];
+          // Replays the matrix cell exactly (its seed, seeds = 1), then searches on.
+          const bb = State.deserializeBattle(baseStr);
+          bb.prng = new PRNG([wi * 131 + 1, crn ? 3 : i + 3, j + 5, 11]);
+          if (!bb.choose('p1', ours[i]) || !bb.choose('p2', theirs[j])) continue;
+          const res = secondTurn(bb, d2, wi * 977 + i * 31 + j);
+          extraSims++;
+          if (!res) continue;
+          extraSims += res.sims;
+          deep++;
+          delta += q[c] * (res.v - sub[r][c]);
+        }
+        if (qs > 0) {
+          corr[ours[i]] = delta / qs;
+          values[ours[i]] += corr[ours[i]];
+        }
+      }
+      sims += extraSims;
+      depth2 = {margin, corr, cells: deep, sims: extraSims};
+    }
+  }
   const ourMix = {};
   rows.forEach((i, r) => { ourMix[ours[i]] = x[r]; });
   const topOpp = cols.map((j, c) => [theirs[j], q[c]]).sort((a, b) => b[1] - a[1]).slice(0, 5);
@@ -502,6 +603,7 @@ function searchWorld(msg, world, wi, opts) {
   if (msg.features) root.x = valueFeatures(battle, 0);
   const out = {values, worst, nash: nashValue, mix: ourMix, ms: Date.now() - t0, sims: sims + screenSims,
                screen_sims: screenSims, screened, n_ours: rows.length, n_theirs: cols.length, top_opp: topOpp, root};
+  if (depth2) out.depth2 = depth2;
   if (record && (record.ours || record.theirs)) {
     // Probe results of every candidate, for the learned screening ranker. `best`
     // is this world's final choice, which a prefilter must never drop.

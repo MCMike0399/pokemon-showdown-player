@@ -19,6 +19,10 @@ gains >= losses AND the candidate's simulations per decision are at most
 (1 - --min-sim-saving) of the incumbent's; reject early once losses exceed
 gains by 5 after 40 pairs. Both stages (development, confirmation on fresh
 seeds) must pass, as for values.
+
+A search-configuration change (e.g. the selective second turn) is gated the same
+way with `--cand-search '{"depth2": {...}}'`: those keys override the deployed
+configuration in the candidate arm only; value and screening are equal in both.
 """
 from __future__ import annotations
 
@@ -116,9 +120,10 @@ different seed, which would break the pairing), so a gate always terminates.
 async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, concurrency: int, seed: int,
                    team: list[dict], pool: list[list[dict]], engines: int, alpha: float, log=print,
                    rule: str = 'superior', min_sim_saving: float = 0.0, screen_log_dir: Path | None = None) -> dict:
-    """`candidate`/`incumbent`: {'path', 'beta', 'screen'}; 'screen' is a learned
-screening model (search.screen_data) or None for probe screening. The opponent
-always plays the incumbent's screening and the hand evaluation."""
+    """`candidate`/`incumbent`: {'path', 'beta', 'screen', 'search'}; 'screen' is a learned
+screening model (search.screen_data) or None for probe screening, 'search' optional
+overrides of the deployed search configuration. The opponent always plays the
+deployed configuration, the incumbent's screening and the hand evaluation."""
     from search.agent import SearchAgent
     from search.screen_data import write_records
     summary = lambda: summarize(rows, pairs, alpha, rule, min_sim_saving)  # noqa: E731
@@ -152,7 +157,8 @@ always plays the incumbent's screening and the hand evaluation."""
             # Adaptive worlds are wall-clock bounded live; gate games run slower on
             # background cores, so lift the bound to measure the intended policy.
             us = SearchAgent(fmt=FMT, preview=preview, seed=game_seed,
-                             **agent_kwargs(engines=engines, adaptive_max_ms=1e9, engine_timeout=900.0),
+                             **{**agent_kwargs(engines=engines, adaptive_max_ms=1e9, engine_timeout=900.0),
+                                **(value.get('search') or {})},
                              value_path=value.get('path'), value_beta=value.get('beta', 0.0),
                              screen_model=value.get('screen'))
             them = SearchAgent(fmt=FMT, preview=preview, seed=game_seed + 1,
@@ -222,12 +228,13 @@ def main():
     ap.add_argument('--rule', choices=['superior', 'noninferior'], default='superior')
     ap.add_argument('--min-sim-saving', type=float, default=0.0)
     ap.add_argument('--screen-log-dir', type=Path, help='write probe results of every game here')
+    ap.add_argument('--cand-search', type=json.loads, help='JSON overrides of the search config, candidate arm only')
     args = ap.parse_args()
     team = json.loads((ROOT / 'teams.json').read_text())[args.team]['sets']
     pool = [t['sets'] if isinstance(t, dict) else t for t in json.loads(args.pool.read_text())]
     from search.screen_data import model_from_file
     cand = {'path': args.candidate, 'beta': args.beta if args.candidate else 0.0,
-            'screen': model_from_file(args.cand_screen)}
+            'screen': model_from_file(args.cand_screen), 'search': args.cand_search}
     inc = {'path': args.incumbent, 'beta': args.incumbent_beta if args.incumbent else 0.0,
            'screen': model_from_file(args.inc_screen)}
     result = asyncio.run(run_gate(cand, inc, args.out, args.pairs, args.concurrency, args.seed, team, pool,
