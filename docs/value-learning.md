@@ -119,6 +119,47 @@ Results are in `artifacts/value-learning/noise-60.json` (private).
 
 `search/learning_report.py --hours 24` prints this picture at any time.
 
+## Campaign c1 (2026-10-12): 1,018 live games, what they bought
+
+- **Live:** 518-500 (50.9%) with the hand evaluation all iteration; no candidate
+  passed a gate, so the live policy never changed. Games under 4 turns were won
+  99% of the time, 10+ turns 24%; Venusaur, Gardevoir and Charizard previews
+  were the worst matchups. Archived on DiveMac at
+  `data/research-archive/live-iteration1-20261012/`.
+- **Opponents from the games:** the real-team pool grew from 78 to 112 open team
+  sheets (`build_real_teams.py`), and 1,839 ladder replicas (`build_ladder_teams.py`,
+  one per live game) feed self-play through `selfplay.cjs --pool2`. 76k rows of
+  this self-play predicted live outcomes as well as 480k rows of the old pool.
+- **Self-play styles:** `--noisy-prob/--random-prob` give non-focus sides an
+  exploratory or random policy (rows carry `k`); `train_value.py --max-style`
+  ablates them. Keeping them was marginally best.
+- **Training:** `--ensemble 5` distills five seeds into one engine-compatible net
+  (seed spread on live log loss fell from about 0.017 to 0.002). Settings are
+  chosen on `live_sel` (newest half of the non-test live games), never on the
+  newest 40%. Final candidate `2f03204e`: live-test log loss 0.497 vs 0.538 for
+  the hand evaluation, AUC 0.831 vs 0.793.
+- **Gate:** inconclusive. Dev 12-11 after 80 pairs, confirm 9-5 after 58, both
+  stopped by hand. Iteration 1's six earlier gates totalled 58-71: **live log
+  loss does not predict gate results.**
+
+Why the gate rarely passes: only about 21% of pairs are discordant. At 120 pairs
+per stage a true +3-point win-rate gain passes both stages 2% of the time, +5
+points 7%; at 400 pairs 10% and 44%; at 1,000 pairs 40% and 92%. The gate only
+sees large effects, and outcome log loss is the wrong proxy for a leaf
+evaluation. Two tools address this:
+
+- `selfplay.cjs --siblings` writes groups of positions that differ only in one
+  side's action (same reply, same chance stream), each played out to the end;
+  `search/sibling_metric.py` scores any evaluation on ranking them, which is the
+  comparison the search makes at its leaves.
+- `search/build_matchup_weights.py` weights ladder replicas of lost games
+  (`w` in the pool2 file), so self-play meets the matchups that beat us more often.
+
+The selective second turn (`depth2` in the agent, `engine.cjs` `secondTurn`) re-scores
+a close world's top two actions against the three likeliest replies one turn
+deeper (+37% simulations per decision). It is off in `search/config.py` until its
+own gate passes (`value_gate.py --cand-search`).
+
 ## Data organised by team
 
 Everything is stored per team (`search/team_data.py`), so a new team never

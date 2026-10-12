@@ -6,6 +6,13 @@ simulation, one training run, and the two-stage paired gate. You then bring back
 whatever passed, and DiveMac deploys it to live play. Nothing moves between the
 Macs on its own. Code: `search/mlops.py`.
 
+Macintosh sessions are bursts of at most about 4 hours: self-play, MPS training
+sweeps, a gate stage that fits. Anything longer (400-pair gates, continuous
+collection, monitoring) runs on DiveMac, as pausable background groups next to
+live play (`data/ml/value/extra-pgids.json`, picked up by the value service in
+any role). After a burst, copy its results to DiveMac and remove Macintosh's
+data copies.
+
 ```
 DiveMac (live, always on)                    Macintosh (trainer, only during a campaign)
   browser-player plays, value service
