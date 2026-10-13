@@ -160,6 +160,41 @@ a close world's top two actions against the three likeliest replies one turn
 deeper (+37% simulations per decision). It is off in `search/config.py` until its
 own gate passes (`value_gate.py --cand-search`).
 
+## Campaign c2 (2026-10-12/13): depth and sibling rankings
+
+The selective second turn was tested against the deployed one-turn search,
+with hand evaluation and probe screening in both arms. The fixed protocol used
+400 pairs per stage, a one-sided sign test at 0.05, and confirmation on fresh
+seeds only after development passed. Depth settings were `margin=0.5`,
+`top_ours=2`, `top_opp=3`, `keep=6`, `probes=2`.
+
+- **Depth gate failed:** 394 complete pairs and 6 void of 400 planned; 53 gains,
+  43 losses, p = 0.17920. Candidate score was 261.5 versus 252 for the incumbent,
+  a positive point estimate without demonstrated superiority. Simulations per
+  decision increased 47.48%. Confirmation was not run; one-turn search remains
+  deployed.
+- **Infrastructure failures:** 24 failed attempts across eight arms exhausted
+  the same-seed retries and voided six pairs. Opponent search emitted invalid
+  Recharge/Struggle pseudo-moves. These are not candidate losses. Even assigning
+  all six void pairs as gains gives p = 0.06855, still above the threshold; this
+  sensitivity check does not replace the fixed gate result.
+- **Sibling ranking:** all 61 stored value candidates were scored at beta 0.5
+  on 6,400 groups. Of these, 2,629 groups (10,512 siblings) had unequal playout
+  scores and contributed to the metric. Hand pair accuracy was 0.6498; the best
+  net, `faa9bf42`, scored 0.6553, a difference of +0.0055 with a paired 95%
+  bootstrap interval of [-0.0029, +0.0134]. No net's interval lay wholly above
+  zero. Beta 0.25/0.75/1.0 checks for that net and `b469e679` also found no clear
+  superiority. Intervals use 2,000 group resamples, seed 0, and do not adjust for
+  selection among candidates.
+
+The sibling metric did not reproduce the six historical dev-gate rankings:
+8/15 pairwise orderings agreed, with Spearman correlation -0.029 against
+gains minus losses. In particular, `3ac1d02d` (12 gains / 5 losses, the strongest
+past dev gate) ranked last of those six on sibling accuracy. The historical
+gates themselves are small; this does not validate the metric as a pre-gate
+filter. Without a clear signal, the next loss-weighted-pool value candidate was
+not trained. Hand evaluation remains deployed.
+
 ## Data organised by team
 
 Everything is stored per team (`search/team_data.py`), so a new team never
