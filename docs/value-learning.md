@@ -195,6 +195,13 @@ gates themselves are small; this does not validate the metric as a pre-gate
 filter. Without a clear signal, the next loss-weighted-pool value candidate was
 not trained. Hand evaluation remains deployed.
 
+## Campaigns c3 and c4 (2026-10-13/14)
+
+The gates above measured candidates against the search itself. Campaigns c3
+and c4 replaced that opponent with an imitation of ladder players learned from
+public replays, tested a human opponent model inside the search (rejected) and
+an opponent-aware team preview (promoted). See `docs/human-opponent.md`.
+
 ## Data organised by team
 
 Everything is stored per team (`search/team_data.py`), so a new team never

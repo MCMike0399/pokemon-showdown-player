@@ -93,6 +93,12 @@ About half of a decision's simulations are the probe screening that only ranks
 candidates. A ranker trained on MPS from logged probe results can replace most of
 them, gated for equal results at fewer simulations. See `docs/learned-screening.md`.
 
+## Opponent-aware team preview
+
+Since 2026-10-14 live team preview uses a matchup value learned from public
+ladder replays (`--preview`), gated against a human-imitation opponent. See
+`docs/human-opponent.md`.
+
 ## Not yet done
 
 - `preview_mode='value'` (score team-preview plans with the value) is written but

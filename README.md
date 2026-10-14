@@ -27,6 +27,10 @@ same local model for decisions, without OpenClaw or per-turn LLM calls.
 simulating every action pair in the official engine over opponent sets sampled from
 ladder usage statistics: 30 wins vs the PPO policy's 19 on the same 45 real-team games.
 
+[Learning the ladder opponent](docs/human-opponent.md): human move and preview models from
+public replays, a human-imitation gate, and the opponent-aware team preview promoted on 2026-10-14
+(the first candidate to pass both gate stages).
+
 ## What's here
 - `ps_client.py` - async client over wss://sim3.psim.us/showdown/websocket (SockJS).
   Handles challstr, login (assertion), rooms, message buffering and battle state.
