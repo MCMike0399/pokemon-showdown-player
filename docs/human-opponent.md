@@ -211,6 +211,11 @@ Live since 2026-10-14 11:03 CST (code ce7d6b8):
     scripts/browser_play.py --team Rain-Recife-special-stat-fix --continuous --resume-active \
         --chrome --search --preview pvalue:data/ml/human/models-preview/pvalue-661448b6a320fce0.json
 
+A copy of the promoted weights is tracked in git at
+`search/human/models/pvalue-661448b6a320fce0.json` (byte-identical to the file the live
+runner loads from the private `data/` tree), so a fresh clone can run or re-gate it:
+`--preview pvalue:search/human/models/pvalue-661448b6a320fce0.json`.
+
 The runner logs a `preview_policy` event per run. When the opponent's six is
 unknown, the old actor's preview is the fallback. Turn decisions are unchanged.
 
