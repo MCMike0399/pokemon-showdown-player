@@ -126,6 +126,12 @@ async def run(args):
 
                         async def preview(ctx):
                             return brain.decide(ctx, explore=False, record=False)['choice']
+                        if args.preview:
+                            # A gated opponent-aware team preview (docs/human-opponent.md, campaign c4);
+                            # the actor's preview stays the fallback when the opponent's six is unknown.
+                            from search.value_gate import make_preview
+                            preview = make_preview(args.preview, preview, int(time.time()))
+                            player.log('preview_policy', spec=args.preview)
                         # One deployed configuration, shared with the value gate.
                         search_kwargs = agent_kwargs(worlds=args.search_worlds, engines=args.search_engines)
                         agent = SearchAgent(fmt=args.format, preview=preview, seed=int(time.time()), **search_kwargs)
@@ -188,6 +194,12 @@ async def run(args):
                                 if screen.get('sha256') != (agent.screen_model or {}).get('sha256'):
                                     agent.set_screen(screen)
                                     player.log('screen_checkpoint', **screen)
+                                # A gated human opponent policy, likewise only between games.
+                                from search.human.store import current_opp, opp_pointer
+                                opp = current_opp(opp_pointer(args.team))
+                                if opp.get('sha256') != (agent.opp_model or {}).get('sha256'):
+                                    agent.set_opp_model(opp)
+                                    player.log('opp_checkpoint', **opp)
                             room = await player.find_battle(args.format, team, args.search_timeout, stop=stop)
                             if not room:
                                 if stop.is_set():
@@ -236,6 +248,7 @@ def parser():
     p.add_argument('--inspect', action='store_true', help='Read-only browser check; no login or games')
     p.add_argument('--no-record', action='store_true', help='Greedy inference without PPO recording')
     p.add_argument('--search', action='store_true', help='Decide turns with the simulator search agent (implies --no-record)')
+    p.add_argument('--preview', default=None, help="team preview policy for --search: 'human:PATH:argmax' or 'pvalue:PATH' (value_gate.make_preview)")
     p.add_argument('--search-worlds', type=int, help='Determinized opponent worlds per decision (default: search/config.py)')
     p.add_argument('--search-engines', type=int, help='Parallel search engine processes (default: search/config.py)')
     p.add_argument('--search-timeout', type=int, default=120)

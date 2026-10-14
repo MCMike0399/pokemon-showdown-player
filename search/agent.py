@@ -85,8 +85,23 @@ def _base(species: str) -> str:
     return re.sub(r'-Mega(-[XYZ])?$', '', species.split(',')[0].strip())
 
 
+_REGIONAL = {'hisuian': 'hisui', 'galarian': 'galar', 'alolan': 'alola', 'paldean': 'paldea'}
+
+
+def _set_species_id(set_: dict) -> str:
+    """Species id of a saved set; 'Hisuian Arcanine' (team-sheet spelling) -> 'arcaninehisui'."""
+    name = str(set_.get('species') or set_.get('name') or '')
+    words = name.split()
+    if len(words) == 2 and words[0].lower() in _REGIONAL:
+        name = words[1] + '-' + _REGIONAL[words[0].lower()].capitalize()
+    return to_id(name)
+
+
 def _our_set(team_sets: list[dict], species: str) -> dict | None:
     sid = to_id(_base(species))
+    for s in team_sets or []:
+        if _set_species_id(s) == sid:
+            return s
     for s in team_sets or []:
         if to_id(s.get('species') or s.get('name')) == sid:
             return s
@@ -111,7 +126,7 @@ class SearchAgent:
                  keep_nonmega: bool = False, log=None, screen=None, value_path=None, value_beta=0.0, value_scale=8.0, preview_mode='incumbent', preview_worlds=6,
                  crn: bool = False, adaptive_margin: float | None = None, adaptive_worlds: int = 0,
                  adaptive_max_ms: float = 6000.0, engine_timeout: float = 120.0, screen_model=None,
-                 screen_log: float = 0.0, depth2: dict | None = None):
+                 screen_log: float = 0.0, depth2: dict | None = None, opp_model: dict | None = None):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -145,6 +160,9 @@ class SearchAgent:
         self.screen_log = float(screen_log or 0.0)
         # Selective second turn on close worlds (engine.cjs secondTurn); None = one turn.
         self.depth2 = dict(depth2) if depth2 else None
+        # Human opponent policy (docs/human-opponent.md): {path, w, temp, sha256} or None.
+        self.opp_model = None
+        self.set_opp_model(opp_model)
         self.log_rng = random.Random(seed + 7919)
         self.screen_records: list[dict] = []
         self.stats = {'decisions': 0, 'ms': 0.0, 'fallbacks': 0, 'errors': [], 'sims': 0}
@@ -159,6 +177,14 @@ class SearchAgent:
         from search.screen_data import engine_model
         learned = engine_model(model)
         self.screen_model = {**learned, 'sha256': (model or {}).get('sha256')} if learned else None
+
+    def set_opp_model(self, model=None):
+        """Swap the learned opponent policy (or back to the equilibrium/greedy mix with None) between games."""
+        if model and model.get('path'):
+            self.opp_model = {'path': str(model['path']), 'w': float(model.get('w', 0.3)),
+                              'temp': float(model.get('temp', 1.0)), 'sha256': model.get('sha256')}
+        else:
+            self.opp_model = None
 
     def take_screen_records(self) -> list[dict]:
         out, self.screen_records = self.screen_records, []
@@ -413,6 +439,8 @@ class SearchAgent:
                 **self.value}
         if self.depth2:
             base['depth2'] = self.depth2
+        if self.opp_model:
+            base['opp_model'] = self.opp_model
         n = len(self.engines)
         chunks = [worlds[i::n] for i in range(n)]
         calls = []
@@ -488,7 +516,8 @@ class SearchAgent:
             'value': {'path': self.value.get('value_path'), 'beta': self.value.get('value_beta')}, 'crn': self.crn,
             'screen_sims': sum(r.get('screen_sims') or 0 for r in results),
             'depth2_worlds': sum(1 for r in results if r.get('depth2')),
-            'screen': (self.screen_model or {}).get('sha256')}
+            'screen': (self.screen_model or {}).get('sha256'),
+            'opp_model': (self.opp_model or {}).get('sha256')}
         if self.log is not None:
             top = sorted(scored.items(), key=lambda kv: -kv[1])[:5]
             self.log.append({'turn': tracker.turn, 'top': top, 'errors': errors[:2],

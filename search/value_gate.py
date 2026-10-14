@@ -117,9 +117,52 @@ different seed, which would break the pairing), so a gate always terminates.
             'passed': bool(passed)}
 
 
+def make_preview(spec: str, fallback, seed: int):
+    """'human:PATH[:temp|argmax]' samples/argmaxes the human preview policy for OUR team;
+'pvalue:PATH' plays the plan with the highest human-games matchup value."""
+    from search.tracker import Tracker
+    kind, _, rest = spec.partition(':')
+    parts = rest.split(':')
+    if kind == 'human':
+        from search.human.preview_model import PreviewPolicy
+        policy = PreviewPolicy(parts[0], temp=float(parts[1]) if len(parts) > 1 and parts[1] != 'argmax' else 1.0, seed=seed)
+        sample = not (len(parts) > 1 and parts[1] == 'argmax')
+
+        async def preview_fn(ctx):
+            request = ctx['request']
+            tracker = Tracker(request['side']['id']).feed(ctx.get('public_log') or [])
+            opp = tracker.preview.get(tracker.foe) or []
+            if len(opp) < 4:
+                return await fallback(ctx)
+            return policy.choose(request, opp, ctx['choices'], sample=sample)
+        return preview_fn
+    if kind == 'pvalue':
+        import numpy as np
+        from search.human.preview_model import PLANS
+        from search.human.preview_value import PreviewValue
+        model = PreviewValue(parts[0])
+
+        async def preview_fn(ctx):
+            request = ctx['request']
+            tracker = Tracker(request['side']['id']).feed(ctx.get('public_log') or [])
+            opp = tracker.preview.get(tracker.foe) or []
+            own = [p['details'].split(',')[0] for p in request['side']['pokemon']]
+            if len(opp) < 4 or len(own) != 6:
+                return await fallback(ctx)
+            legal = set(ctx['choices'])
+            for k in np.argsort(-model.probs(own, opp)):
+                choice = 'team ' + ','.join(str(i + 1) for i in PLANS[k])
+                if choice in legal:
+                    return choice
+            return await fallback(ctx)
+        return preview_fn
+    raise ValueError(spec)
+
+
 async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, concurrency: int, seed: int,
                    team: list[dict], pool: list[list[dict]], engines: int, alpha: float, log=print,
-                   rule: str = 'superior', min_sim_saving: float = 0.0, screen_log_dir: Path | None = None) -> dict:
+                   rule: str = 'superior', min_sim_saving: float = 0.0, screen_log_dir: Path | None = None,
+                   opponent: str = 'search') -> dict:
     """`candidate`/`incumbent`: {'path', 'beta', 'screen', 'search'}; 'screen' is a learned
 screening model (search.screen_data) or None for probe screening, 'search' optional
 overrides of the deployed search configuration. The opponent always plays the
@@ -154,16 +197,32 @@ deployed configuration, the incumbent's screening and the hand evaluation."""
             them_side = 'p2' if us_side == 'p1' else 'p1'
             opp_team = pool[order[pair % len(order)]]
             value = candidate if arm == 'cand' else incumbent
+            # A candidate team-preview policy (search/human/preview_model.py), candidate arm only.
+            our_preview = preview
+            if arm == 'cand' and value.get('preview'):
+                our_preview = make_preview(value['preview'], preview, game_seed)
             # Adaptive worlds are wall-clock bounded live; gate games run slower on
             # background cores, so lift the bound to measure the intended policy.
-            us = SearchAgent(fmt=FMT, preview=preview, seed=game_seed,
+            us = SearchAgent(fmt=FMT, preview=our_preview, seed=game_seed,
                              **{**agent_kwargs(engines=engines, adaptive_max_ms=1e9, engine_timeout=900.0),
                                 **(value.get('search') or {})},
                              value_path=value.get('path'), value_beta=value.get('beta', 0.0),
                              screen_model=value.get('screen'))
-            them = SearchAgent(fmt=FMT, preview=preview, seed=game_seed + 1,
-                               **agent_kwargs(engines=1, adaptive_max_ms=1e9, engine_timeout=900.0),
-                               screen_model=incumbent.get('screen'))
+            if opponent.startswith('imitation:'):
+                # A ladder-human imitation (search/human/imitation.py) piloting the real team:
+                # the deployment distribution, not search against search.
+                from search.human.imitation import ImitationAgent
+                spec = opponent.split(':')
+                # spec: imitation:PATH[:temp|argmax[:PREVIEW_PATH[:topk]]]
+                them = ImitationAgent(spec[1], fmt=FMT, preview=preview, seed=game_seed + 1,
+                                      temp=float(spec[2]) if len(spec) > 2 and spec[2] != 'argmax' else 1.0,
+                                      sample=not (len(spec) > 2 and spec[2] == 'argmax'),
+                                      preview_model=spec[3] if len(spec) > 3 and spec[3] else None,
+                                      search_topk=int(spec[4]) if len(spec) > 4 and spec[4] else 0)
+            else:
+                them = SearchAgent(fmt=FMT, preview=preview, seed=game_seed + 1,
+                                   **agent_kwargs(engines=1, adaptive_max_ms=1e9, engine_timeout=900.0),
+                                   screen_model=incumbent.get('screen'))
             us.reseed(game_seed * 2 + 1)
             them.reseed(game_seed * 2 + 2)
             t0 = time.time()
@@ -229,17 +288,19 @@ def main():
     ap.add_argument('--min-sim-saving', type=float, default=0.0)
     ap.add_argument('--screen-log-dir', type=Path, help='write probe results of every game here')
     ap.add_argument('--cand-search', type=json.loads, help='JSON overrides of the search config, candidate arm only')
+    ap.add_argument('--cand-preview', help="candidate arm's team preview: 'human:PATH[:argmax]' or 'pvalue:PATH'")
+    ap.add_argument('--opponent', default='search', help="'search' (deployed search, hand evaluation) or 'imitation:PATH[:temp[:PREVIEW_PATH]]'")
     args = ap.parse_args()
     team = json.loads((ROOT / 'teams.json').read_text())[args.team]['sets']
     pool = [t['sets'] if isinstance(t, dict) else t for t in json.loads(args.pool.read_text())]
     from search.screen_data import model_from_file
     cand = {'path': args.candidate, 'beta': args.beta if args.candidate else 0.0,
-            'screen': model_from_file(args.cand_screen), 'search': args.cand_search}
+            'screen': model_from_file(args.cand_screen), 'search': args.cand_search, 'preview': args.cand_preview}
     inc = {'path': args.incumbent, 'beta': args.incumbent_beta if args.incumbent else 0.0,
            'screen': model_from_file(args.inc_screen)}
     result = asyncio.run(run_gate(cand, inc, args.out, args.pairs, args.concurrency, args.seed, team, pool,
                                   args.engines, args.alpha, rule=args.rule, min_sim_saving=args.min_sim_saving,
-                                  screen_log_dir=args.screen_log_dir))
+                                  screen_log_dir=args.screen_log_dir, opponent=args.opponent))
     print(json.dumps({'candidate': cand, 'incumbent': inc, **result}))
 
 

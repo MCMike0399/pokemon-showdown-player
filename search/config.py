@@ -37,6 +37,10 @@ LIVE = {
     # under probe screening; under a learned ranker that world skips the
     # prefilter, so it is part of the deployed policy and gated with it.
     'screen_log': 0.5,
+    # Learned human opponent policy (docs/human-opponent.md): None = the
+    # equilibrium/greedy mix alone. Live adopts the team's opp-current.json pointer
+    # between games; a gate's candidate arm sets it through --cand-search.
+    'opp_model': None,
 }
 
 

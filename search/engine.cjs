@@ -369,10 +369,31 @@ function solveZeroSum(M, iters) {
 // the screening keeps, the usual probes run only on the survivors; at the keeps
 // themselves no probe runs at all (docs/learned-screening.md).
 const SF = require('./screenfeat.cjs');
+const HF = require('./human/humanfeat.cjs');
 const SCREEN_NETS = {};
 function screenNet(p) {
   if (!SCREEN_NETS[p]) SCREEN_NETS[p] = VNET.load(p);
   return SCREEN_NETS[p];
+}
+// Human opponent policy (search/human): a net over HF features that scores how
+// likely a ladder player is to pick each joint action. With msg.opp_model =
+// {path, w, temp} the opponent's kept set is its top keep_opp actions by that
+// probability (no probe simulations for their side), and the opponent model
+// blends (1-w) * human policy + w * the equilibrium/greedy mix.
+const HUMAN_NETS = {};
+function humanNet(p) {
+  if (!HUMAN_NETS[p]) HUMAN_NETS[p] = VNET.load(p);
+  return HUMAN_NETS[p];
+}
+function humanLogits(net, battle, sideIdx, choices, temp) {
+  const s = HF.stateFeatures(battle, sideIdx);
+  return choices.map(c => VNET.logit(net, [...s, ...HF.actionFeatures(battle, sideIdx, c)]) / (temp || 1));
+}
+function softmaxArr(z) {
+  const m = Math.max(...z);
+  const e = z.map(v => Math.exp(v - m));
+  const t = e.reduce((a, b) => a + b, 0);
+  return e.map(v => v / t);
 }
 function rankLearned(net, battle, sideIdx, choices) {
   const s = SF.stateFeatures(battle, sideIdx);
@@ -448,6 +469,7 @@ function searchWorld(msg, world, wi, opts) {
   const battle = buildBattle(msg.format, world, msg.field, [wi + 1, 7, 13, 19]);
   const ours = (msg.our_choices || sideChoices(battle, battle.sides[0])).slice();
   let theirs = sideChoices(battle, battle.sides[1], {noSwitch: !!msg.opp_no_switch});
+  const allTheirs = msg.opp_detail ? theirs.slice() : null;
   if (msg.max_opp && theirs.length > msg.max_opp) {
     theirs = theirs.slice(0, msg.max_opp);
   }
@@ -459,6 +481,17 @@ function searchWorld(msg, world, wi, opts) {
     if (theirs.length > learned.pre_opp) theirs = rankLearned(net, battle, 1, theirs).slice(0, learned.pre_opp);
     if (ours.length > learned.pre_ours) ours.splice(0, ours.length, ...rankLearned(net, battle, 0, ours).slice(0, learned.pre_ours));
     screened = 'learned';
+  }
+  const oppModel = msg.opp_model && msg.opp_model.path ? msg.opp_model : null;
+  let humanP = null;  // their kept action -> human probability (renormalised over the kept set)
+  if (oppModel) {
+    const z = humanLogits(humanNet(oppModel.path), battle, 1, theirs, oppModel.temp);
+    const order = theirs.map((c, j) => j).sort((a, b) => z[b] - z[a]);
+    const keepN = msg.screen && msg.screen.keep_opp ? Math.min(msg.screen.keep_opp, theirs.length) : theirs.length;
+    const kept = order.slice(0, keepN);
+    const p = softmaxArr(kept.map(j => z[j]));
+    humanP = new Map(kept.map((j, k) => [theirs[j], p[k]]));
+    theirs = kept.map(j => theirs[j]);
   }
   const record = log ? {} : null;
   const base = State.serializeBattle(battle);
@@ -542,7 +575,13 @@ function searchWorld(msg, world, wi, opts) {
   const pri = colMean.map(v => Math.exp(-(v - mn) / tau));
   const ps = pri.reduce((a, b) => a + b, 0);
   const alpha = msg.alpha === undefined ? 0.5 : msg.alpha;
-  const q = y.map((yy, c) => alpha * yy + (1 - alpha) * pri[c] / ps);
+  let q = y.map((yy, c) => alpha * yy + (1 - alpha) * pri[c] / ps);
+  if (humanP) {
+    const w = oppModel.w === undefined ? 0.3 : oppModel.w;
+    const h = cols.map(j => humanP.get(theirs[j]) || 0);
+    const hs = h.reduce((a, b) => a + b, 0) || 1;
+    q = q.map((v, c) => (1 - w) * h[c] / hs + w * v);
+  }
   const values = {};
   const worst = {};
   const nashValue = {};
@@ -595,6 +634,19 @@ function searchWorld(msg, world, wi, opts) {
   const ourMix = {};
   rows.forEach((i, r) => { ourMix[ours[i]] = x[r]; });
   const topOpp = cols.map((j, c) => [theirs[j], q[c]]).sort((a, b) => b[1] - a[1]).slice(0, 5);
+  // msg.opp_detail: the full opponent model of this world, for offline comparison
+  // against what ladder opponents really did (search/human/compare_live.py).
+  let oppDetail = null;
+  if (msg.opp_detail) {
+    const side = battle.sides[1];
+    oppDetail = {theirs: cols.map(j => theirs[j]), q: Array.from(q), nash: Array.from(y),
+                 greedy: pri.map(v => v / ps), all: allTheirs,
+                 moves: side.active.map(p => (p && !p.fainted ? (p.getMoveRequestData().moves || []).map(m => m.id) : [])),
+                 party: side.pokemon.map(p => p.species.name),
+                 alive: side.active.map(p => !!(p && !p.fainted)),
+                 sx: HF.stateFeatures(battle, 1).map(r4), a: cols.map(j => HF.actionFeatures(battle, 1, theirs[j]).map(r4)),
+                 a_all: allTheirs.map(c => HF.actionFeatures(battle, 1, c).map(r4))};
+  }
   // Root statistics for learning: the one-turn game value under the averaged
   // strategies, and the static evaluation of the rebuilt (pre-turn) position.
   let eq = 0;
@@ -602,8 +654,10 @@ function searchWorld(msg, world, wi, opts) {
   const root = {eq, hand: handEvaluate(battle)};
   if (msg.features) root.x = valueFeatures(battle, 0);
   const out = {values, worst, nash: nashValue, mix: ourMix, ms: Date.now() - t0, sims: sims + screenSims,
-               screen_sims: screenSims, screened, n_ours: rows.length, n_theirs: cols.length, top_opp: topOpp, root};
+               screen_sims: screenSims, screened, n_ours: rows.length, n_theirs: cols.length, top_opp: topOpp, root,
+               opp_model: oppModel ? (oppModel.sha256 || oppModel.path) : null};
   if (depth2) out.depth2 = depth2;
+  if (oppDetail) out.opp_detail = oppDetail;
   if (record && (record.ours || record.theirs)) {
     // Probe results of every candidate, for the learned screening ranker. `best`
     // is this world's final choice, which a prefilter must never drop.
@@ -710,6 +764,19 @@ function handle(msg) {
       wd: battle.field.weatherState.duration, terrain: battle.field.terrain, pseudo: Object.keys(battle.field.pseudoWeather),
       sides: battle.sides.map(s => Object.keys(s.sideConditions))}, turn: battle.turn, value: evaluate(battle),
       p1choices: sideChoices(battle, battle.sides[0]).length, p2choices: sideChoices(battle, battle.sides[1]).length};
+  }
+  if (msg.type === 'human') {
+    // Human-policy data (search/human): side 0's legal joint actions in a rebuilt
+    // world, with the position/action features a learned policy scores, and the
+    // per-slot move ids so a logged action can be mapped to an enumerated choice.
+    const battle = buildBattle(msg.format, msg.worlds[0], msg.field);
+    const side = battle.sides[0];
+    const choices = sideChoices(battle, side, {bothMega: true});
+    const moves = side.active.map(p => (p && !p.fainted ? (p.getMoveRequestData().moves || []).map(m => m.id) : []));
+    return {id: msg.id, choices, moves, can_mega: side.active.map(p => !!(p && p.canMegaEvo)),
+            party: side.pokemon.map(p => p.species.name), hand: handEvaluate(battle),
+            sx: HF.stateFeatures(battle, 0).map(r4), a: choices.map(c => HF.actionFeatures(battle, 0, c).map(r4)),
+            version: HF.VERSION};
   }
   if (msg.type === 'ping') return {id: msg.id, ok: true};
   throw new Error('unknown message type');
