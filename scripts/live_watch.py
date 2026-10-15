@@ -231,6 +231,16 @@ def status():
             "recent": recent, "checked_at": datetime.now(timezone.utc).isoformat()}
 
 
+def elo_report():
+    """Performance-rating panel data (search/elo_monitor.py), cached on ledger mtimes.
+
+    Served on its own endpoint that the page polls slowly; it is never part of
+    the SSE state, so a ledger append cannot add work to the stream.
+    """
+    from search import elo_monitor
+    return elo_monitor.report_cached(PROJECT / 'data/ml/browser-runs')
+
+
 def battle_log(room=None):
     if room is None:
         _, state, _, _, _ = viewer_run()
@@ -434,9 +444,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         if route.path == "/api/events":
             return self.stream(room, deltas=parse_qs(route.query).get('deltas') == ['1'])
-        if route.path in ("/api/status", "/api/battle"):
+        if route.path in ("/api/status", "/api/battle", "/api/elo"):
             try:
-                payload = status() if route.path == "/api/status" else battle_log(room)
+                payload = (status() if route.path == "/api/status" else
+                           elo_report() if route.path == "/api/elo" else battle_log(room))
                 body = json.dumps(payload).encode()
                 content_type, code = "application/json", 200
             except (OSError, sqlite3.Error, ValueError):

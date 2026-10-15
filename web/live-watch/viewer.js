@@ -418,6 +418,8 @@ function applyStatus(data) {
     $id('win-rate').textContent = stats.rate === null ? '—' : stats.rate.toFixed(1) + '%';
     $id('streak').textContent = stats.streakText;
     applyModelPulse(data);
+    if (eloCompleted !== null && eloCompleted !== stats.total) refreshElo();  // a game just finished
+    eloCompleted = stats.total;
     $id('signal').textContent = data.feed_stale ? 'Player feed interrupted' : data.room ? 'Live game' : data.phase==='paused_for_adjustments' ? 'Adjustment checkpoint' :
       ['blocked', 'paused'].includes(data.phase) ? 'Run paused' :
       ['complete', 'ladder_target_complete', 'deadline_reached', 'stopped'].includes(data.phase) ? 'Run stopped' : 'Between games';
@@ -456,4 +458,67 @@ function applyStatus(data) {
       replay ? 'Watching a replay. Model and system data describe the latest player session.' :
       'Model and system data describe the latest player session, including while watching replays.';
 }
+// Ladder performance panel: /api/elo is computed server-side (cached on ledger
+// mtimes) and polled slowly, never per SSE tick.
+const eloText = perf => !perf || perf.rating == null ? '—' :
+  Math.round(perf.rating) + (perf.clamped ? '*' : '') + (perf.ci != null ? ' ±' + Math.round(perf.ci) : '');
+const eloGames = perf => perf && perf.n ? perf.n.toLocaleString() + (perf.n === 1 ? ' game' : ' games') : 'no games';
+function setSpark(data) {
+  const svg = $id('perf-spark');
+  svg.replaceChildren();
+  const series = data.series || [];
+  if (series.length < 2) return;
+  const ns = 'http://www.w3.org/2000/svg', W = 220, H = 54, pad = 4;
+  const values = series.map(point => point[1]);
+  const mean = values.reduce((a, b) => a + b, 0) / values.length;
+  let lo = Math.min(...values), hi = Math.max(...values);
+  lo = Math.min(lo, mean - 40); hi = Math.max(hi, mean + 40);
+  const first = series[0][0], last = series[series.length - 1][0];
+  const x = index => (last === first ? 0 : (index - first) / (last - first) * W);
+  const y = value => pad + (hi - value) / (hi - lo) * (H - 2 * pad);
+  const make = (tag, attrs) => { const el = document.createElementNS(ns, tag); for (const k in attrs) el.setAttribute(k, attrs[k]); svg.append(el); return el; };
+  const ref = data.segments?.length ? data.segments[data.segments.length - 1] : null;
+  if (ref && ref.rating != null) make('line', {class: 'base', x1: 0, x2: W, y1: y(ref.rating), y2: y(ref.rating), 'vector-effect': 'non-scaling-stroke'});
+  const start = (data.segment_starts || [])[data.segments?.length - 1];
+  if (start != null && start > first && start <= last) make('line', {class: 'cut', x1: x(start), x2: x(start), y1: 0, y2: H, 'vector-effect': 'non-scaling-stroke'});
+  make('polyline', {class: 'line', points: series.map(point => x(point[0]).toFixed(1) + ',' + y(point[1]).toFixed(1)).join(' '), 'vector-effect': 'non-scaling-stroke'});
+  make('circle', {class: 'end', cx: W - 1.5, cy: y(values[values.length - 1]), r: 2});
+  svg.setAttribute('aria-label', 'Rolling 50-game performance rating, from ' + Math.round(values[0]) + ' to ' +
+    Math.round(values[values.length - 1]) + ' (range ' + Math.round(Math.min(...values)) + ' to ' + Math.round(Math.max(...values)) + ')');
+  $id('perf-caption').textContent = 'Rolling-50 performance · ' + Math.round(Math.min(...values)) + '–' + Math.round(Math.max(...values)) +
+    (start != null && start > first && start <= last ? ' · dashed line = current deploy' : '');
+}
+function applyElo(data) {
+  if (!data || data.error) return;
+  $id('perf').classList.remove('hidden');
+  $id('perf-rating').textContent = data.rating == null ? '—' : data.rating.toLocaleString();
+  const change = data.rating_change_50, delta = $id('perf-delta');
+  delta.className = change == null ? '' : change > 0 ? 'up' : change < 0 ? 'down' : '';
+  delta.textContent = change == null ? 'Current ladder rating' : (change > 0 ? '+' : change < 0 ? '−' : '±') + Math.abs(change) + ' last 50 games';
+  const segs = data.segments || [], cur = segs[segs.length - 1], prev = segs[segs.length - 2];
+  const label = seg => eloGames(seg) + ' · ' + (seg.short || 'deploy');
+  $id('perf-cur-label').textContent = cur ? label(cur) : '';
+  $id('perf-cur-label').title = cur ? cur.label + ' (' + cur.first + ' → ' + cur.last + ')' : '';
+  $id('perf-cur').textContent = eloText(cur);
+  $id('perf-prev-label').textContent = prev ? label(prev) : 'No earlier deploy';
+  $id('perf-prev-label').title = prev ? prev.label + ' (' + prev.first + ' → ' + prev.last + ')' : '';
+  $id('perf-prev').textContent = prev ? eloText(prev) : '—';
+  for (const w of ['50', '100', '200']) {
+    const perf = data.windows?.[w];
+    $id('perf-w' + w).textContent = perf && perf.n ? Math.round(perf.rating) + (perf.clamped ? '*' : '') : '—';
+    $id('perf-w' + w + 'n').textContent = perf && perf.n ? (perf.ci != null ? '±' + Math.round(perf.ci) + ' · ' : '') + 'win ' + perf.win_rate.toFixed(0) + '%' : '';
+  }
+  setSpark(data);
+}
+let eloTimer = null, eloCompleted = null;
+async function refreshElo() {
+  if (typeof fetch !== 'function' || typeof setTimeout !== 'function') return;  // headless test harness
+  clearTimeout(eloTimer);
+  try {
+    const response = await fetch('/api/elo', {cache: 'no-store'});
+    if (response.ok) applyElo(await response.json());
+  } catch (error) { /* keep the last panel; try again on the next tick */ }
+  eloTimer = setTimeout(refreshElo, 30000);
+}
+refreshElo();
 connect();

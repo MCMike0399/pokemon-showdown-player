@@ -140,3 +140,46 @@ the viewer. It supplies `BattlePokemonSprites`; `data/graphics.js` alone does no
 supply animated sprite metadata, so Dex silently selects still PNGs without it.
 The known missing-form fallback uses Dex's sprite resolver to preserve GIFs and
 image dimensions, while keeping the actual form's cry and battle identity.
+
+## Ladder performance (Elo performance rating)
+
+Live progress is judged by the **performance rating**, not by win rate.
+Ladder matchmaking pairs the bot with opponents near its own rating, so the win
+rate is pulled toward 50% whether the bot is strong or weak, and a better
+policy mostly shows up as tougher opponents. The performance rating is the
+rating R at which the sum of Elo expected scores against the opponents actually
+faced equals the score actually earned (win = 1, tie = 0.5). It rises when the
+bot beats stronger opposition and does not saturate at 50%. The opponent rating
+is the one printed on the `|player|` line at game start; our name comes from
+`.env` `PS_USERNAME`.
+
+The sidebar panel **Ladder performance** shows:
+
+- the current ladder rating (after the latest game) and its change over the last 50 games;
+- **Current**: the performance rating (plus or minus the 95% interval) of the
+  current deploy segment, and **Previous** for comparison. A segment is a run of
+  consecutive browser runs with the same policy key (a hash of the `search_agent`
+  config without volatile fields, plus the preview spec and the team name), so a
+  new preview model, team or search setting starts a new segment. Hover a label
+  for the changed fields and times;
+- the performance (and win rate) over the last 50, 100 and 200 games;
+- a sparkline of the rolling-50 performance over all games (at most 200 points),
+  with a dashed line where the current segment starts and a dotted reference at its rating.
+
+Read it like this: the interval is about plus or minus 70 at 100 games and 25 at
+1,000, so compare the current segment with the previous one only when their
+intervals clearly separate; the last 50 is noisy (plus or minus 100). A `*` after
+a rating means all wins or all losses, so the value is clamped (100..3000) and has no interval.
+The interval ignores the uncertainty in the opponents' own ratings.
+
+`/api/elo` serves the data. It is computed in the server from the browser-run
+ledgers (`data/ml/browser-runs/*/events.jsonl`, read incrementally and cached on
+file size and mtime), polled by the page every 30 s and after each finished game,
+and is not part of the SSE stream. The same numbers are available offline:
+
+    .venv/bin/python search/elo_monitor.py [--runs DIR] [--json]
+
+It prints the segments table (performance, interval, win rate, mean opponent
+rating, games, first and last time), the rolling windows and the current rating.
+Games are deduped by room (a resumed room keeps its terminal with a log) and
+games without an opponent rating are left out of the rating.

@@ -97,7 +97,10 @@ them, gated for equal results at fewer simulations. See `docs/learned-screening.
 
 Since 2026-10-14 live team preview uses a matchup value learned from public
 ladder replays (`--preview`), gated against a human-imitation opponent. See
-`docs/human-opponent.md`.
+`docs/human-opponent.md`. Judge it by the live **performance rating** (Elo rating
+at which the expected score against the opponents faced equals the actual score;
+win rate is pulled toward 50% by matchmaking): `search/elo_monitor.py`, and the
+"Ladder performance" panel described in `docs/live-watch.md`.
 
 ## Not yet done
 
