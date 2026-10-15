@@ -1,0 +1,29 @@
+"""scripts/auto_promote.py rewrites search/config.py LIVE without disturbing the rest of the file."""
+import ast
+import importlib.util
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location('auto_promote', ROOT / 'scripts' / 'auto_promote.py')
+auto_promote = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(auto_promote)
+
+
+def live_of(src: str) -> dict:
+    ns: dict = {}
+    exec(compile(ast.parse(src), 'config', 'exec'), ns)
+    return ns['LIVE']
+
+
+def test_apply_options_replaces_and_adds_keys():
+    src = (ROOT / 'search' / 'config.py').read_text()
+    opts = {'alpha': 0.25, 'leaf': {'a': 0.801, 'b': -0.43}, 'speed_infer': True,
+            'protect_d2': {'behind': -1.0, 'top_opp': 3, 'keep': 6, 'probes': 2}}
+    out = auto_promote.apply_options(src, opts, 'test promotion')
+    live, before = live_of(out), live_of(src)
+    assert {k: live[k] for k in opts} == opts
+    assert {k: v for k, v in live.items() if k not in opts} == {k: v for k, v in before.items() if k not in opts}
+    assert out.split('LIVE = {')[0] == src.split('LIVE = {')[0]
+    assert out.split('def agent_kwargs')[1] == src.split('def agent_kwargs')[1]
+    # Idempotent on a second promotion of the same keys.
+    assert live_of(auto_promote.apply_options(out, opts, 'again')) == live
