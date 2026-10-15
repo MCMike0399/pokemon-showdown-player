@@ -158,6 +158,21 @@ class Tracker:
                 mon.locked_move = None
             mon.revealed = True
             self.slots[slot] = mon
+        elif kind == 'swap' and len(p) > 3 and p[3].isdigit():
+            # Ally Switch: '|swap|p2b: X|0' moves X to position 0; the partner takes X's old slot.
+            mon = self._mon(arg)
+            if mon is not None:
+                target = arg[:2] + 'ab'[int(p[3])]
+                old = mon.active_slot
+                other = self.slots.get(target)
+                self.slots[target] = mon
+                mon.active_slot = target
+                if old and old != target:
+                    if other is not None and other is not mon:
+                        self.slots[old] = other
+                        other.active_slot = old
+                    else:
+                        self.slots.pop(old, None)
         elif kind in ('detailschange', '-formechange') and len(p) > 3:
             mon = self._slot_mon(arg)
             if mon:

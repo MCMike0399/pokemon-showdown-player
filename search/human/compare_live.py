@@ -86,6 +86,8 @@ async def main():
     ap.add_argument('--out', type=Path, default=ROOT / 'artifacts' / 'human-policy' / 'compare-live.json')
     ap.add_argument('--team', default='Rain-Recife-special-stat-fix')
     ap.add_argument('--mix', default='0.1,0.2,0.3,0.5')
+    ap.add_argument('--leaf', type=json.loads, help='win-probability leaf {"a":..,"b":..} (engine.cjs setLeaf)')
+    ap.add_argument('--dump', type=Path, help='JSONL of per-world nash/greedy/real-action mask, for offline alpha/tau sweeps')
     args = ap.parse_args()
     nets = {p.stem: load_net(p) for p in args.model}
     team_sets = json.loads((ROOT / 'teams.json').read_text())[args.team]['sets']
@@ -98,6 +100,7 @@ async def main():
     acc = {n: {'nll': 0.0, 'top1': 0, 'top3': 0, 'n': 0} for n in names}
     counts = {'decisions': 0, 'exact': 0, 'screened_out': 0, 'not_found': 0, 'worlds': 0}
     t0 = time.time()
+    dump = args.dump.open('w') if args.dump else None
     try:
         for gi, room in enumerate(rooms):
             game = games[room]
@@ -139,7 +142,8 @@ async def main():
                     out = await agent.engines[0].call({'type': 'search', 'format': FMT, 'field': field, 'worlds': worlds,
                                                        'our_choices': list(sim_map), 'seeds': 1, 'alpha': kw['alpha'],
                                                        'opp_tau': kw['opp_tau'], 'screen': kw['screen'], 'crn': kw['crn'],
-                                                       'opp_detail': True, 'world_offset': 0}, timeout=600)
+                                                       'opp_detail': True, 'world_offset': 0,
+                                                       **({'leaf': args.leaf} if args.leaf else {})}, timeout=600)
                 except Exception as error:
                     counts['not_found'] += 1
                     continue
@@ -174,6 +178,9 @@ async def main():
                             cov[0] += int(bool(top & set(mask_all))); cov[1] += 1
                         cov = counts.setdefault('coverage', {}).setdefault('probe', [0, 0])
                         cov[0] += int(bool(mask)); cov[1] += 1
+                    if dump is not None:
+                        dump.write(json.dumps({'room': room, 'turn': turn, 'nash': [round(v, 6) for v in d['nash']],
+                                               'greedy': [round(v, 8) for v in d['greedy']], 'mask': mask}) + '\n')
                     n = len(d['theirs'])
                     dists = {'q': np.asarray(d['q']), 'nash': np.asarray(d['nash']), 'greedy': np.asarray(d['greedy']),
                              'uniform': np.full(n, 1.0 / n)}
@@ -193,6 +200,8 @@ async def main():
                                   'q_top1': round(acc['q']['top1'] / max(1, acc['q']['n']), 3)}), flush=True)
     finally:
         await agent.close()
+        if dump is not None:
+            dump.close()
     report = {'counts': counts, 'games': len(rooms), 'worlds_per_decision': args.worlds,
               'models': {n: {'nll': round(a['nll'] / max(1, a['n']), 4), 'top1': round(a['top1'] / max(1, a['n']), 4),
                              'top3': round(a['top3'] / max(1, a['n']), 4), 'n': a['n']} for n, a in acc.items()},

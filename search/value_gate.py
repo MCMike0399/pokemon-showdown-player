@@ -197,9 +197,10 @@ deployed configuration, the incumbent's screening and the hand evaluation."""
             them_side = 'p2' if us_side == 'p1' else 'p1'
             opp_team = pool[order[pair % len(order)]]
             value = candidate if arm == 'cand' else incumbent
-            # A candidate team-preview policy (search/human/preview_model.py), candidate arm only.
+            # A team-preview policy per arm (search/human/preview_model.py); the incumbent arm
+            # takes one too (--inc-preview) once a preview policy is deployed live.
             our_preview = preview
-            if arm == 'cand' and value.get('preview'):
+            if value.get('preview'):
                 our_preview = make_preview(value['preview'], preview, game_seed)
             # Adaptive worlds are wall-clock bounded live; gate games run slower on
             # background cores, so lift the bound to measure the intended policy.
@@ -289,6 +290,7 @@ def main():
     ap.add_argument('--screen-log-dir', type=Path, help='write probe results of every game here')
     ap.add_argument('--cand-search', type=json.loads, help='JSON overrides of the search config, candidate arm only')
     ap.add_argument('--cand-preview', help="candidate arm's team preview: 'human:PATH[:argmax]' or 'pvalue:PATH'")
+    ap.add_argument('--inc-preview', help="incumbent arm's team preview (same syntax); default the frozen actor's")
     ap.add_argument('--opponent', default='search', help="'search' (deployed search, hand evaluation) or 'imitation:PATH[:temp[:PREVIEW_PATH]]'")
     args = ap.parse_args()
     team = json.loads((ROOT / 'teams.json').read_text())[args.team]['sets']
@@ -297,7 +299,7 @@ def main():
     cand = {'path': args.candidate, 'beta': args.beta if args.candidate else 0.0,
             'screen': model_from_file(args.cand_screen), 'search': args.cand_search, 'preview': args.cand_preview}
     inc = {'path': args.incumbent, 'beta': args.incumbent_beta if args.incumbent else 0.0,
-           'screen': model_from_file(args.inc_screen)}
+           'screen': model_from_file(args.inc_screen), 'preview': args.inc_preview}
     result = asyncio.run(run_gate(cand, inc, args.out, args.pairs, args.concurrency, args.seed, team, pool,
                                   args.engines, args.alpha, rule=args.rule, min_sim_saving=args.min_sim_saving,
                                   screen_log_dir=args.screen_log_dir, opponent=args.opponent))

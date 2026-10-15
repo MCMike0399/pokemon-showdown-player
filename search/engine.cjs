@@ -324,6 +324,20 @@ function evaluate(battle) {
   return handEvaluate(battle);
 }
 
+// Optional win-probability leaf (msg.leaf = {a, b, k}): a cell is scored k * sigmoid(a * v + b)
+// instead of the material value v. Expectations over chance, opponent replies and worlds are
+// then taken in win-probability space, which is risk-seeking when behind and risk-averse when
+// ahead; a linear leaf treats "survive one more turn in a lost position" (-30 -> -3) as worth
+// more than the whole gap between a lost and a winning position. a, b are fitted from live
+// positions (P(win) vs hand evaluation); k = 4 / a keeps unit slope at P = 0.5, so margins
+// near even positions stay on the hand scale. null = linear (deployed).
+let LEAF = null;
+function setLeaf(leaf) { LEAF = leaf && leaf.a ? {a: +leaf.a, b: +(leaf.b || 0), k: +(leaf.k || 4 / leaf.a)} : null; }
+function leafEval(battle) {
+  const v = evaluate(battle);
+  return LEAF ? LEAF.k / (1 + Math.exp(-(LEAF.a * v + LEAF.b))) : v;
+}
+
 function handEvaluate(battle) {
   if (battle.ended) {
     if (!battle.winner) return 0;
@@ -402,6 +416,12 @@ function rankLearned(net, battle, sideIdx, choices) {
 }
 const r4 = v => (Number.isFinite(v) ? Math.round(v * 1e4) / 1e4 : null);
 
+const SELF_PROTECT = new Set(['protect', 'detect', 'spikyshield', 'kingsshield', 'banefulbunker', 'silktrap',
+                              'burningbulwark', 'obstruct', 'maxguard']);
+function hasProtect(choice) {
+  return String(choice).split(',').some(part => { const w = part.trim().split(/\s+/); return w[0] === 'move' && SELF_PROTECT.has(w[1]); });
+}
+
 // ------------------------------------------------------------------ selective second turn
 // One-turn search from a position reached inside the matrix: rank their actions
 // against `probes` evenly spaced probes of ours, ours against their best `probes`,
@@ -422,7 +442,7 @@ function secondTurn(bb, d2, seedBase) {
     if (!c.choose('p1', a)) return null;
     if (!c.choose('p2', b)) return undefined;
     n++;
-    return evaluate(c);
+    return leafEval(c);
   };
   if (B.length > keep) {
     const step = Math.max(1, Math.floor(A.length / P));
@@ -510,7 +530,7 @@ function searchWorld(msg, world, wi, opts) {
     if (!bb.choose('p1', a)) { screenErr.p1 = screenErr.p1 || (a + ' :: ' + bb.sides[0].choice.error); return null; }
     if (!bb.choose('p2', b)) { screenErr.p2 = screenErr.p2 || (b + ' :: ' + bb.sides[1].choice.error); return undefined; }
     screenSims++;
-    return evaluate(bb);
+    return leafEval(bb);
   };
   if (msg.screen && (theirs.length > msg.screen.keep_opp || ours.length > msg.screen.keep_ours)) {
     // Screening: rank their options against a few probes of ours, then rank ours
@@ -555,7 +575,7 @@ function searchWorld(msg, world, wi, opts) {
         b.prng = new PRNG([wi * 131 + k * 17 + 1, crn ? 3 : i + 3, j + 5, 11]);
         if (!b.choose('p1', ours[i])) { validOurs[i] = false; if (!firstErr.p1) firstErr.p1 = ours[i] + ' :: ' + b.sides[0].choice.error; break; }
         if (!b.choose('p2', theirs[j])) { validTheirs[j] = false; if (!firstErr.p2) firstErr.p2 = theirs[j] + ' :: ' + b.sides[1].choice.error; break; }
-        total += evaluate(b);
+        total += leafEval(b);
         sims++;
       }
       if (!validOurs[i]) break;
@@ -596,40 +616,55 @@ function searchWorld(msg, world, wi, opts) {
   // action gets the probability-weighted depth-2 minus depth-1 difference on those
   // cells, so all actions stay on the one-turn scale; cells that end the game or
   // force a switch keep their one-turn value.
+  // msg.protect_d2 = {behind, top_opp, keep, probes}: in a position whose static
+  // evaluation is below `behind` (hand units), when this world's best action
+  // contains a self-Protect, the best Protect action and the best action without
+  // one get the same second-turn correction. A one-turn leaf scores the board after
+  // a Protect as if the threat were gone; the next turn (Protect can no longer be
+  // chained reliably) shows whether stalling bought anything.
   let depth2 = null;
-  if (msg.depth2 && rows.length > 1) {
-    const d2 = msg.depth2;
+  let rescore = null, d2 = null, trigger = null, margin = null;
+  if (rows.length > 1) {
     const order = rows.slice().sort((i1, i2) => values[ours[i2]] - values[ours[i1]]);
-    const margin = values[ours[order[0]]] - values[ours[order[1]]];
-    if (margin < (d2.margin === undefined ? 0.5 : d2.margin)) {
-      const top = cols.map((j, c) => c).sort((c1, c2) => q[c2] - q[c1]).slice(0, d2.top_opp || 3);
-      const qs = top.reduce((a, c) => a + q[c], 0);
-      const corr = {};
-      let extraSims = 0, deep = 0;
-      for (const i of order.slice(0, d2.top_ours || 2)) {
-        const r = rows.indexOf(i);
-        let delta = 0;
-        for (const c of top) {
-          const j = cols[c];
-          // Replays the matrix cell exactly (its seed, seeds = 1), then searches on.
-          const bb = State.deserializeBattle(baseStr);
-          bb.prng = new PRNG([wi * 131 + 1, crn ? 3 : i + 3, j + 5, 11]);
-          if (!bb.choose('p1', ours[i]) || !bb.choose('p2', theirs[j])) continue;
-          const res = secondTurn(bb, d2, wi * 977 + i * 31 + j);
-          extraSims++;
-          if (!res) continue;
-          extraSims += res.sims;
-          deep++;
-          delta += q[c] * (res.v - sub[r][c]);
-        }
-        if (qs > 0) {
-          corr[ours[i]] = delta / qs;
-          values[ours[i]] += corr[ours[i]];
-        }
+    margin = values[ours[order[0]]] - values[ours[order[1]]];
+    if (msg.depth2 && margin < (msg.depth2.margin === undefined ? 0.5 : msg.depth2.margin)) {
+      d2 = msg.depth2; rescore = order.slice(0, d2.top_ours || 2); trigger = 'margin';
+    } else if (msg.protect_d2 && handEvaluate(battle) < (msg.protect_d2.behind === undefined ? -1 : msg.protect_d2.behind)) {
+      const prot = order.filter(i => hasProtect(ours[i]));
+      const plain = order.filter(i => !hasProtect(ours[i]));
+      if (prot.length && plain.length && order[0] === prot[0]) {
+        d2 = msg.protect_d2; rescore = [prot[0], plain[0]]; trigger = 'protect';
       }
-      sims += extraSims;
-      depth2 = {margin, corr, cells: deep, sims: extraSims};
     }
+  }
+  if (rescore) {
+    const top = cols.map((j, c) => c).sort((c1, c2) => q[c2] - q[c1]).slice(0, d2.top_opp || 3);
+    const qs = top.reduce((a, c) => a + q[c], 0);
+    const corr = {};
+    let extraSims = 0, deep = 0;
+    for (const i of rescore) {
+      const r = rows.indexOf(i);
+      let delta = 0;
+      for (const c of top) {
+        const j = cols[c];
+        // Replays the matrix cell exactly (its seed, seeds = 1), then searches on.
+        const bb = State.deserializeBattle(baseStr);
+        bb.prng = new PRNG([wi * 131 + 1, crn ? 3 : i + 3, j + 5, 11]);
+        if (!bb.choose('p1', ours[i]) || !bb.choose('p2', theirs[j])) continue;
+        const res = secondTurn(bb, d2, wi * 977 + i * 31 + j);
+        extraSims++;
+        if (!res) continue;
+        extraSims += res.sims;
+        deep++;
+        delta += q[c] * (res.v - sub[r][c]);
+      }
+      if (qs > 0) {
+        corr[ours[i]] = delta / qs;
+        values[ours[i]] += corr[ours[i]];
+      }
+    }
+    sims += extraSims;
+    depth2 = {trigger, margin, corr, cells: deep, sims: extraSims};
   }
   const ourMix = {};
   rows.forEach((i, r) => { ourMix[ours[i]] = x[r]; });
@@ -732,6 +767,7 @@ function previewPlans(msg) {
 function handle(msg) {
   if (msg.type === 'search') {
     setValue(msg.value_path, msg.value_beta, msg.value_scale);
+    setLeaf(msg.leaf);
     const results = msg.worlds.map((w, i) => {
       try { return searchWorld(msg, w, (msg.world_offset || 0) + i, {log: i < (msg.screen_log || 0)}); } catch (e) { return {error: String(e && e.stack || e).slice(0, 800)}; }
     });

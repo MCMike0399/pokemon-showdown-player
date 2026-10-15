@@ -16,6 +16,7 @@ from pathlib import Path
 
 from battle_state import hp_fraction, to_id
 from search.priors import sample_bench, sample_set
+from search.speed import observations as speed_observations, violations
 from search.tracker import PROTECT_MOVES, Tracker, _hp
 
 ENGINE = Path(__file__).resolve().parent / 'engine.cjs'
@@ -126,7 +127,9 @@ class SearchAgent:
                  keep_nonmega: bool = False, log=None, screen=None, value_path=None, value_beta=0.0, value_scale=8.0, preview_mode='incumbent', preview_worlds=6,
                  crn: bool = False, adaptive_margin: float | None = None, adaptive_worlds: int = 0,
                  adaptive_max_ms: float = 6000.0, engine_timeout: float = 120.0, screen_model=None,
-                 screen_log: float = 0.0, depth2: dict | None = None, opp_model: dict | None = None):
+                 screen_log: float = 0.0, depth2: dict | None = None, opp_model: dict | None = None,
+                 leaf: dict | None = None, speed_infer: bool = False, speed_tries: int = 24,
+                 protect_d2: dict | None = None):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -160,6 +163,14 @@ class SearchAgent:
         self.screen_log = float(screen_log or 0.0)
         # Selective second turn on close worlds (engine.cjs secondTurn); None = one turn.
         self.depth2 = dict(depth2) if depth2 else None
+        # Second turn for Protect lines in losing positions (engine.cjs protect_d2); None = off.
+        self.protect_d2 = dict(protect_d2) if protect_d2 else None
+        # Win-probability leaf {a, b[, k]} (engine.cjs setLeaf); None = linear material leaf.
+        self.leaf = dict(leaf) if leaf else None
+        # Reject opposing sets that contradict the observed move order (search/speed.py).
+        self.speed_infer = bool(speed_infer)
+        self.speed_tries = int(speed_tries)
+        self._speed_obs: dict = {}
         # Human opponent policy (docs/human-opponent.md): {path, w, temp, sha256} or None.
         self.opp_model = None
         self.set_opp_model(opp_model)
@@ -282,10 +293,24 @@ class SearchAgent:
             observed = {'moves': m.moves, 'item': None if not m.item_known else m.item, 'ability': m.ability,
                         'mega': m.mega, 'mega_species': m.species if m.mega else None,
                         'mega_ruled_out': mega_used and not m.mega}
-            set_ = sample_set(rng, m.base_species, observed, self.fmt, self.cutoff)
-            if m.item_known and m.item and not m.mega:
-                set_['item'] = m.item
-            set_ = from_sheet(m.base_species, set_)
+            def draw():
+                drawn = sample_set(rng, m.base_species, observed, self.fmt, self.cutoff)
+                if m.item_known and m.item and not m.mega:
+                    drawn['item'] = m.item
+                return from_sheet(m.base_species, drawn)
+            set_ = draw()
+            cons = (self._speed_obs or {}).get(m.name) if m.side == foe else None
+            if cons:
+                # Speed inference (search/speed.py): redraw sets the observed move order rules out.
+                best, best_bad = set_, violations(set_, cons)
+                for _ in range(self.speed_tries):
+                    if best_bad == 0:
+                        break
+                    cand = draw()
+                    bad = violations(cand, cons)
+                    if bad < best_bad:
+                        best, best_bad = cand, bad
+                set_ = best
             st = {
                 'hp': m.hp, 'fainted': m.fainted, 'status': m.status,
                 'boosts': dict(m.boosts) if m.active_slot else {},
@@ -356,6 +381,9 @@ class SearchAgent:
     async def decide(self, ctx: dict) -> str:
         request = ctx['request']
         choices = ctx['choices']
+        # Cleared first: a preview or single-choice decision must not report the
+        # previous turn's (or previous game's) search trace in the ledger.
+        self.last_trace = None
         if len(choices) == 1:
             return choices[0]
         if request.get('teamPreview'):
@@ -415,6 +443,15 @@ class SearchAgent:
             self.log.append({'turn': 0, 'top': sorted(scored.items(), key=lambda kv: -kv[1])[:5]})
         return best
 
+    def _observe_speeds(self, ctx: dict, side: str) -> None:
+        self._speed_obs = {}
+        if not self.speed_infer:
+            return
+        try:
+            self._speed_obs = speed_observations(ctx.get('public_log') or [], side, ctx.get('team_sets') or [])
+        except Exception as error:  # an unreadable log only loses the filter, never the decision
+            self.stats['errors'].append('speed ' + repr(error)[:200])
+
     def _fallback(self, ctx):
         pruned = self._prune_ours(ctx)
         return pruned[0]
@@ -439,6 +476,10 @@ class SearchAgent:
                 **self.value}
         if self.depth2:
             base['depth2'] = self.depth2
+        if self.protect_d2:
+            base['protect_d2'] = self.protect_d2
+        if self.leaf:
+            base['leaf'] = self.leaf
         if self.opp_model:
             base['opp_model'] = self.opp_model
         n = len(self.engines)
@@ -461,6 +502,7 @@ class SearchAgent:
     async def _move(self, ctx: dict) -> str:
         side = ctx['request']['side']['id']
         tracker = Tracker(side).feed(ctx.get('public_log') or [])
+        self._observe_speeds(ctx, side)
         our_choices = self._prune_ours(ctx)
         active = ctx['request'].get('active') or []
         if any(a.get('canMegaEvo') for a in active):
@@ -516,6 +558,8 @@ class SearchAgent:
             'value': {'path': self.value.get('value_path'), 'beta': self.value.get('value_beta')}, 'crn': self.crn,
             'screen_sims': sum(r.get('screen_sims') or 0 for r in results),
             'depth2_worlds': sum(1 for r in results if r.get('depth2')),
+            'protect_d2_worlds': sum(1 for r in results if (r.get('depth2') or {}).get('trigger') == 'protect'),
+            'leaf': bool(self.leaf), 'speed_infer': self.speed_infer,
             'screen': (self.screen_model or {}).get('sha256'),
             'opp_model': (self.opp_model or {}).get('sha256')}
         if self.log is not None:
@@ -555,6 +599,7 @@ class SearchAgent:
         choices = ctx['choices']
         if len(choices) == 1:
             return choices[0]
+        self._observe_speeds(ctx, side)
         best, best_v = choices[0], -1e9
         for choice in choices:
             parts = [p.strip() for p in choice.split(',')]
