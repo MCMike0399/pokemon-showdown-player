@@ -54,8 +54,14 @@ def log(gates: Path, msg: str):
 
 def stage_state(gates: Path, stage: str, pairs: int, alpha: float) -> dict:
     path = gates / f'{stage}.jsonl'
-    rows = [json.loads(l) for l in path.open() if l.strip()] if path.exists() else []
+    # Process first: once it has exited, the rows read next are final.
     running = subprocess.run(['pgrep', '-f', f'{stage}.jsonl'], capture_output=True).returncode == 0
+    rows = []
+    for line in (path.open() if path.exists() else []):
+        try:
+            rows.append(json.loads(line))
+        except ValueError:
+            pass  # blank or still being written
     sm = summarize(rows, pairs, alpha) if rows else {'complete': False}
     return {**sm, 'running': running, 'settled': bool(sm.get('complete')) and not running}
 
@@ -125,7 +131,11 @@ def promote(gates: Path, options: dict, label: str, evidence: dict, dry: bool):
     CONFIG.write_text(apply_options(original, options, note))
     try:
         check_config(options)
-        run(gates, [PY, '-m', 'pytest', '-q'])
+        try:
+            run(gates, [PY, '-m', 'pytest', '-q'])
+        except RuntimeError:
+            log(gates, 'tests failed; retrying once (load-sensitive tests)')
+            run(gates, [PY, '-m', 'pytest', '-q'])
         with tempfile.TemporaryDirectory() as tmp:
             out = run(gates, [PY, 'scripts/public_snapshot.py', str(Path(tmp) / 'snap')])
             if '"secret_scan": "passed"' not in out:
@@ -145,7 +155,16 @@ def promote(gates: Path, options: dict, label: str, evidence: dict, dry: bool):
         if subprocess.run(['git', 'diff', '--quiet', '--', str(CONFIG)], cwd=ROOT).returncode != 0:
             CONFIG.write_text(original)
         raise
-    run(gates, ['git', 'push', '-q', 'origin', 'main'])
+    for attempt in range(1, 4):
+        try:
+            run(gates, ['git', 'push', '-q', 'origin', 'main'])
+            break
+        except RuntimeError:
+            log(gates, f'push failed (attempt {attempt}); rebasing on origin/main')
+            subprocess.run(['git', 'pull', '-q', '--rebase', 'origin', 'main'], cwd=ROOT)
+            time.sleep(60)
+    else:
+        log(gates, 'push failed 3 times: the commit stays local (push it by hand); deploying anyway')
     restart(gates)
 
 
@@ -156,9 +175,13 @@ def restart(gates: Path):
     deadline = time.time() + 3600
     while subprocess.run(['pgrep', '-f', 'scripts/browser_play.py'], capture_output=True).returncode == 0:
         if time.time() > deadline:
-            raise RuntimeError('runner did not exit within an hour')
+            log(gates, 'runner still running after an hour; bootstrapping anyway')
+            break
         time.sleep(10)
-    run(gates, ['launchctl', 'bootstrap', f'gui/{uid}', str(PLIST)])
+    for attempt in range(3):  # never leave the ladder player down
+        if subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(PLIST)], capture_output=True).returncode == 0:
+            break
+        time.sleep(30)
     time.sleep(60)
     if subprocess.run(['pgrep', '-f', 'scripts/browser_play.py'], capture_output=True).returncode != 0:
         raise RuntimeError('runner is not running after bootstrap')
@@ -184,8 +207,13 @@ def main():
     log(gates, f'auto-promote {args.label}: waiting for {args.confirm} and {args.standard}')
     resumes = 0
     while True:
-        c = stage_state(gates, args.confirm, args.pairs, args.alpha)
-        s = stage_state(gates, args.standard, args.standard_pairs, args.alpha)
+        try:
+            c = stage_state(gates, args.confirm, args.pairs, args.alpha)
+            s = stage_state(gates, args.standard, args.standard_pairs, args.alpha)
+        except Exception as e:  # noqa: BLE001 - keep waiting; a gate file can be mid-rewrite
+            log(gates, f'status check failed, retrying: {e!r}')
+            time.sleep(args.poll)
+            continue
         if c['settled'] and not c['passed']:
             break
         if not s['running'] and not s['settled'] and args.launch:

@@ -27,3 +27,10 @@ def test_apply_options_replaces_and_adds_keys():
     assert out.split('def agent_kwargs')[1] == src.split('def agent_kwargs')[1]
     # Idempotent on a second promotion of the same keys.
     assert live_of(auto_promote.apply_options(out, opts, 'again')) == live
+
+
+def test_stage_state_skips_a_half_written_line(tmp_path):
+    rows = [{'pair': 0, 'arm': 'cand', 'win': True, 'score': 1.0}, {'pair': 0, 'arm': 'inc', 'win': False, 'score': 0.0}]
+    (tmp_path / 'x-stage.jsonl').write_text(''.join(__import__('json').dumps(r) + '\n' for r in rows) + '{"pair": 1, "ar')
+    st = auto_promote.stage_state(tmp_path, 'x-stage', 1, 0.05)
+    assert st['pairs_complete'] == 1 and st['gains'] == 1 and st['settled'] and not st['running']
