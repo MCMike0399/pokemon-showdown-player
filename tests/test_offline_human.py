@@ -62,7 +62,9 @@ def _team():
 
 
 def _world():
-    from search.priors import sample_set
+    from search.priors import STATS, sample_set
+    if not (STATS / f'{FMT}-0.json').exists():
+        pytest.skip('ladder usage statistics not downloaded (search/fetch_usage.py)')
     rng = random.Random(3)
     team = _team()
     ours = [{'set': s, 'state': {'hp': 1.0, 'turn': 1}} for s in team[:4]]
