@@ -51,10 +51,20 @@ def test_match_choice_exact_and_marginal():
                         'p1', ['Staraptor'], [True, False]) == ([0], 'ok')
 
 
+def _team():
+    # The live team lives in the gitignored teams.json; a fresh clone (CI) uses the tracked example.
+    path = ROOT / 'teams.json'
+    if path.exists():
+        teams = json.loads(path.read_text())
+        if 'Rain-Recife-special-stat-fix' in teams:
+            return teams['Rain-Recife-special-stat-fix']['sets']
+    return json.loads((ROOT / 'examples' / 'champions-rain.json').read_text())['sets']
+
+
 def _world():
     from search.priors import sample_set
     rng = random.Random(3)
-    team = json.loads((ROOT / 'teams.json').read_text())['Rain-Recife-special-stat-fix']['sets']
+    team = _team()
     ours = [{'set': s, 'state': {'hp': 1.0, 'turn': 1}} for s in team[:4]]
     theirs = [{'set': sample_set(rng, sp, {}, FMT), 'state': {'hp': 1.0, 'turn': 1}}
               for sp in ('Rillaboom', 'Incineroar', 'Sneasler', 'Kingambit')]
@@ -129,7 +139,9 @@ def test_imitation_agent_returns_legal_choice(tmp_path):
     from battle_state import legal_choices
     from search.human.imitation import ImitationAgent
     model = _tiny_model(tmp_path)
-    team = json.loads((ROOT / 'teams.json').read_text())['Rain-Recife-special-stat-fix']['sets']
+    if 'Rain-Recife-special-stat-fix' not in (json.loads((ROOT / 'teams.json').read_text()) if (ROOT / 'teams.json').exists() else {}):
+        pytest.skip('the request fixture needs the live team (gitignored teams.json)')
+    team = _team()
     request = json.loads((ROOT / 'tests' / 'fixtures' / 'human-request.json').read_text()) if (ROOT / 'tests' / 'fixtures' / 'human-request.json').exists() else None
     if request is None:
         pytest.skip('no request fixture')
