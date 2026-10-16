@@ -403,6 +403,67 @@ def test_search_submit_failure_redecides_without_the_failed_choice(tmp_path):
         store.close()
 
 
+def test_identical_preview_request_in_a_new_game_is_decided(tmp_path):
+    # Live 2026-10-14/15: our preview request is the same in every game on one side;
+    # an answered-key without the room skipped it until the server warned our clock.
+    from ml.brain import Brain
+    from ml.features import Features
+    from ml.storage import Store
+    store = Store(tmp_path)
+    try:
+        page = Page(snapshot(preview=True))
+        player = BrowserPlayer(page, Brain(store, Features()), decision_interval=0)
+        decided = []
+
+        async def decider(ctx):
+            decided.append(ctx['choices'][0])
+            return ctx['choices'][0]
+        player.decider = decider
+
+        async def submit(state, choice):
+            page.state['log'].append('|win|Configured')
+        player.submit = submit
+        asyncio.run(player.play(ROOM, FMT, record=False, timeout=5))
+        other = ROOM + '4'
+        page.state = {**snapshot(preview=True), 'room': other}
+        asyncio.run(player.play(other, FMT, record=False, timeout=5))
+        assert len(decided) == 2
+    finally:
+        store.close()
+
+
+def test_preview_submit_failure_keeps_the_models_order(tmp_path):
+    # A preview failure is about the controls, not the order: retrying other orders
+    # sent the third-ranked preview through the fallback.
+    from ml.brain import Brain
+    from ml.features import Features
+    from ml.storage import Store
+    store = Store(tmp_path)
+    try:
+        page = Page(snapshot(preview=True))
+        player = BrowserPlayer(page, Brain(store, Features()), decision_interval=0)
+        decided, sent = [], []
+
+        async def decider(ctx):
+            decided.append(ctx['choices'][0])
+            return ctx['choices'][0]
+        player.decider = decider
+
+        async def submit(state, choice):
+            raise ValueError('team preview controls never rendered')
+        player.submit = submit
+
+        async def fallback_submit(room, rqid, choice, reason):
+            sent.append(choice)
+            page.state['log'].append('|win|Configured')
+            return True
+        player.fallback_submit = fallback_submit
+        asyncio.run(player.play(ROOM, FMT, record=False, timeout=5))
+        assert len(set(decided)) == 1 and sent == decided[:1]
+    finally:
+        store.close()
+
+
 def _lost_choice_player(tmp_path, monkeypatch, state):
     from ml.brain import Brain
     from ml.features import Features

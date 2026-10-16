@@ -80,8 +80,11 @@ def server_waits_for(lines, name):
 
 
 def request_key(snapshot):
+    # Scoped to the room: our team-preview request (and a turn-1 request with the
+    # same leads) is byte-identical across games, so an unscoped key made a new
+    # game's request look already answered (live 2026-10-14/15: 36% of games).
     request = snapshot.get('request') or {}
-    return (request.get('rqid'), fingerprint(request))
+    return (request.get('rqid'), fingerprint(request), snapshot.get('room'))
 
 
 def result(snapshot):
@@ -650,6 +653,7 @@ the loop decides this request again. Returns True if it acted."""
         sheets_attempted = False
         timer_claimed = False
         failed = {}  # search mode: request key -> choices the UI could not submit
+        attempts = {}  # search mode: request key -> failed Chrome submissions
         started = time.monotonic()
         self._drill_mode = self._drill_rqid = None  # a drill applies to the game it fired in only
         observed_from = None  # log length when this process started watching the room
@@ -799,7 +803,7 @@ the loop decides this request again. Returns True if it acted."""
                         # selection, never retry that choice for this request, re-decide.
                         if 'closed' in str(error).lower():
                             raise
-                        if len(failed.get(key, ())) >= MAX_SUBMIT_FAILURES - 1:
+                        if attempts.get(key, 0) >= MAX_SUBMIT_FAILURES - 1:
                             # Chrome failed this request repeatedly: the fallback sends this choice.
                             await self._clear_choice(room)
                             if not await self.fallback_submit(room, key[0], decision['choice'],
@@ -814,7 +818,11 @@ the loop decides this request again. Returns True if it acted."""
                                             'log_length': len(snapshot['log'])}
                             last_progress = time.monotonic()
                             continue
-                        failed.setdefault(key, set()).add(decision['choice'])
+                        attempts[key] = attempts.get(key, 0) + 1
+                        if not snapshot['request'].get('teamPreview'):
+                            # Every preview order uses the same controls, so a failure
+                            # says nothing about the order: keep the model's choice.
+                            failed.setdefault(key, set()).add(decision['choice'])
                         self.log('submit_retry', room=room, request_id=key[0], choice=decision['choice'],
                                  error=f'{type(error).__name__}: {str(error)[:200]}')
                         await self._clear_choice(room)
