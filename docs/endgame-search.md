@@ -103,3 +103,29 @@ leaf only and the full set, against the deployed configuration with both arms on
 the live pvalue preview (`value_gate.py --inc-preview`), against the argmax
 ladder-human imitation. Live progress is judged by the Elo performance rating
 (`search/elo_monitor.py`, viewer panel), not by win rate.
+
+## 6. Results and promotion (2026-10-15/16)
+
+| Stage (vs) | Pairs | Gains | Losses | p (one-sided) | Score cand / inc | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| leaf-dev (imitation) | 395 | 36 | 32 | .36 | — | failed |
+| full-dev (imitation) | 397 | 44 | 23 | .007 | 299 / 279 | passed |
+| full-confirm (imitation) | 397 | 52 | 38 | .085 | 295 / 282 | failed (p > .05) |
+| full-standard (deployed search) | 198 | 29 | 17 | .052 | 128 / 115.5 | no harm |
+
+The win-probability leaf alone does nothing; the bundle helps. Under the
+pre-registered rule the confirm stage missed (p .085), so `auto_promote.py`
+declined. **Amendment 1 (2026-10-16, after all stages settled):** full was
+promoted anyway. Every stage favoured it, and no stage showed harm. Pooled over the
+two stages that did not select it (confirm + standard), it went 81–55,
+p = .016. The deviation is deliberate: the goal is live Elo, which an
+imitation gate measures only indirectly (c4: +7.6 pp in the gate, +29 Elo live).
+Live is now the arbiter.
+
+**Live judging rule (written before any c5 live game):** compare the c5 deploy segment of
+`search/elo_monitor.py` with the c4 segment (1235 ± 28 over 634 games). After ≥ 300
+games, roll back (remove `leaf`, `protect_d2`, `speed_infer`; `alpha` 0.5) if the c5
+performance is below the c4 segment's. The same restart also shipped a browser fix
+(answered requests scoped to their room, 4b2800f). Before it, 36% of c4 games played
+the third-ranked preview after a stall, so the c5 segment measures the fix plus the
+search change.

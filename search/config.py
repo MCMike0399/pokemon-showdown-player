@@ -15,7 +15,7 @@ LIVE = {
     'worlds': 6,
     'engines': 3,
     'screen': {'probe': 4, 'keep_opp': 20, 'keep_ours': 24},
-    'alpha': 0.5,
+    'alpha': 0.25,  # campaign c5 (docs/endgame-search.md); was 0.5
     'opp_tau': 1.0,
     'seeds': 1,
     # Common random numbers: unbiased variance reduction. On live ledger positions
@@ -41,6 +41,12 @@ LIVE = {
     # equilibrium/greedy mix alone. Live adopts the team's opp-current.json pointer
     # between games; a gate's candidate arm sets it through --cand-search.
     'opp_model': None,
+    # Campaign c5 full (docs/endgame-search.md), live 2026-10-16: win-probability
+    # leaf, Protect re-scored a second turn when behind, speed inference from move
+    # order. Gates vs the imitation: dev 44-23, confirm 52-38; vs search 29-17.
+    'leaf': {'a': 0.801, 'b': -0.43},
+    'protect_d2': {'behind': -1.0, 'top_opp': 3, 'keep': 6, 'probes': 2},
+    'speed_infer': True,
 }
 
 
