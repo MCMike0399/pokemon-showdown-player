@@ -461,32 +461,94 @@ function applyStatus(data) {
 // Ladder performance panel: /api/elo is computed server-side (cached on ledger
 // mtimes) and polled slowly, never per SSE tick.
 const eloText = perf => !perf || perf.rating == null ? '—' :
-  Math.round(perf.rating) + (perf.clamped ? '*' : '') + (perf.ci != null ? ' ±' + Math.round(perf.ci) : '');
+  (perf.clamped === 'wins' ? '≥' : perf.clamped === 'losses' ? '≤' : '') + Math.round(perf.rating) + (perf.ci != null ? ' ±' + Math.round(perf.ci) : '');
 const eloGames = perf => perf && perf.n ? perf.n.toLocaleString() + (perf.n === 1 ? ' game' : ' games') : 'no games';
+// SVG content is built with textContent so ledger labels never become markup.
+function chartElement(svg, tag, attrs = {}, text) {
+  const el = document.createElementNS('http://www.w3.org/2000/svg', tag);
+  for (const key in attrs) el.setAttribute(key, attrs[key]);
+  if (text != null) el.textContent = text;
+  svg.append(el);
+  return el;
+}
+function chartTitle(el, text) { chartElement(el, 'title', {}, text); }
 function setSpark(data) {
   const svg = $id('perf-spark');
   svg.replaceChildren();
-  const series = data.series || [];
-  if (series.length < 2) return;
-  const ns = 'http://www.w3.org/2000/svg', W = 220, H = 54, pad = 4;
-  const values = series.map(point => point[1]);
-  const mean = values.reduce((a, b) => a + b, 0) / values.length;
-  let lo = Math.min(...values), hi = Math.max(...values);
-  lo = Math.min(lo, mean - 40); hi = Math.max(hi, mean + 40);
+  const series = (data.series || []).filter(p => Number.isFinite(p[0]) && Number.isFinite(p[1]));
+  const window = data.series_window || 50;
+  $id('perf-caption').textContent = window + '-game window';
+  if (series.length < 2) {
+    chartElement(svg, 'text', {x:130, y:75, 'text-anchor':'middle'}, 'Waiting for ' + window + ' rated games');
+    svg.setAttribute('aria-label', 'Waiting for rolling performance data');
+    return;
+  }
+  const left = 34, right = 253, top = 16, bottom = 125;
+  const values = series.map(p => p[1]);
+  const lo = Math.floor((Math.min(...values) - 20) / 100) * 100;
+  const hi = Math.ceil((Math.max(...values) + 20) / 100) * 100;
   const first = series[0][0], last = series[series.length - 1][0];
-  const x = index => (last === first ? 0 : (index - first) / (last - first) * W);
-  const y = value => pad + (hi - value) / (hi - lo) * (H - 2 * pad);
-  const make = (tag, attrs) => { const el = document.createElementNS(ns, tag); for (const k in attrs) el.setAttribute(k, attrs[k]); svg.append(el); return el; };
-  const ref = data.segments?.length ? data.segments[data.segments.length - 1] : null;
-  if (ref && ref.rating != null) make('line', {class: 'base', x1: 0, x2: W, y1: y(ref.rating), y2: y(ref.rating), 'vector-effect': 'non-scaling-stroke'});
+  const x = index => left + (index - first) / (last - first) * (right - left);
+  const y = value => top + (hi - value) / (hi - lo) * (bottom - top);
   const start = (data.segment_starts || [])[data.segments?.length - 1];
-  if (start != null && start > first && start <= last) make('line', {class: 'cut', x1: x(start), x2: x(start), y1: 0, y2: H, 'vector-effect': 'non-scaling-stroke'});
-  make('polyline', {class: 'line', points: series.map(point => x(point[0]).toFixed(1) + ',' + y(point[1]).toFixed(1)).join(' '), 'vector-effect': 'non-scaling-stroke'});
-  make('circle', {class: 'end', cx: W - 1.5, cy: y(values[values.length - 1]), r: 2});
-  svg.setAttribute('aria-label', 'Rolling 50-game performance rating, from ' + Math.round(values[0]) + ' to ' +
-    Math.round(values[values.length - 1]) + ' (range ' + Math.round(Math.min(...values)) + ' to ' + Math.round(Math.max(...values)) + ')');
-  $id('perf-caption').textContent = 'Rolling-50 performance · ' + Math.round(Math.min(...values)) + '–' + Math.round(Math.max(...values)) +
-    (start != null && start > first && start <= last ? ' · dashed line = current deploy' : '');
+  if (Number.isFinite(start) && start <= last) {
+    const cut = x(Math.max(first, start));
+    chartElement(svg, 'rect', {class:'band', x:cut, y:top, width:right-cut, height:bottom-top});
+    if (start >= first) chartElement(svg, 'line', {class:'cut', x1:cut, x2:cut, y1:top, y2:bottom});
+    chartElement(svg, 'text', {x:right, y:10, 'text-anchor':'end'}, 'Current deploy');
+  }
+  for (const value of [lo, (lo + hi) / 2, hi]) {
+    chartElement(svg, 'line', {class:'grid', x1:left, x2:right, y1:y(value), y2:y(value)});
+    chartElement(svg, 'text', {x:left-6, y:y(value)+3, 'text-anchor':'end'}, Math.round(value));
+  }
+  for (const [index, anchor] of [[first, 'start'], [last, 'end']])
+    chartElement(svg, 'text', {x:x(index), y:143, 'text-anchor':anchor}, 'Game ' + (index+1).toLocaleString());
+  chartElement(svg, 'polyline', {class:'line', points:series.map(p => x(p[0]).toFixed(1)+','+y(p[1]).toFixed(1)).join(' ')});
+  for (const point of series) {
+    const dot = chartElement(svg, 'circle', {class:'end', cx:x(point[0]), cy:y(point[1]), r:point[0] === last ? 3 : 4, 'fill-opacity':point[0] === last ? 1 : 0, 'pointer-events':'all'});
+    // A wide invisible stroke makes each sample inspectable with a mouse.
+    dot.setAttribute('stroke', 'transparent'); dot.setAttribute('stroke-width', '8');
+    chartTitle(dot, 'Game ' + (point[0]+1) + ': ' + Math.round(point[1]));
+  }
+  svg.setAttribute('aria-label', 'Rolling ' + window + '-game performance, ' + Math.round(values[0]) + ' to ' + Math.round(values.at(-1)) + '. Shaded area: current deploy.');
+}
+function setDeployChart(data) {
+  const svg = $id('perf-deploys');
+  svg.replaceChildren();
+  const all = data.segments || [];
+  const rows = all.slice(-4).filter(s => Number.isFinite(s.rating));
+  const height = Math.max(76, rows.length * 33 + 30);
+  svg.setAttribute('viewBox', '0 0 260 ' + height);
+  if (!rows.length) {
+    chartElement(svg, 'text', {x:130, y:38, 'text-anchor':'middle'}, 'No rated deploys yet');
+    svg.setAttribute('aria-label', 'No rated deploys yet');
+    return;
+  }
+  const lo = Math.floor(Math.min(...rows.map(s => s.rating - (s.ci || 0))) / 100) * 100 - 25;
+  const hi = Math.ceil(Math.max(...rows.map(s => s.rating + (s.ci || 0))) / 100) * 100 + 25;
+  const x = value => 68 + (value-lo)/(hi-lo)*185;
+  for (const value of [Math.ceil(lo/100)*100, Math.floor(hi/100)*100]) {
+    chartElement(svg, 'line', {class:'grid', x1:x(value), x2:x(value), y1:4, y2:height-22});
+    chartElement(svg, 'text', {x:x(value), y:height-5, 'text-anchor':'middle'}, value);
+  }
+  const descriptions = [];
+  rows.forEach((seg, i) => {
+    const current = seg === all.at(-1), y = 17 + i * 33;
+    const label = current ? 'Live' : '#' + (seg.index + 1);
+    chartElement(svg, 'text', {x:0, y:y-1}, label);
+    chartElement(svg, 'text', {x:0, y:y+11, style:'font-size:9px'}, seg.n.toLocaleString() + ' games');
+    const group = chartElement(svg, 'g');
+    const description = label + ': ' + eloText(seg) + ', ' + eloGames(seg) + '. ' + (seg.label || '');
+    chartTitle(group, description); descriptions.push(description);
+    if (seg.ci != null) {
+      chartElement(group, 'line', {class:'interval' + (current ? ' current' : ''), x1:x(seg.rating-seg.ci), x2:x(seg.rating+seg.ci), y1:y, y2:y});
+      for (const bound of [seg.rating-seg.ci, seg.rating+seg.ci])
+        chartElement(group, 'line', {class:'interval' + (current ? ' current' : ''), x1:x(bound), x2:x(bound), y1:y-4, y2:y+4});
+    }
+    chartElement(group, 'circle', {class:current ? 'end' : 'previous', cx:x(seg.rating), cy:y, r:3.5});
+    if (seg.clamped) chartElement(group, 'text', {x:x(seg.rating), y:y+13, 'text-anchor':'middle'}, seg.clamped === 'wins' ? '≥' : '≤');
+  });
+  svg.setAttribute('aria-label', 'Deploy performance, 95% confidence intervals. ' + descriptions.join(' '));
 }
 function applyElo(data) {
   if (!data || data.error) return;
@@ -496,7 +558,7 @@ function applyElo(data) {
   delta.className = change == null ? '' : change > 0 ? 'up' : change < 0 ? 'down' : '';
   delta.textContent = change == null ? 'Current ladder rating' : (change > 0 ? '+' : change < 0 ? '−' : '±') + Math.abs(change) + ' last 50 games';
   const segs = data.segments || [], cur = segs[segs.length - 1], prev = segs[segs.length - 2];
-  const label = seg => eloGames(seg) + ' · ' + (seg.short || 'deploy');
+  const label = seg => 'Deploy #' + (seg.index + 1) + ' · ' + eloGames(seg);
   $id('perf-cur-label').textContent = cur ? label(cur) : '';
   $id('perf-cur-label').title = cur ? cur.label + ' (' + cur.first + ' → ' + cur.last + ')' : '';
   $id('perf-cur').textContent = eloText(cur);
@@ -505,10 +567,22 @@ function applyElo(data) {
   $id('perf-prev').textContent = prev ? eloText(prev) : '—';
   for (const w of ['50', '100', '200']) {
     const perf = data.windows?.[w];
-    $id('perf-w' + w).textContent = perf && perf.n ? Math.round(perf.rating) + (perf.clamped ? '*' : '') : '—';
+    $id('perf-w' + w).textContent = perf && perf.n ? (perf.clamped === 'wins' ? '≥' : perf.clamped === 'losses' ? '≤' : '') + Math.round(perf.rating) : '—';
     $id('perf-w' + w + 'n').textContent = perf && perf.n ? (perf.ci != null ? '±' + Math.round(perf.ci) + ' · ' : '') + 'win ' + perf.win_rate.toFixed(0) + '%' : '';
   }
   setSpark(data);
+  setDeployChart(data);
+  $id('perf-win-rate').textContent = cur?.win_rate == null ? '—' : cur.win_rate.toFixed(1) + '%';
+  $id('perf-opponents').textContent = cur?.mean_opp == null ? '—' : Math.round(cur.mean_opp).toLocaleString();
+  const gain = cur?.rating != null && prev?.rating != null && !cur.clamped && !prev.clamped ? Math.round(cur.rating-prev.rating) : null;
+  $id('perf-gain').textContent = gain == null ? '—' : (gain > 0 ? '+' : '') + gain + ' Elo';
+  $id('perf-gain').className = gain > 0 ? 'up' : gain < 0 ? 'down' : '';
+  $id('perf-gain').title = 'Difference in performance estimates; see confidence intervals above';
+  $id('perf-coverage').textContent = data.rated_games == null ? '—' : data.rated_games.toLocaleString() + ' / ' + data.games.toLocaleString();
+  const updated = data.updated ? new Date(data.updated) : null;
+  $id('perf-updated').textContent = updated && Number.isFinite(updated.getTime()) ? 'Last result ' + updated.toLocaleString([], {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit'}) : 'No completed games';
+  $id('perf-rating').title = 'Current ladder rating';
+  $id('perf-cur').title = 'Opponent-adjusted performance rating ±95% confidence interval';
 }
 let eloTimer = null, eloCompleted = null;
 async function refreshElo() {
