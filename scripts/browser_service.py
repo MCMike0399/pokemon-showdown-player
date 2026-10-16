@@ -48,12 +48,17 @@ def main():
         parser.error('player service already installed; do not replace an active battle owner')
     logs = HERE / 'data/ml/logs'
     logs.mkdir(parents=True, exist_ok=True)
-    command = [str(HERE / '.venv/bin/python'), '-u', str(HERE / 'scripts/browser_play.py'),
+    # The player runs from the pinned live worktree (scripts/live_deploy.py), never from the
+    # shared checkout where other agents' uncommitted edits would go live on a restart.
+    sys.path.insert(0, str(HERE / 'scripts'))
+    import live_deploy
+    live = live_deploy.ensure('HEAD')
+    command = [str(HERE / '.venv/bin/python'), '-u', str(live / 'scripts/browser_play.py'),
                '--team', args.team, '--continuous', '--resume-active', '--chrome',
                '--search', '--search-worlds', '6', '--search-engines', '3']
     if args.room:
         command.extend(['--room', args.room])
-    config = {'Label': LABEL, 'ProgramArguments': command, 'WorkingDirectory': str(HERE),
+    config = {'Label': LABEL, 'ProgramArguments': command, 'WorkingDirectory': str(live),
               'RunAtLoad': True, 'ExitTimeOut': 1200,
               'StandardOutPath': str(logs / 'browser-player.log'),
               'StandardErrorPath': str(logs / 'browser-player-errors.log'),

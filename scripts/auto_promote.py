@@ -3,8 +3,9 @@
 Waits until a campaign's confirm stage and its supplementary standard gate (vs the
 deployed search) have settled, applies the campaign rule, and only if it holds:
 writes the candidate's options into `search/config.py` LIVE, runs the test suite and
-the public-snapshot secret scan, commits that one file, pushes main, and restarts the
-browser-player LaunchAgent gracefully (bootout lets the current game finish).
+the public-snapshot secret scan, commits that one file, pushes main, pins the live
+worktree (`scripts/live_deploy.py`) to that commit and restarts the browser-player
+LaunchAgent gracefully (bootout lets the current game finish).
 
 Rule (campaigns c4/c5): the confirm stage passed (value_gate `superior` summary) and
 the standard gate shows no significant harm (one-sided sign test for the incumbent
@@ -18,6 +19,10 @@ blocker shows up long before promotion. A test failure blocks only if origin/mai
 
 Every step is appended to `<gates>/promote.log`; the outcome goes to
 `<gates>/promote.json`. Any failure before the push leaves config.py untouched.
+
+Other agents may work in the main checkout meanwhile: the runner runs from the pinned live
+worktree, so their uncommitted edits never go live, and the main checkout is fast-forwarded
+only when it is on `main` with no tracked changes (never another agent's branch).
 
     nohup .venv/bin/python scripts/auto_promote.py --gates data/ml/value/campaign-c5/gates \\
       --confirm c5-full-confirm --standard c5-full-standard --label "campaign c5 full" \\
@@ -40,13 +45,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / 'scripts'))
 
+import live_deploy  # noqa: E402
 from search.value_gate import sign_test, summarize  # noqa: E402
 
-CONFIG = ROOT / 'search' / 'config.py'
 PY = str(ROOT / '.venv' / 'bin' / 'python')
-LABEL = 'dev.pokemon-showdown.browser-player'
-PLIST = Path.home() / 'Library' / 'LaunchAgents' / f'{LABEL}.plist'
 
 
 def log(gates: Path, msg: str):
@@ -176,6 +180,7 @@ def preflight(gates: Path, options: dict, label: str) -> dict:
     """Run prepare() while the gates are still running, so a blocker shows up hours before promotion."""
     state = {'time': datetime.now().isoformat(timespec='seconds')}
     try:
+        live_deploy.check()
         prepare(gates, options, label)
         # Credentials: a dry-run push still authenticates against GitHub's receive-pack.
         run(gates, ['git', 'push', '--dry-run', '-q', 'origin', 'origin/main:refs/heads/main'])
@@ -190,9 +195,9 @@ def preflight(gates: Path, options: dict, label: str) -> dict:
 
 
 def promote(gates: Path, options: dict, label: str, evidence: dict, dry: bool):
-    if subprocess.run(['git', 'diff', '--quiet', '--', str(CONFIG)], cwd=ROOT).returncode != 0:
-        raise RuntimeError('search/config.py has uncommitted changes in the workspace')
+    live_deploy.check()
     wt = prepare(gates, options, label)
+    sha = None
     try:
         if dry:
             log(gates, 'dry run: checks passed, nothing committed')
@@ -213,38 +218,29 @@ def promote(gates: Path, options: dict, label: str, evidence: dict, dry: bool):
             time.sleep(60)
         else:
             log(gates, 'push failed 3 times: commit kept on the worktree HEAD; deploying anyway')
-        promoted = (wt / 'search' / 'config.py').read_text()
+        sha = subprocess.run(['git', 'rev-parse', 'HEAD'], cwd=wt, capture_output=True, text=True).stdout.strip()
     finally:
         if not dry:
             log(gates, f'promotion commit: {subprocess.run(["git", "rev-parse", "HEAD"], cwd=wt, capture_output=True, text=True).stdout.strip()}')
         subprocess.run(['git', 'worktree', 'remove', '--force', str(wt)], cwd=ROOT, capture_output=True)
-    # The live runner reads the workspace: fast-forward it, else write the promoted config in place.
+    # Deploy the exact promotion commit (pushed or not: the object is in the shared repo).
     run(gates, ['git', 'fetch', '-q', 'origin'], check=False)
-    if run(gates, ['git', 'merge', '-q', '--ff-only', 'origin/main'], check=False).returncode != 0:
-        log(gates, 'workspace could not fast-forward; writing the promoted config.py in place')
-        CONFIG.write_text(apply_options(CONFIG.read_text(), options, f'{label}, promoted {datetime.now().date()}'))
-    check_config(options)
-    restart(gates)
+    log(gates, f'live worktree pinned to {live_deploy.pin(sha)}')
+    check_config(options, live_deploy.LIVE)
+    sync_workspace(gates)
+    live_deploy.restart(log=lambda m: log(gates, m))
 
 
-def restart(gates: Path):
-    uid = os.getuid()
-    subprocess.run(['launchctl', 'bootout', f'gui/{uid}/{LABEL}'], capture_output=True)
-    log(gates, 'bootout sent; waiting for the current game to finish')
-    deadline = time.time() + 3600
-    while subprocess.run(['pgrep', '-f', 'scripts/browser_play.py'], capture_output=True).returncode == 0:
-        if time.time() > deadline:
-            log(gates, 'runner still running after an hour; bootstrapping anyway')
-            break
-        time.sleep(10)
-    for attempt in range(3):  # never leave the ladder player down
-        if subprocess.run(['launchctl', 'bootstrap', f'gui/{uid}', str(PLIST)], capture_output=True).returncode == 0:
-            break
-        time.sleep(30)
-    time.sleep(60)
-    if subprocess.run(['pgrep', '-f', 'scripts/browser_play.py'], capture_output=True).returncode != 0:
-        raise RuntimeError('runner is not running after bootstrap')
-    log(gates, 'runner restarted with the promoted configuration')
+def sync_workspace(gates: Path):
+    """Fast-forward the main checkout only if it is on main with no tracked changes; other
+    agents' branches and work in progress are left alone (the runner does not read it)."""
+    branch = subprocess.run(['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=ROOT, capture_output=True, text=True).stdout.strip()
+    dirty = subprocess.run(['git', 'status', '--porcelain', '--untracked-files=no'], cwd=ROOT,
+                           capture_output=True, text=True).stdout.strip()
+    if branch != 'main' or dirty:
+        log(gates, f'main checkout left alone (branch {branch}, tracked changes: {bool(dirty)})')
+        return
+    run(gates, ['git', 'merge', '-q', '--ff-only', 'origin/main'], check=False)
 
 
 def main():

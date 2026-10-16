@@ -104,6 +104,14 @@ ambiguous ownership or transport failure; it does not retry blindly. Removal
 signals the player to finish its active game before unloading the service.
 Logs are under `data/ml/logs/browser-player*.log`; the viewer follows its event ledger.
 
+The player runs from a pinned worktree, `<checkout>.live`, not from the checkout
+other agents edit. Its gitignored inputs (`.env`, `data`, `cache`, `node_modules`,
+`teams.json`, `artifacts`) are symlinks to the main checkout. Deploy a commit with
+`scripts/live_deploy.py --ref origin/main`: it refuses a hand-edited worktree and
+restarts gracefully. `--status` shows the pinned commit. `scripts/auto_promote.py`
+deploys a promotion the same way. It fast-forwards the main checkout only when that
+checkout is on `main` with no tracked changes.
+
 The independent `ml.pipeline` service retains CPU collection and evaluation plus
 one MPS learner. `autopilot.json` selects `resource.backend: "mps"`; actual
 training reports record device, optimizer steps and MPS allocation, so configuration

@@ -34,3 +34,24 @@ def test_stage_state_skips_a_half_written_line(tmp_path):
     (tmp_path / 'x-stage.jsonl').write_text(''.join(__import__('json').dumps(r) + '\n' for r in rows) + '{"pair": 1, "ar')
     st = auto_promote.stage_state(tmp_path, 'x-stage', 1, 0.05)
     assert st['pairs_complete'] == 1 and st['gains'] == 1 and st['settled'] and not st['running']
+
+
+def test_sync_workspace_leaves_another_branch_alone(tmp_path, monkeypatch):
+    import subprocess
+
+    def git(*args):
+        return subprocess.run(['git', *args], cwd=tmp_path, capture_output=True, text=True, check=True).stdout.strip()
+    git('init', '-q', '-b', 'main')
+    git('config', 'user.email', 't@t')
+    git('config', 'user.name', 't')
+    (tmp_path / 'a').write_text('1')
+    git('add', '.')
+    git('commit', '-q', '-m', 'one')
+    git('checkout', '-q', '-b', 'ui-feature')
+    calls = []
+    monkeypatch.setattr(auto_promote, 'ROOT', tmp_path)
+    monkeypatch.setattr(auto_promote, 'run', lambda gates, cmd, **kw: calls.append(cmd))
+    monkeypatch.setattr(auto_promote, 'log', lambda gates, msg: calls.append(msg))
+    auto_promote.sync_workspace(tmp_path)
+    assert not any(isinstance(c, list) and 'merge' in c for c in calls)
+    assert git('rev-parse', '--abbrev-ref', 'HEAD') == 'ui-feature'
