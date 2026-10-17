@@ -20,6 +20,10 @@ from search.speed import observations as speed_observations, violations
 from search.tracker import PROTECT_MOVES, Tracker, _hp
 
 ENGINE = Path(__file__).resolve().parent / 'engine.cjs'
+# Single-target status moves meant for the partner (mirrors engine.cjs ALLY_STATUS_OK).
+ALLY_STATUS_OK = {'healpulse', 'floralhealing', 'decorate', 'skillswap', 'entrainment', 'afteryou', 'instruct',
+                  'purify', 'acupressure', 'swagger', 'flatter', 'lifedew', 'pollenpuff', 'quash', 'helpinghand',
+                  'aromaticmist', 'coaching', 'doodle', 'roleplay', 'allyswitch'}
 _MOVES = None
 
 
@@ -29,6 +33,24 @@ def move_info(move_id: str) -> dict:
         root = Path(__file__).resolve().parents[1] / 'cache' / 'dex' / 'gen9championsvgc2026regmc' / 'moves.json'
         _MOVES = json.loads(root.read_text())
     return _MOVES.get(to_id(move_id), {})
+
+
+_STONES = None
+
+
+def _mega_stones() -> set:
+    """Item ids that Mega Evolve something in this format."""
+    global _STONES
+    if _STONES is None:
+        dex = json.loads((Path(__file__).resolve().parents[1] / 'cache' / 'dex' / 'gen9championsvgc2026regmc' /
+                          'pokedex.json').read_text())
+        _STONES = {to_id(v['requiredItem']) for v in dex.values() if '-Mega' in (v.get('name') or '') and v.get('requiredItem')}
+    return _STONES
+
+
+def _party_sid(mon: dict) -> str:
+    """Base species id of a request party entry ('Golisopod-Mega, L50' -> 'golisopod')."""
+    return to_id(re.sub(r'-Mega(-[XYZ])?$', '', mon.get('details', '').split(',')[0].strip()))
 
 
 class Engine:
@@ -129,7 +151,8 @@ class SearchAgent:
                  adaptive_max_ms: float = 6000.0, engine_timeout: float = 120.0, screen_model=None,
                  screen_log: float = 0.0, depth2: dict | None = None, opp_model: dict | None = None,
                  leaf: dict | None = None, speed_infer: bool = False, speed_tries: int = 24,
-                 protect_d2: dict | None = None):
+                 protect_d2: dict | None = None, eval_terms: dict | None = None, endgame_d2: dict | None = None,
+                 mega_avoid: list | None = None, bench_prior: str | None = None):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -167,6 +190,14 @@ class SearchAgent:
         self.protect_d2 = dict(protect_d2) if protect_d2 else None
         # Win-probability leaf {a, b[, k]} (engine.cjs setLeaf); None = linear material leaf.
         self.leaf = dict(leaf) if leaf else None
+        # Campaign c7 options (docs/c7-live-review.md), all None = the c5 search:
+        # evaluation terms (engine.cjs setTerms), a deeper endgame (engine.cjs
+        # endgame_d2), Mega Evolution priority among our stone holders, and the
+        # unseen-bench prior ('back_rate' = corpus bring rates instead of ladder usage).
+        self.eval_terms = dict(eval_terms) if eval_terms else None
+        self.endgame_d2 = dict(endgame_d2) if endgame_d2 else None
+        self.mega_avoid = [to_id(x) for x in mega_avoid] if mega_avoid else None
+        self.bench_prior = bench_prior
         # Reject opposing sets that contradict the observed move order (search/speed.py).
         self.speed_infer = bool(speed_infer)
         self.speed_tries = int(speed_tries)
@@ -242,16 +273,21 @@ class SearchAgent:
                 'actions': tm.actions if tm and tm.active_slot else 0,
                 'active_turns': (tracker.turn - tm.switch_turn) if tm and tm.active_slot else 0,
                 'protect_last_turn': bool(tm and tm.active_slot and tm.last_move in PROTECT_MOVES and
-                                          tm.last_move_turn == tracker.turn - 1),
+                                          tm.last_move_turn == tracker.turn - 1 and not tm.protect_failed),
                 'sleep_turns': tm.sleep_turns if tm else 0,
                 'toxic_turns': tm.toxic_turns if tm else 0,
                 'turn': tracker.turn,
             }
             if pos < len(active_req) and order is None:
                 pp = {}
-                for m in active_req[pos].get('moves', []):
+                req_moves = active_req[pos].get('moves', [])
+                for m in req_moves:
                     if 'pp' in m:
                         pp[to_id(m.get('id') or m.get('move'))] = m['pp']
+                if [to_id(m.get('id') or m.get('move')) for m in req_moves] == ['struggle']:
+                    # A Struggle request lists no real move: empty them in the rebuilt
+                    # battle, or `move struggle` is rejected there and every world fails.
+                    pp = {to_id(m): 0 for m in set_.get('moves', [])}
                 st['pp'] = pp
             out.append({'set': set_, 'state': st})
         return out[:4]
@@ -269,7 +305,8 @@ class SearchAgent:
                 ordered.append(m)
         preview = tracker.preview.get(foe) or []
         need = max(0, 4 - len(ordered))
-        extra = sample_bench(rng, preview, [m.base_species for m in ordered], need, self.fmt, self.cutoff) if preview else []
+        extra = sample_bench(rng, preview, [m.base_species for m in ordered], need, self.fmt, self.cutoff,
+                             mode=getattr(self, 'bench_prior', None), leads=[m.base_species for m in revealed[:2]]) if preview else []
         out = []
         mega_used = tracker.mega_used.get(foe)
         sheet = {to_id(_base(x.get('species') or x.get('name') or '')): x for x in (tracker.sheets.get(foe) or [])}
@@ -322,7 +359,7 @@ class SearchAgent:
                 'actions': m.actions if m.active_slot else 0,
                 'active_turns': (tracker.turn - m.switch_turn) if m.active_slot else 0,
                 'protect_last_turn': bool(m.active_slot and m.last_move in PROTECT_MOVES and
-                                          m.last_move_turn == tracker.turn - 1),
+                                          m.last_move_turn == tracker.turn - 1 and not m.protect_failed),
                 'sleep_turns': m.sleep_turns, 'toxic_turns': m.toxic_turns, 'turn': tracker.turn,
                 'locked_move': m.last_move if (m.active_slot and to_id(set_.get('item', '')).startswith('choice')
                                                and m.last_move and not m.item_gone) else None,
@@ -362,6 +399,10 @@ class SearchAgent:
             target = int(words[2]) if len(words) > 2 and words[2].lstrip('-').isdigit() else None
             if target is not None and target < 0 and info.get('category') != 'Status':
                 return False
+            # Harmful single-target status moves at the partner (Parting Shot on our ally).
+            if (target is not None and target < 0 and info.get('target') in ('normal', 'any')
+                    and to_id(moves[j].get('id') or moves[j].get('move')) not in ALLY_STATUS_OK):
+                return False
             return True
 
         out = []
@@ -369,6 +410,20 @@ class SearchAgent:
             parts = [p.strip() for p in c.split(',')]
             if all(ok_part(p, i) for i, p in enumerate(parts)):
                 out.append(c)
+        if getattr(self, 'mega_avoid', None) and not self.keep_nonmega:
+            # Mega priority: no Mega for an avoided species while another living stone
+            # holder of ours could still take it (live: Golisopod Mega'd beside an
+            # un-Mega'd Garchomp won 16% vs 38% expected; Mega Golisopod is 4x Fire-weak).
+            party = (request.get('side') or {}).get('pokemon') or []
+            stones = _mega_stones()
+            others = [m for m in party if to_id(m.get('item', '')) in stones and hp_fraction(m.get('condition')) > 0
+                      and _party_sid(m) not in self.mega_avoid]
+
+            def avoided(c: str) -> bool:
+                return any(part.endswith(' mega') and slot < len(party) and _party_sid(party[slot]) in self.mega_avoid
+                           for slot, part in enumerate(p.strip() for p in c.split(',')))
+            if others:
+                out = [c for c in out if not avoided(c)] or out
         if not self.keep_nonmega:
             can_mega = [bool(a.get('canMegaEvo')) for a in active]
             if any(can_mega):
@@ -480,6 +535,10 @@ class SearchAgent:
             base['protect_d2'] = self.protect_d2
         if self.leaf:
             base['leaf'] = self.leaf
+        if self.eval_terms:
+            base['eval_terms'] = self.eval_terms
+        if self.endgame_d2:
+            base['endgame_d2'] = self.endgame_d2
         if self.opp_model:
             base['opp_model'] = self.opp_model
         n = len(self.engines)
@@ -559,6 +618,7 @@ class SearchAgent:
             'screen_sims': sum(r.get('screen_sims') or 0 for r in results),
             'depth2_worlds': sum(1 for r in results if r.get('depth2')),
             'protect_d2_worlds': sum(1 for r in results if (r.get('depth2') or {}).get('trigger') == 'protect'),
+            'endgame_d2_worlds': sum(1 for r in results if (r.get('depth2') or {}).get('trigger') == 'endgame'),
             'leaf': bool(self.leaf), 'speed_infer': self.speed_infer,
             'screen': (self.screen_model or {}).get('sha256'),
             'opp_model': (self.opp_model or {}).get('sha256')}

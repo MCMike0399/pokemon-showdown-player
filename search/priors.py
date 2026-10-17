@@ -16,6 +16,11 @@ from battle_state import to_id
 ROOT = Path(__file__).resolve().parents[1]
 STATS = ROOT / 'cache' / 'usage'
 STAT_ORDER = ('hp', 'atk', 'def', 'spa', 'spd', 'spe')
+# Megas whose dex baseSpecies is not the forme that holds the stone: Smogon files
+# Floette-Mega under Floette, but only Floette-Eternal (the preview species) can
+# Mega Evolve. Without the alias Floettite had ~0% prior (98% true) and a Mega'd
+# Floette fell back to base Floette-Eternal with a random item.
+MEGA_BASE_ALIAS = {'floette': 'floetteeternal'}
 
 
 @lru_cache(maxsize=4)
@@ -30,6 +35,8 @@ def load_usage(fmt: str = 'gen9championsvgc2026regmc', cutoff: str = '0') -> dic
         # Keep regional/gender formes (Indeedee-F, Arcanine-Hisui) as their own base.
         if '-Mega' not in name:
             base = name
+        else:
+            base = MEGA_BASE_ALIAS.get(to_id(base), base)
         prepared = {
             'name': name, 'count': float(entry.get('Raw count', 1)),
             'mega': '-Mega' in name,
@@ -56,7 +63,8 @@ def _base_id(species: str, dex: dict) -> str:
     sid = to_id(species)
     info = dex.get(sid, {})
     if '-Mega' in species and info.get('baseSpecies'):
-        return to_id(info['baseSpecies'])
+        base = to_id(info['baseSpecies'])
+        return MEGA_BASE_ALIAS.get(base, base)
     return sid
 
 
@@ -179,14 +187,52 @@ def sample_set(rng: random.Random, species: str, observed: dict | None = None,
             'moves': moves, 'level': 50, 'usage_entry': entry['name']}
 
 
+BACK_RATES = ROOT / 'search' / 'back_rates.json'
+
+
+@lru_cache(maxsize=2)
+def load_back_rates(path: str = str(BACK_RATES)) -> dict:
+    """Corpus counts of who is brought from the back (search/human/build_back_rates.py)."""
+    t = json.loads(Path(path).read_text())
+    t['global'] = sum(t['back'].values()) / max(1, sum(t['nonlead'].values()))
+    return t
+
+
+def back_odds(species: str, leads: list[str], table: dict, k: float = 20.0) -> float:
+    """Odds that a non-leading `species` was brought: per-species rate shrunk to the
+    global one, then a shrunk adjustment per lead it was paired with."""
+    import math
+    logit = lambda q: math.log(q / (1 - q))  # noqa: E731
+    s = to_id(species)
+    p = (table['back'].get(s, 0) + k * table['global']) / (table['nonlead'].get(s, 0) + k)
+    z = logit(min(max(p, 1e-3), 1 - 1e-3))
+    for lead in leads:
+        hit, n = table['pair'].get(s + '>' + to_id(lead), (0, 0))
+        q = (hit + k * p) / (n + k)
+        z += logit(min(max(q, 1e-3), 1 - 1e-3)) - logit(min(max(p, 1e-3), 1 - 1e-3))
+    return math.exp(z)
+
+
 def sample_bench(rng: random.Random, preview: list[str], seen: list[str], need: int,
-                 fmt: str = 'gen9championsvgc2026regmc', cutoff: str = '0') -> list[str]:
-    """Pick the unseen brought Pokemon from the preview, weighted by ladder usage."""
-    seen_ids = {_base_id(s, load_usage(fmt, cutoff)['dex']) for s in seen}
-    candidates = [s for s in preview if _base_id(s, load_usage(fmt, cutoff)['dex']) not in seen_ids]
+                 fmt: str = 'gen9championsvgc2026regmc', cutoff: str = '0', mode: str | None = None,
+                 leads: list[str] | None = None) -> list[str]:
+    """Pick the unseen brought Pokemon from the preview.
+
+    mode None weights them by ladder usage (deployed; on October replays this
+    predicted the back pair worse than uniform: log loss 2.47 vs 1.79). 'back_rate'
+    uses corpus bring odds of non-leading members, adjusted for the leads.
+    """
+    dex = load_usage(fmt, cutoff)['dex']
+    seen_ids = {_base_id(s, dex) for s in seen}
+    candidates = [s for s in preview if _base_id(s, dex) not in seen_ids]
+    table = load_back_rates() if mode == 'back_rate' and BACK_RATES.exists() else None
+    lead_ids = [_base_id(x, dex) for x in (leads or [])]
     chosen = []
     while len(chosen) < need and candidates:
-        weights = [species_weight(s, fmt, cutoff) for s in candidates]
+        if table is not None:
+            weights = [back_odds(_base_id(s, dex), lead_ids, table) for s in candidates]
+        else:
+            weights = [species_weight(s, fmt, cutoff) for s in candidates]
         total = sum(weights)
         r, acc = rng.random() * total, 0.0
         for i, w in enumerate(weights):

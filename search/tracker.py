@@ -42,7 +42,7 @@ class Mon:
     __slots__ = ('side', 'name', 'species', 'base_species', 'hp', 'hp_exact', 'maxhp', 'status', 'status_turn',
                  'sleep_turns', 'boosts', 'volatiles', 'item', 'item_known', 'item_gone', 'ability', 'moves',
                  'fainted', 'active_slot', 'switch_turn', 'actions', 'last_move', 'last_move_turn', 'mega',
-                 'locked_move', 'revealed', 'toxic_turns')
+                 'locked_move', 'revealed', 'toxic_turns', 'protect_failed')
 
     def __init__(self, side: str, name: str, species: str):
         self.side, self.name, self.species = side, name, species
@@ -63,6 +63,8 @@ class Mon:
         self.mega = False
         self.locked_move = None
         self.revealed = False
+        # The last Protect failed (`|-fail|` right after it): the chain counter is reset.
+        self.protect_failed = False
 
     def as_dict(self) -> dict:
         return {k: getattr(self, k) for k in self.__slots__}
@@ -361,12 +363,17 @@ class Tracker:
                     mon.actions += 1
                     mon.last_move = move
                     mon.last_move_turn = self.turn
+                    mon.protect_failed = False
                     if '[still]' not in rest and '[notarget]' not in rest:
                         pass
                     if mon.item and to_id(mon.item).startswith('choice') and not mon.item_gone:
                         mon.locked_move = move
                     elif not mon.item_known:
                         mon.locked_move = mon.locked_move  # unknown; priors may add choice lock
+        elif kind == '-fail' and arg:
+            mon = self._slot_mon(arg)
+            if mon and mon.last_move in PROTECT_MOVES and mon.last_move_turn == self.turn:
+                mon.protect_failed = True
         elif kind == 'cant' and len(p) > 3:
             mon = self._slot_mon(arg)
             if mon:

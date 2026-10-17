@@ -94,18 +94,32 @@ def auc(p, y):
 
 
 class PreviewValue:
+    """One net ({'layers'}) or an ensemble ({'members': [{'layers'}, ...]}, probabilities
+    averaged). Version 2 nets take `rating_features` extra inputs (rating difference and
+    own rating, both 0 = equal 1300 players at inference), so the matchup estimate is not
+    confounded by who tends to pick a plan."""
+
     def __init__(self, path):
         w = json.loads(Path(path).read_text())
-        self.layers = [(np.asarray(l['W']), np.asarray(l['b'])) for l in w['layers']]
+        members = w.get('members') or [w]
+        self.nets = [[(np.asarray(l['W']), np.asarray(l['b'])) for l in m['layers']] for m in members]
+        self.extra = int(w.get('rating_features', 0))
+        self.layers = self.nets[0]
 
     def probs(self, own: list[str], opp: list[str]) -> np.ndarray:
         own_ids = [_sid(x) for x in own]; opp_ids = [_sid(x) for x in opp]
-        h = np.stack([plan_features(own_ids, opp_ids, p) for p in PLANS]).astype(np.float64)
-        for k, (W, b) in enumerate(self.layers):
-            h = h @ W.T + b
-            if k < len(self.layers) - 1:
-                h = np.maximum(h, 0)
-        return 1 / (1 + np.exp(-h[:, 0]))
+        x = np.stack([plan_features(own_ids, opp_ids, p) for p in PLANS]).astype(np.float64)
+        if self.extra:
+            x = np.concatenate([x, np.zeros((len(PLANS), self.extra))], 1)
+        out = np.zeros(len(PLANS))
+        for layers in self.nets:
+            h = x
+            for k, (W, b) in enumerate(layers):
+                h = h @ W.T + b
+                if k < len(layers) - 1:
+                    h = np.maximum(h, 0)
+            out += 1 / (1 + np.exp(-h[:, 0]))
+        return out / len(self.nets)
 
 
 def main():

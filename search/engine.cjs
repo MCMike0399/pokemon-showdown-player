@@ -183,12 +183,24 @@ function targets(target, slot, count) {
   return [null];
 }
 
+// Single-target status moves that are meant for the partner (heals, redirection
+// helpers, ability tricks); every other status move is only aimed at foes.
+const ALLY_STATUS_OK = new Set(['healpulse', 'floralhealing', 'decorate', 'skillswap', 'entrainment', 'afteryou',
+                                'instruct', 'purify', 'acupressure', 'swagger', 'flatter', 'lifedew', 'pollenpuff',
+                                'quash', 'helpinghand', 'aromaticmist', 'coaching', 'doodle', 'roleplay', 'allyswitch']);
+
 /** Legal joint choices for one side of a move request, lightly pruned. */
 function sideChoices(battle, side, opts) {
   opts = opts || {};
   const choices = [];
   const perSlot = [];
   const bench = side.pokemon.map((p, i) => [p, i]).filter(([p, i]) => i >= side.active.length && !p.fainted);
+  // Both actives able to Mega (two stones, neither used): each slot also lists its
+  // plain moves, and combos keep exactly one Mega. Forcing ' mega' on both slots
+  // left only "one of them switches" combos, so an opposing Charizard-Y + Venusaur
+  // lead could never attack with both in our worlds.
+  const megaSlots = side.active.filter(p => p && !p.fainted && p.canMegaEvo).length;
+  const pairMega = megaSlots > 1 && !opts.noMega;
   for (let s = 0; s < side.active.length; s++) {
     const pokemon = side.active[s];
     if (!pokemon || pokemon.fainted) { perSlot.push(['pass']); continue; }
@@ -202,8 +214,11 @@ function sideChoices(battle, side, opts) {
       const tgts = data.moves.length === 1 && m.id === 'struggle' ? [null] :
         (m.target ? targets(m.target, s, side.active.length) : [null]);
       for (const t of tgts) {
-        // Prune attacking our own partner with a damaging move.
-        if (t !== null && t < 0 && move.category !== 'Status' && !opts.allowAllyHits) continue;
+        // Prune attacking our own partner with a damaging move, and single-target
+        // status moves at the partner unless they help it (Parting Shot on the ally
+        // lowered our own Mega Garchomp's stats live).
+        if (t !== null && t < 0 && !opts.allowAllyHits && (move.category !== 'Status' ||
+            ((m.target === 'normal' || m.target === 'any') && !ALLY_STATUS_OK.has(move.id)))) continue;
         // Prune targeting an empty/fainted foe slot when the other foe is alive.
         if (t !== null && t > 0) {
           const foe = side.foe.active[t - 1];
@@ -213,7 +228,7 @@ function sideChoices(battle, side, opts) {
         let c = 'move ' + (j + 1) + (t !== null ? ' ' + t : '');
         if (mega) c += ' mega';
         options.push(c);
-        if (mega && opts.bothMega) options.push('move ' + (j + 1) + (t !== null ? ' ' + t : ''));
+        if (mega && (opts.bothMega || pairMega)) options.push('move ' + (j + 1) + (t !== null ? ' ' + t : ''));
       }
     });
     if (!data.trapped && !data.maybeTrapped && !opts.noSwitch) {
@@ -225,7 +240,10 @@ function sideChoices(battle, side, opts) {
     if (k === perSlot.length) {
       const sw = acc.filter(c => c.startsWith('switch'));
       if (new Set(sw).size !== sw.length) return;
-      if (acc.filter(c => c.endsWith(' mega')).length > 1) return;
+      const megas = acc.filter(c => c.endsWith(' mega')).length;
+      if (megas > 1) return;
+      // Mega stays forced when available: a pair combo with a move must Mega one slot.
+      if (pairMega && !opts.bothMega && !megas && acc.some(c => c.startsWith('move'))) return;
       choices.push(acc.join(', '));
       return;
     }
@@ -274,9 +292,13 @@ function sideScore(battle, side, sideIndex) {
       const b = p.boosts;
       const atkStat = p.storedStats.atk >= p.storedStats.spa ? 'atk' : 'spa';
       const off = Math.max(-4, Math.min(4, b[atkStat]));
-      v += W.boost * off * (0.6 + 0.4 * p.hp / p.maxhp);
+      // TERMS (msg.eval_terms, campaign c7): positive attack stages, Speed stages and
+      // evasion weighted as the live outcomes price them; drops keep W.boost.
+      const posBoost = TERMS ? TERMS.boost + (sideIndex === 1 ? TERMS.foe_boost : 0) : W.boost;
+      v += (off > 0 ? posBoost : W.boost) * off * (0.6 + 0.4 * p.hp / p.maxhp);
       v += 0.05 * Math.max(-3, Math.min(3, b.def + b.spd));
-      v += W.speedBoost * Math.max(-2, Math.min(2, b.spe));
+      v += (TERMS ? TERMS.speed : W.speedBoost) * Math.max(-2, Math.min(2, b.spe));
+      if (TERMS && b.evasion) v += TERMS.evasion * Math.max(-3, Math.min(3, b.evasion));
       if (p.volatiles.substitute) v += 0.15;
       if (p.volatiles.perishsong) v -= 0.4 * (3 - Math.min(3, (p.volatiles.perishsong.duration || 4) - 1)) / 3 + 0.2;
       if (p.volatiles.confusion) v -= 0.1;
@@ -346,7 +368,35 @@ function handEvaluate(battle) {
   let v = sideScore(battle, battle.sides[0], 0) - sideScore(battle, battle.sides[1], 1);
   const tr = battle.field.pseudoWeather.trickroom;
   if (tr) v += W.trickroom * (tr.duration || 1) * speedEdge(battle) * 2;
+  if (TERMS && TERMS.weather && battle.field.weather) {
+    const wid = battle.field.weather;
+    const own = weatherOwner(battle.sides[0], wid) - weatherOwner(battle.sides[1], wid);
+    if (own) v += TERMS.weather * own * Math.min(1, (battle.field.weatherState.duration || 1) / 3);
+  }
   return v;
+}
+
+// Optional evaluation terms (msg.eval_terms = {boost, foe_boost, speed, evasion, weather}),
+// fitted on live positions (docs/c7-live-review.md): a one-turn leaf priced an opposing
+// +1 attack stage at 0.12 hand units where outcomes price it near 0.6, and had no
+// weather term although an opposing sun cost about 0.66. null = the deployed evaluation.
+let TERMS = null;
+function setTerms(t) {
+  TERMS = t ? {boost: +(t.boost ?? W.boost), foe_boost: +(t.foe_boost || 0), speed: +(t.speed ?? W.speedBoost),
+               evasion: +(t.evasion || 0), weather: +(t.weather || 0)} : null;
+}
+// A side "owns" a weather when a living member sets it or runs on it.
+const WEATHER_ABILITIES = {
+  raindance: ['drizzle', 'swiftswim'], primordialsea: ['primordialsea', 'swiftswim'],
+  sunnyday: ['drought', 'chlorophyll', 'solarpower', 'protosynthesis', 'orichalcumpulse'],
+  desolateland: ['desolateland', 'chlorophyll', 'solarpower'],
+  sandstorm: ['sandstream', 'sandrush', 'sandforce'], snow: ['snowwarning', 'slushrush'], hail: ['snowwarning', 'slushrush'],
+};
+const WEATHER_STONES = {sunnyday: ['charizarditey']};
+function weatherOwner(side, wid) {
+  const abil = WEATHER_ABILITIES[wid] || [], stones = WEATHER_STONES[wid] || [];
+  return side.pokemon.some(p => !p.fainted && (abil.includes(p.ability) || abil.includes(p.baseAbility) ||
+                                               (p.canMegaEvo && stones.includes(p.item)))) ? 1 : 0;
 }
 
 // ------------------------------------------------------------------ game solving
@@ -627,7 +677,14 @@ function searchWorld(msg, world, wi, opts) {
   if (rows.length > 1) {
     const order = rows.slice().sort((i1, i2) => values[ours[i2]] - values[ours[i1]]);
     margin = values[ours[order[0]]] - values[ours[order[1]]];
-    if (msg.depth2 && margin < (msg.depth2.margin === undefined ? 0.5 : msg.depth2.margin)) {
+    // msg.endgame_d2 = {alive, top_ours, top_opp, keep, probes}: with at most `alive`
+    // Pokemon left on each side, every decision re-scores its top `top_ours` actions
+    // a turn deeper (cheap with so few options; one-turn endgames Protected until lost).
+    const living = sd => sd.pokemon.filter(p => !p.fainted && p.hp > 0).length;
+    const eg = msg.endgame_d2;
+    if (eg && living(battle.sides[0]) <= (eg.alive || 2) && living(battle.sides[1]) <= (eg.alive || 2)) {
+      d2 = eg; rescore = order.slice(0, eg.top_ours || 4); trigger = 'endgame';
+    } else if (msg.depth2 && margin < (msg.depth2.margin === undefined ? 0.5 : msg.depth2.margin)) {
       d2 = msg.depth2; rescore = order.slice(0, d2.top_ours || 2); trigger = 'margin';
     } else if (msg.protect_d2 && handEvaluate(battle) < (msg.protect_d2.behind === undefined ? -1 : msg.protect_d2.behind)) {
       const prot = order.filter(i => hasProtect(ours[i]));
@@ -765,6 +822,8 @@ function previewPlans(msg) {
 }
 
 function handle(msg) {
+  // Per message, so a later features/preview call never inherits a search's terms.
+  setTerms(msg.eval_terms);
   if (msg.type === 'search') {
     setValue(msg.value_path, msg.value_beta, msg.value_scale);
     setLeaf(msg.leaf);

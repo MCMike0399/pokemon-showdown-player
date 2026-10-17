@@ -289,6 +289,8 @@ def main():
     ap.add_argument('--min-sim-saving', type=float, default=0.0)
     ap.add_argument('--screen-log-dir', type=Path, help='write probe results of every game here')
     ap.add_argument('--cand-search', type=json.loads, help='JSON overrides of the search config, candidate arm only')
+    ap.add_argument('--inc-search', type=json.loads,
+                    help='JSON overrides of the search config, incumbent arm only (e.g. gate a preview on a new search)')
     ap.add_argument('--cand-preview', help="candidate arm's team preview: 'human:PATH[:argmax]' or 'pvalue:PATH'")
     ap.add_argument('--inc-preview', help="incumbent arm's team preview (same syntax); default the frozen actor's")
     ap.add_argument('--opponent', default='search', help="'search' (deployed search, hand evaluation) or 'imitation:PATH[:temp[:PREVIEW_PATH]]'")
@@ -299,7 +301,7 @@ def main():
     cand = {'path': args.candidate, 'beta': args.beta if args.candidate else 0.0,
             'screen': model_from_file(args.cand_screen), 'search': args.cand_search, 'preview': args.cand_preview}
     inc = {'path': args.incumbent, 'beta': args.incumbent_beta if args.incumbent else 0.0,
-           'screen': model_from_file(args.inc_screen), 'preview': args.inc_preview}
+           'screen': model_from_file(args.inc_screen), 'preview': args.inc_preview, 'search': args.inc_search}
     result = asyncio.run(run_gate(cand, inc, args.out, args.pairs, args.concurrency, args.seed, team, pool,
                                   args.engines, args.alpha, rule=args.rule, min_sim_saving=args.min_sim_saving,
                                   screen_log_dir=args.screen_log_dir, opponent=args.opponent))
