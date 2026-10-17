@@ -6,6 +6,9 @@ simulation, one training run, and the two-stage paired gate. You then bring back
 whatever passed, and DiveMac deploys it to live play. Nothing moves between the
 Macs on its own. Code: `search/mlops.py`.
 
+Proposal (not implemented): Macintosh playing pair ranges of DiveMac's long gate
+stages in user-approved bursts, see [macintosh-gates.md](macintosh-gates.md).
+
 Macintosh sessions are bursts of at most about 4 hours: self-play, MPS training
 sweeps, a gate stage that fits. Anything longer (400-pair gates, continuous
 collection, monitoring) runs on DiveMac, as pausable background groups next to
