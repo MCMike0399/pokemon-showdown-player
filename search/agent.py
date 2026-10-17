@@ -16,6 +16,7 @@ from pathlib import Path
 
 from battle_state import hp_fraction, to_id
 from search.priors import sample_bench, sample_set
+from search.scout import apply_facts, sheet_fits
 from search.speed import observations as speed_observations, violations
 from search.tracker import PROTECT_MOVES, Tracker, _hp
 
@@ -36,6 +37,22 @@ def move_info(move_id: str) -> dict:
 
 
 _STONES = None
+
+
+def _with_sheet(drawn: dict, sheet: dict, mon=None, mega_used: bool = False) -> dict:
+    """A drawn set replaced by an earlier game's open team sheet (moves, item, ability, nature),
+    keeping whatever the current game has already revealed or ruled out."""
+    out = dict(drawn)
+    out['moves'] = list(sheet['moves'])[:4]
+    item = sheet.get('item')
+    if item and not (mon is not None and (mon.item_known or mon.item_gone or mon.mega)):
+        if not (mega_used and item in _mega_stones()):
+            out['item'] = item
+    if sheet.get('ability') and not (mon is not None and (mon.ability or mon.mega)):
+        out['ability'] = sheet['ability']
+    if sheet.get('nature'):
+        out['nature'] = sheet['nature']
+    return out
 
 
 def _mega_stones() -> set:
@@ -152,7 +169,7 @@ class SearchAgent:
                  screen_log: float = 0.0, depth2: dict | None = None, opp_model: dict | None = None,
                  leaf: dict | None = None, speed_infer: bool = False, speed_tries: int = 24,
                  protect_d2: dict | None = None, eval_terms: dict | None = None, endgame_d2: dict | None = None,
-                 mega_avoid: list | None = None, bench_prior: str | None = None):
+                 mega_avoid: list | None = None, bench_prior: str | None = None, scout: dict | None = None):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -198,6 +215,12 @@ class SearchAgent:
         self.endgame_d2 = dict(endgame_d2) if endgame_d2 else None
         self.mega_avoid = [to_id(x) for x in mega_avoid] if mega_avoid else None
         self.bench_prior = bench_prior
+        # Scouting (search/scout.py): {trust, max_games, min_overlap}; facts come from an
+        # injected `scout_source` (OnlineScout live), so without one nothing is looked up.
+        self.scout_cfg = dict(scout) if scout else None
+        self.scout_source = None
+        self.scout_facts: dict = {}
+        self._scout_task = None
         # Reject opposing sets that contradict the observed move order (search/speed.py).
         self.speed_infer = bool(speed_infer)
         self.speed_tries = int(speed_tries)
@@ -330,10 +353,16 @@ class SearchAgent:
             observed = {'moves': m.moves, 'item': None if not m.item_known else m.item, 'ability': m.ability,
                         'mega': m.mega, 'mega_species': m.species if m.mega else None,
                         'mega_ruled_out': mega_used and not m.mega}
-            def draw():
+            scouted = self._scouted(m.base_species, rng)
+            if scouted:
+                observed = apply_facts(observed, scouted, m.item_known, m.item_gone)
+
+            def draw(observed=observed, scouted=scouted):
                 drawn = sample_set(rng, m.base_species, observed, self.fmt, self.cutoff)
                 if m.item_known and m.item and not m.mega:
                     drawn['item'] = m.item
+                if scouted and not sheet and sheet_fits(scouted.get('sheet'), m.moves):
+                    drawn = _with_sheet(drawn, scouted['sheet'], m)
                 return from_sheet(m.base_species, drawn)
             set_ = draw()
             cons = (self._speed_obs or {}).get(m.name) if m.side == foe else None
@@ -367,7 +396,13 @@ class SearchAgent:
             out.append({'set': set_, 'state': st})
         for species in extra:
             observed = {'mega_ruled_out': mega_used}
-            set_ = from_sheet(species, sample_set(rng, species, observed, self.fmt, self.cutoff))
+            scouted = self._scouted(species, rng)
+            if scouted:
+                observed = apply_facts(observed, scouted, False, False)
+            drawn = sample_set(rng, species, observed, self.fmt, self.cutoff)
+            if scouted and not sheet and sheet_fits(scouted.get('sheet'), []):
+                drawn = _with_sheet(drawn, scouted['sheet'], None, mega_used)
+            set_ = from_sheet(species, drawn)
             out.append({'set': set_, 'state': {'hp': 1.0, 'turn': tracker.turn}})
         # Pad (unknown preview) with generic placeholders so the battle has 4 members.
         while len(out) < 4 and preview:
@@ -439,6 +474,8 @@ class SearchAgent:
         # Cleared first: a preview or single-choice decision must not report the
         # previous turn's (or previous game's) search trace in the ledger.
         self.last_trace = None
+        if request.get('teamPreview'):
+            self._start_scout(ctx)
         if len(choices) == 1:
             return choices[0]
         if request.get('teamPreview'):
@@ -452,6 +489,7 @@ class SearchAgent:
             return choices[0]
         started = time.perf_counter()
         self.last_trace = None
+        self._collect_scout()
         try:
             if request.get('forceSwitch'):
                 choice = await self._force_switch(ctx)
@@ -469,6 +507,38 @@ class SearchAgent:
             self.last_trace['ms'] = round(elapsed, 1)
             self.last_trace['choice'] = choice
         return choice
+
+    # ------------------------------------------------------------ scouting
+    def _start_scout(self, ctx: dict) -> None:
+        """New game: drop the last opponent's facts, look up this one's in the background."""
+        if self._scout_task is not None and not self._scout_task.done():
+            self._scout_task.cancel()
+        self._scout_task, self.scout_facts = None, {}
+        if not (self.scout_cfg and self.scout_source):
+            return
+        me = (ctx['request'].get('side') or {}).get('id')
+        foe = 'p2' if me == 'p1' else 'p1'
+        name = next((line.split('|')[3] for line in ctx.get('public_log') or []
+                     if line.startswith(f'|player|{foe}|') and len(line.split('|')) > 3 and line.split('|')[3]), None)
+        six = Tracker(me).feed(ctx.get('public_log') or []).preview.get(foe) or []
+        if name and six:
+            self._scout_task = asyncio.ensure_future(self.scout_source.facts(name, six, ctx.get('room')))
+
+    def _collect_scout(self) -> None:
+        task = self._scout_task
+        if task is not None and task.done():
+            self._scout_task = None
+            try:
+                self.scout_facts = task.result() or {}
+            except (Exception, asyncio.CancelledError) as error:  # a failed lookup only loses the facts
+                self.stats['errors'].append('scout ' + repr(error)[:200])
+                self.scout_facts = {}
+
+    def _scouted(self, species: str, rng: random.Random) -> dict | None:
+        if not self.scout_facts or not self.scout_cfg:
+            return None
+        f = self.scout_facts.get(to_id(_base(species)))
+        return f if f and rng.random() < float(self.scout_cfg.get('trust', 0.85)) else None
 
     async def _value_preview(self, ctx: dict) -> str:
         from search.priors import species_weight

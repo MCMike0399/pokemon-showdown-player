@@ -135,6 +135,13 @@ async def run(args):
                         # One deployed configuration, shared with the value gate.
                         search_kwargs = agent_kwargs(worlds=args.search_worlds, engines=args.search_engines)
                         agent = SearchAgent(fmt=args.format, preview=preview, seed=int(time.time()), **search_kwargs)
+                        if search_kwargs.get('scout'):
+                            # Opponents' earlier public games (search/scout.py); gates never look online.
+                            from search.scout import OnlineScout
+                            cfg = search_kwargs['scout']
+                            agent.scout_source = OnlineScout(args.format, args.root / 'scout-cache',
+                                                             max_games=int(cfg.get('max_games', 6)),
+                                                             min_overlap=int(cfg.get('min_overlap', 4)), log=player.log)
 
                         from search.value_store import LivePriority
 

@@ -224,6 +224,12 @@ deployed configuration, the incumbent's screening and the hand evaluation."""
                 them = SearchAgent(fmt=FMT, preview=preview, seed=game_seed + 1,
                                    **agent_kwargs(engines=1, adaptive_max_ms=1e9, engine_timeout=900.0),
                                    screen_model=incumbent.get('screen'))
+            if value.get('scout_sim') is not None:
+                # Scouting under simulated coverage (search/scout.py SimScout): this arm "has seen"
+                # the opponent before; a gate never looks anything up online.
+                from search.scout import SimScout
+                us.scout_cfg = us.scout_cfg or {'trust': 0.85}
+                us.scout_source = SimScout(opp_team, game_seed + 17, **value['scout_sim'])
             us.reseed(game_seed * 2 + 1)
             them.reseed(game_seed * 2 + 2)
             t0 = time.time()
@@ -289,6 +295,8 @@ def main():
     ap.add_argument('--min-sim-saving', type=float, default=0.0)
     ap.add_argument('--screen-log-dir', type=Path, help='write probe results of every game here')
     ap.add_argument('--cand-search', type=json.loads, help='JSON overrides of the search config, candidate arm only')
+    ap.add_argument('--cand-scout-sim', type=json.loads,
+                    help='candidate arm scouts the opponent under simulated coverage (search/scout.py SimScout kwargs, {} = defaults)')
     ap.add_argument('--inc-search', type=json.loads,
                     help='JSON overrides of the search config, incumbent arm only (e.g. gate a preview on a new search)')
     ap.add_argument('--cand-preview', help="candidate arm's team preview: 'human:PATH[:argmax]' or 'pvalue:PATH'")
@@ -299,7 +307,8 @@ def main():
     pool = [t['sets'] if isinstance(t, dict) else t for t in json.loads(args.pool.read_text())]
     from search.screen_data import model_from_file
     cand = {'path': args.candidate, 'beta': args.beta if args.candidate else 0.0,
-            'screen': model_from_file(args.cand_screen), 'search': args.cand_search, 'preview': args.cand_preview}
+            'screen': model_from_file(args.cand_screen), 'search': args.cand_search, 'preview': args.cand_preview,
+            'scout_sim': args.cand_scout_sim}
     inc = {'path': args.incumbent, 'beta': args.incumbent_beta if args.incumbent else 0.0,
            'screen': model_from_file(args.inc_screen), 'preview': args.inc_preview, 'search': args.inc_search}
     result = asyncio.run(run_gate(cand, inc, args.out, args.pairs, args.concurrency, args.seed, team, pool,

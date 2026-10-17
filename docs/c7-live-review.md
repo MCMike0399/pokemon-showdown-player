@@ -108,9 +108,29 @@ Every stage is 400 pairs against the argmax ladder-human imitation. A stage pass
 
 **Live judging** uses Elo segments.
 
-## 5. Not built yet, by expected value
+## 5. Scouting (built, not yet gated)
 
-1. Scouting the opponent's earlier public replays: exact items, and team history.
-2. Joint set sampling from open team sheets: item | revealed moves.
-3. Bring rules for Farigiraf/Trick Room against fast and Defiant teams. The preview ensemble moves this way.
-4. Stat spreads closer to what humans run on this team, such as bulkier Archaludon and Golisopod. This is a team change and needs its own arena gate.
+`search/scout.py` is opt-in (`scout: {trust, max_games, min_overlap}` in the config).
+
+**Flow.**
+- At team preview the agent starts a background lookup of the opponent's newest public replays in this format: `OnlineScout`, about 1 s, cached under `data/ml/scout-cache`.
+- It extracts what that player revealed: moves, items, abilities and open team sheets.
+- Every world treats those facts as observed with probability `trust`. A Mega stone keeps only its Mega entry. Facts the current game reveals always win.
+- Only the live runner injects the online source. Gates use `SimScout` (`value_gate.py --cand-scout-sim`), whose simulated coverage is calibrated on live games.
+
+**Offline check.** 1,220 live games from 10-14 to 10-17 were checked against the local replay corpus:
+
+| Six shared with the earlier games (min_overlap) | Opponents with facts | Item precision |
+|---|---:|---:|
+| ≥ 4 | 31% | 98.1% |
+| ≥ 2 | 45% | 96.2% |
+
+- 71–74% of the moves a live game revealed were already in the scouted set.
+- 64% of opponents had any earlier game.
+- For comparison, the usage prior's sampled item is the exact item about 39% of the time.
+
+## 6. Not built yet, by expected value
+
+1. Joint set sampling from open team sheets: item | revealed moves.
+2. Bring rules for Farigiraf/Trick Room against fast and Defiant teams. The preview ensemble moves this way.
+3. Stat spreads closer to what humans run on this team, such as bulkier Archaludon and Golisopod. This is a team change and needs its own arena gate.

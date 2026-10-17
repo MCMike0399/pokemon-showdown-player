@@ -110,9 +110,13 @@ def sample_set(rng: random.Random, species: str, observed: dict | None = None,
         filtered = [e for e in entries if e['mega'] and (not mega_species or to_id(e['name']) == to_id(mega_species))]
         entries = filtered or entries
     elif item:
-        # A revealed non-stone item rules out the Mega entries.
+        # A known stone (scouted from an earlier game) keeps only its Mega entry; any other
+        # revealed item rules the Mega entries out.
+        stone_entries = [e for e in entries if e['mega'] and e['items'] and e['items'][0][0] == item]
         stone = dex.get(to_id(species), {}).get('requiredItem')
-        if not stone or to_id(stone) != item:
+        if stone_entries:
+            entries = stone_entries
+        elif not stone or to_id(stone) != item:
             entries = [e for e in entries if not e['mega']] or entries
     elif observed.get('mega_ruled_out'):
         entries = [e for e in entries if not e['mega']] or entries
