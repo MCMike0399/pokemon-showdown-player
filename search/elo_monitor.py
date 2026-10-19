@@ -115,7 +115,7 @@ def policy_key(config: dict, preview, team) -> str:
     return hashlib.sha1(blob.encode()).hexdigest()[:12]
 
 
-_KIND = re.compile(rb'"kind"\s*:\s*"(?:terminal|search_agent|preview_policy|team)"')
+_KIND = re.compile(rb'"kind"\s*:\s*"(?:terminal|search_agent|preview_policy|team|ab_arm)"')
 
 
 def _apply(run: dict, event: dict, me: str) -> None:
@@ -126,6 +126,9 @@ def _apply(run: dict, event: dict, me: str) -> None:
         run['preview'] = event.get('spec')
     elif kind == 'team':
         run['team'] = event.get('name')
+    elif kind == 'ab_arm' and event.get('room'):
+        # A live A/B game (search/ab_test.py): its arm, not the run's config, is the policy.
+        run.setdefault('arms', {})[event['room']] = str(event.get('id'))
     elif kind == 'terminal':
         result = event.get('result') or {}
         room = result.get('room')
@@ -187,8 +190,10 @@ def games_from_runs(runs: list[dict]) -> list[dict]:
     """Finished games deduped by room (a resumed room keeps its later run's terminal), by time."""
     games = {}
     for run in runs:  # run order: a later terminal replaces an earlier one
+        arms = run.get('arms') or {}
         for room, game in run['terminals'].items():
-            game['policy_key'] = run['key']
+            # A/B games form their own segment: both arms mixed, judged per arm by ab_test.
+            game['policy_key'] = run['key'] + ('+ab-' + arms[room] if room in arms else '')
             games[room] = game
     return sorted(games.values(), key=lambda g: (g['time'], g['room']))
 
@@ -321,6 +326,8 @@ def segments(games, runs=None) -> list[dict]:
         changes = _changes(previous, descriptor) if previous else []
         previous = descriptor
         label = _preview_label(descriptor['preview'])
+        if '+ab-' in seg['key']:
+            label += ' [live A/B ' + seg['key'].split('+ab-', 1)[1] + ', see search/ab_test.py]'
         seg.update(index=index, descriptor=descriptor, changes=changes,
                    label=label + (' (' + '; '.join(changes) + ')' if changes and index else ''),
                    first=games_time(seg['games'], 0), last=games_time(seg['games'], -1))

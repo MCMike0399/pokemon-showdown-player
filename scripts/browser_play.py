@@ -132,16 +132,35 @@ async def run(args):
                             from search.value_gate import make_preview
                             preview = make_preview(args.preview, preview, int(time.time()))
                             player.log('preview_policy', spec=args.preview)
-                        # One deployed configuration, shared with the value gate.
+                        def make_agent(over):
+                            # One deployed configuration, shared with the value gate; a live A/B arm
+                            # (search/ab_test.py) adds its factors' overrides.
+                            sized = {k: v for k, v in (('worlds', args.search_worlds), ('engines', args.search_engines))
+                                     if v is not None}
+                            kwargs = agent_kwargs(**{**over, **sized})
+                            made = SearchAgent(fmt=args.format, preview=preview, seed=int(time.time()), **kwargs)
+                            if kwargs.get('scout'):
+                                # Opponents' earlier public games (search/scout.py); gates never look online.
+                                from search.scout import OnlineScout
+                                cfg = kwargs['scout']
+                                made.scout_source = OnlineScout(args.format, args.root / 'scout-cache',
+                                                                max_games=int(cfg.get('max_games', 6)),
+                                                                min_overlap=int(cfg.get('min_overlap', 4)), log=player.log)
+                            return made
                         search_kwargs = agent_kwargs(worlds=args.search_worlds, engines=args.search_engines)
-                        agent = SearchAgent(fmt=args.format, preview=preview, seed=int(time.time()), **search_kwargs)
-                        if search_kwargs.get('scout'):
-                            # Opponents' earlier public games (search/scout.py); gates never look online.
-                            from search.scout import OnlineScout
-                            cfg = search_kwargs['scout']
-                            agent.scout_source = OnlineScout(args.format, args.root / 'scout-cache',
-                                                             max_games=int(cfg.get('max_games', 6)),
-                                                             min_overlap=int(cfg.get('min_overlap', 4)), log=player.log)
+                        agent = make_agent({})
+                        arm_over = {}
+
+                        async def use_arm(arm):
+                            # Rebuilt only between games, when the arm's overrides change.
+                            nonlocal agent, arm_over
+                            want = (arm or {}).get('overrides') or {}
+                            if want != arm_over:
+                                old = agent
+                                agent = make_agent(want)
+                                agent.stats = old.stats
+                                await old.close()
+                                arm_over = want
 
                         from search.value_store import LivePriority
 
@@ -176,7 +195,21 @@ async def run(args):
                             except asyncio.TimeoutError:
                                 pass
                         room = args.room if game == 0 else None
+                        arm, ab_spec = None, None
+                        if agent is not None:
+                            from search import ab_test
+                            try:
+                                ab_spec = ab_test.load_spec()
+                            except ValueError as error:  # a malformed spec plays LIVE, loudly
+                                player.log('ab_error', error=repr(error)[:300])
+                            if ab_spec:
+                                # A resumed room keeps the arm it started with; an unknown one plays LIVE.
+                                arm = ab_test.arm_for_room(ab_spec, room) if room else ab_test.next_arm(ab_spec)
+                            await use_arm(arm)
                         if room:
+                            if arm:
+                                player.log('ab_arm', room=room, resumed=True,
+                                           **{k: arm[k] for k in ('id', 'n', 'cell', 'random', 'overrides')})
                             await player.enter_room(room)
                         else:
                             disk = storage_status(args.root, LearningConfig.load(args.root).resource['max_disk_gb'])
@@ -212,6 +245,9 @@ async def run(args):
                                 if stop.is_set():
                                     break
                                 raise TimeoutError('matchmaking timed out; search cancelled')
+                            if arm:
+                                ab_test.record_arm(ab_spec, room, arm)
+                                player.log('ab_arm', room=room, **{k: arm[k] for k in ('id', 'n', 'cell', 'random', 'overrides')})
                         outcome = await player.play(room, args.format, sets=team['sets'] if team else None,
                                                     timeout=args.stall_timeout, record=not args.no_record)
                         if agent is not None:

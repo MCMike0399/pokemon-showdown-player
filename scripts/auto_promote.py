@@ -194,7 +194,8 @@ def preflight(gates: Path, options: dict, label: str) -> dict:
     return state
 
 
-def promote(gates: Path, options: dict, label: str, evidence: dict, dry: bool):
+def promote(gates: Path, options: dict, label: str, evidence: dict, dry: bool, message: str | None = None):
+    """`message` replaces the gate-evidence commit message (live A/B promotions, scripts/ab_watch.py)."""
     live_deploy.check()
     wt = prepare(gates, options, label)
     sha = None
@@ -202,12 +203,15 @@ def promote(gates: Path, options: dict, label: str, evidence: dict, dry: bool):
         if dry:
             log(gates, 'dry run: checks passed, nothing committed')
             return
-        c, s = evidence['confirm'], evidence['standard']
-        msg = (f'Promote {label} to the live search\n\n'
-               f'Confirm gate vs the ladder-human imitation: {c["gains"]} gains, {c["losses"]} losses, '
-               f'p {c["p_one_sided"]} ({c["pairs_complete"]} pairs).\n'
-               f'Standard gate vs the deployed search: {s["gains"]} gains, {s["losses"]} losses '
-               f'(no significant harm).\nPromoted automatically by scripts/auto_promote.py.')
+        if message:
+            msg = message
+        else:
+            c, s = evidence['confirm'], evidence['standard']
+            msg = (f'Promote {label} to the live search\n\n'
+                   f'Confirm gate vs the ladder-human imitation: {c["gains"]} gains, {c["losses"]} losses, '
+                   f'p {c["p_one_sided"]} ({c["pairs_complete"]} pairs).\n'
+                   f'Standard gate vs the deployed search: {s["gains"]} gains, {s["losses"]} losses '
+                   f'(no significant harm).\nPromoted automatically by scripts/auto_promote.py.')
         run(gates, ['git', 'commit', '-q', '-m', msg, '--', 'search/config.py'], cwd=wt)
         for attempt in range(1, 4):
             if run(gates, ['git', 'push', '-q', 'origin', 'HEAD:main'], cwd=wt, check=False).returncode == 0:
