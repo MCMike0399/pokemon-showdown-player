@@ -23,6 +23,12 @@ seeds) must pass, as for values.
 A search-configuration change (e.g. the selective second turn) is gated the same
 way with `--cand-search '{"depth2": {...}}'`: those keys override the deployed
 configuration in the candidate arm only; value and screening are equal in both.
+
+For future protocols, `--rule pooled --pairs 800` uses one full-panel sign test
+and only two rejection looks (halfway and three-quarters, gains <= losses).
+It never promotes early. This avoids requiring two separately significant
+stages and checking futility after every early pair. Do not change the rule of
+an experiment already in progress, or automatically deploy on an offline pass.
 """
 from __future__ import annotations
 
@@ -79,6 +85,7 @@ def summarize(rows: list[dict], pairs: int, alpha: float, rule: str = 'superior'
 An arm that errored MAX_ATTEMPTS times voids its pair (never retried with a
 different seed, which would break the pairing), so a gate always terminates.
 """
+    rows = [r for r in rows if not r.get('post_decision')]
     by: dict[int, dict] = {}
     for r in rows:
         arm = by.setdefault(r['pair'], {}).setdefault(r['arm'], {'score': None, 'errors': 0})
@@ -98,6 +105,11 @@ different seed, which would break the pairing), so a gate always terminates.
     early = len(complete) >= min(FUTILITY_FROM, pairs) and len(complete) + void < pairs
     if rule == 'noninferior':
         futile = early and losses - gains >= NONINFERIOR_FUTILITY
+    elif rule == 'pooled':
+        # Fixed final test, interim rejection only: type-I error cannot exceed
+        # the exact sign test's alpha. A small early deficit is not a verdict.
+        futile = (len(complete) in (pairs // 2, 3 * pairs // 4)
+                  and len(complete) + void < pairs and gains <= losses)
     else:
         futile = early and gains <= losses
     done = len(complete) + void >= pairs or futile
@@ -115,6 +127,20 @@ different seed, which would break the pairing), so a gate always terminates.
             'sims_ratio': round(ratio, 4) if ratio is not None else None,
             'errors': sum(1 for r in rows if r.get('error')), 'complete': done, 'futility_stop': futile,
             'passed': bool(passed)}
+
+
+def first_decision(rows: list[dict], pairs: int, alpha: float, rule: str, min_sim_saving: float):
+    """Recover the first stopping decision in append order, including after a restart.
+
+    Games already running may finish after futility. Their results remain in the
+    ledger, but cannot undo a decision or make resuming a rejected panel legal.
+    """
+    earliest_pairs = pairs // 2 if rule == 'pooled' else min(FUTILITY_FROM, pairs)
+    for end in range(2 * earliest_pairs, len(rows) + 1):
+        result = summarize(rows[:end], pairs, alpha, rule, min_sim_saving)
+        if result['complete']:
+            return result, end
+    return None, 0
 
 
 def make_preview(spec: str, fallback, seed: int):
@@ -162,16 +188,31 @@ def make_preview(spec: str, fallback, seed: int):
 async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, concurrency: int, seed: int,
                    team: list[dict], pool: list[list[dict]], engines: int, alpha: float, log=print,
                    rule: str = 'superior', min_sim_saving: float = 0.0, screen_log_dir: Path | None = None,
-                   opponent: str = 'search') -> dict:
+                   opponent: str | list[str] = 'search') -> dict:
     """`candidate`/`incumbent`: {'path', 'beta', 'screen', 'search'}; 'screen' is a learned
 screening model (search.screen_data) or None for probe screening, 'search' optional
 overrides of the deployed search configuration. The opponent always plays the
 deployed configuration, the incumbent's screening and the hand evaluation."""
     from search.agent import SearchAgent
     from search.screen_data import write_records
+    if pairs < 1 or concurrency < 1:
+        raise ValueError('pairs and concurrency must be positive')
+    opponents = opponent if isinstance(opponent, list) else [opponent]
+    if not opponents or any(not isinstance(o, str) or not (o == 'search' or o.startswith('imitation:')) for o in opponents):
+        raise ValueError('opponent pool must contain search/imitation specs')
+    if rule == 'pooled' and (pairs < 4 or pairs % 4):
+        raise ValueError('pooled rule requires pairs >= 4 and divisible by four')
     summary = lambda: summarize(rows, pairs, alpha, rule, min_sim_saving)  # noqa: E731
     out.parent.mkdir(parents=True, exist_ok=True)
     rows = [json.loads(line) for line in out.read_text().splitlines() if line.strip()] if out.exists() else []
+    decision, decision_rows = first_decision(rows, pairs, alpha, rule, min_sim_saving)
+
+    def result():
+        return {**(decision or summary()), 'decision_rows': decision_rows or len(rows),
+                'recorded_rows': len(rows)}
+
+    if decision is not None:
+        return result()
     attempts: dict = {}
     for r in rows:
         key = (r['pair'], r['arm'])
@@ -184,14 +225,19 @@ deployed configuration, the incumbent's screening and the hand evaluation."""
 
     async def one(pair: int, arm: str):
         while attempts.get((pair, arm), 0) < MAX_ATTEMPTS:
-            if summary()['complete']:
+            if decision is not None:
                 return  # decided (futility stop): skip games not yet started
-            attempts[(pair, arm)] = attempts.get((pair, arm), 0) + 1
             if await attempt(pair, arm):
                 return
 
     async def attempt(pair: int, arm: str) -> bool:
+        nonlocal decision, decision_rows
         async with sem:
+            # A queued coroutine may have waited through dozens of completed
+            # games. Recheck AFTER taking the slot, before constructing agents.
+            if decision is not None:
+                return True
+            attempts[(pair, arm)] = attempts.get((pair, arm), 0) + 1
             game_seed = seed * 1_000_003 + pair
             us_side = 'p1' if pair % 2 == 0 else 'p2'
             them_side = 'p2' if us_side == 'p1' else 'p1'
@@ -209,11 +255,12 @@ deployed configuration, the incumbent's screening and the hand evaluation."""
                                 **(value.get('search') or {})},
                              value_path=value.get('path'), value_beta=value.get('beta', 0.0),
                              screen_model=value.get('screen'))
-            if opponent.startswith('imitation:'):
+            opponent_spec = opponent[pair % len(opponent)] if isinstance(opponent, list) else opponent
+            if opponent_spec.startswith('imitation:'):
                 # A ladder-human imitation (search/human/imitation.py) piloting the real team:
                 # the deployment distribution, not search against search.
                 from search.human.imitation import ImitationAgent
-                spec = opponent.split(':')
+                spec = opponent_spec.split(':')
                 # spec: imitation:PATH[:temp|argmax[:PREVIEW_PATH[:topk]]]
                 them = ImitationAgent(spec[1], fmt=FMT, preview=preview, seed=game_seed + 1,
                                       temp=float(spec[2]) if len(spec) > 2 and spec[2] != 'argmax' else 1.0,
@@ -262,17 +309,21 @@ deployed configuration, the incumbent's screening and the hand evaluation."""
                 await us.close()
                 await them.close()
             async with lock:
+                if decision is not None:
+                    rec['post_decision'] = True  # retained for audit, excluded by every summary consumer
                 with out.open('a') as fh:
                     fh.write(json.dumps(rec) + '\n')
                 rows.append(rec)
                 s = summary()
+                if decision is None and s['complete']:
+                    decision, decision_rows = s, len(rows)
                 log(json.dumps({'pair': pair, 'arm': arm, 'win': rec.get('win'), 'seconds': rec.get('seconds'),
                                 'gains': s['gains'], 'losses': s['losses'], 'complete': s['pairs_complete']}))
             return 'error' not in rec
 
     # Interleave arms so an interruption leaves complete pairs, not one long arm.
     await asyncio.gather(*(one(p, arm) for p in range(pairs) for arm in ('cand', 'inc')))
-    return summary()
+    return result()
 
 
 def main():
@@ -291,7 +342,7 @@ def main():
     ap.add_argument('--out', type=Path, required=True)
     ap.add_argument('--cand-screen', type=Path, help='learned screening candidate for the candidate arm')
     ap.add_argument('--inc-screen', type=Path, help='learned screening of the incumbent arm and the opponent')
-    ap.add_argument('--rule', choices=['superior', 'noninferior'], default='superior')
+    ap.add_argument('--rule', choices=['superior', 'noninferior', 'pooled'], default='superior')
     ap.add_argument('--min-sim-saving', type=float, default=0.0)
     ap.add_argument('--screen-log-dir', type=Path, help='write probe results of every game here')
     ap.add_argument('--cand-search', type=json.loads, help='JSON overrides of the search config, candidate arm only')
@@ -302,6 +353,7 @@ def main():
     ap.add_argument('--cand-preview', help="candidate arm's team preview: 'human:PATH[:argmax]' or 'pvalue:PATH'")
     ap.add_argument('--inc-preview', help="incumbent arm's team preview (same syntax); default the frozen actor's")
     ap.add_argument('--opponent', default='search', help="'search' (deployed search, hand evaluation) or 'imitation:PATH[:temp[:PREVIEW_PATH]]'")
+    ap.add_argument('--opponent-pool', type=json.loads, help='JSON list of opponent specs, deterministically balanced by pair')
     args = ap.parse_args()
     team = json.loads((ROOT / 'teams.json').read_text())[args.team]['sets']
     pool = [t['sets'] if isinstance(t, dict) else t for t in json.loads(args.pool.read_text())]
@@ -313,7 +365,7 @@ def main():
            'screen': model_from_file(args.inc_screen), 'preview': args.inc_preview, 'search': args.inc_search}
     result = asyncio.run(run_gate(cand, inc, args.out, args.pairs, args.concurrency, args.seed, team, pool,
                                   args.engines, args.alpha, rule=args.rule, min_sim_saving=args.min_sim_saving,
-                                  screen_log_dir=args.screen_log_dir, opponent=args.opponent))
+                                  screen_log_dir=args.screen_log_dir, opponent=args.opponent_pool or args.opponent))
     print(json.dumps({'candidate': cand, 'incumbent': inc, **result}))
 
 

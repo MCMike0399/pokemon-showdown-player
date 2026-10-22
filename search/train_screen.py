@@ -271,6 +271,20 @@ def sims_per_world(m_ours: int, m_theirs: int, pre: dict | None) -> int:
     return probe + min(mo, KEEP[0]) * min(mt, KEEP[1])
 
 
+def check_holdout(metrics: dict, pre: dict, recall_opp=.92, recall_ours=.90, best_retention=.98) -> bool:
+    """Check already-fixed prefilter sizes without adapting them to test results."""
+    for name, key, threshold in (('ours', 'ours', recall_ours), ('theirs', 'opp', recall_opp)):
+        side = metrics.get(name, {})
+        if key not in pre or side.get('groups', 0) < LIVE_MIN_GROUPS:
+            return False
+        m = side.get('by_pre', {}).get(str(pre[key]), {})
+        if m.get('recall', 0) < threshold - LIVE_TOLERANCE:
+            return False
+        if name == 'ours' and m.get('best', 0) < best_retention - LIVE_TOLERANCE:
+            return False
+    return True
+
+
 def saving(world_sizes: dict, pre: dict) -> float | None:
     both = [w for w in world_sizes.values() if 0 in w and 1 in w]
     if not both or 'opp' not in pre or 'ours' not in pre:
@@ -295,6 +309,8 @@ def main(argv=None):
     ap.add_argument('--wd', type=float, default=1e-4)
     ap.add_argument('--batch', type=int, default=4096)
     ap.add_argument('--device', default='auto', choices=['auto', 'mps', 'cpu'])
+    ap.add_argument('--strict-holdout', action='store_true', help='choose sizes on validation only; test can reject but never retune')
+    ap.add_argument('--mps-memory-fraction', type=float, default=.25)
     ap.add_argument('--seed', type=int, default=0)
     ap.add_argument('--threads', type=int, default=2)
     ap.add_argument('--recall-opp', type=float, default=0.92)
@@ -303,6 +319,8 @@ def main(argv=None):
     ap.add_argument('--min-saving', type=float, default=0.15)
     ap.add_argument('--min-groups', type=int, default=300)
     args = ap.parse_args(argv)
+    if not 0 < args.mps_memory_fraction <= 1:
+        ap.error('--mps-memory-fraction must be in (0, 1]')
     started = time.time()
     import torch
     torch.set_num_threads(args.threads)
@@ -322,7 +340,7 @@ def main(argv=None):
         device = 'mps' if torch.backends.mps.is_available() else 'cpu'
     if device == 'mps':
         try:
-            torch.mps.set_per_process_memory_fraction(0.25)
+            torch.mps.set_per_process_memory_fraction(args.mps_memory_fraction)
         except Exception:
             pass
     fit = (args.hidden, args.epochs, args.lr, args.wd, args.batch)
@@ -339,7 +357,8 @@ def main(argv=None):
               'splits': {s: int((data['split'] == s).sum()) for s in ('train', 'val', 'live_test')}}
     for split in ('val', 'live_test'):
         report[split] = evaluate(data, pred, split)
-    pre = choose(report['val'], args.recall_opp, args.recall_ours, args.best_retention, report.get('live_test'))
+    pre = choose(report['val'], args.recall_opp, args.recall_ours, args.best_retention,
+                 None if args.strict_holdout else report.get('live_test'))
     report['prefilter'] = pre
     report['estimated_sim_saving'] = {s: saving(report[s].get('worlds', {}), pre) for s in ('val', 'live_test') if report[s]}
     for s in ('val', 'live_test'):
@@ -348,6 +367,11 @@ def main(argv=None):
     est = report['estimated_sim_saving'].get('val')
     report['useful'] = bool('opp' in pre and 'ours' in pre and est is not None and est >= args.min_saving
                             and groups_val >= args.min_groups)
+    if args.strict_holdout:
+        report['holdout_passed'] = check_holdout(report.get('live_test', {}), pre,
+                                                args.recall_opp, args.recall_ours, args.best_retention)
+        test_saving = report['estimated_sim_saving'].get('live_test')
+        report['useful'] &= bool(report['holdout_passed'] and test_saving is not None and test_saving >= args.min_saving)
     layers = [m for m in net if hasattr(m, 'weight')]
     weights = {'layers': [{'W': l.weight.detach().tolist(), 'b': l.bias.detach().tolist()} for l in layers],
                'mean': mean.tolist(), 'std': std.tolist(),

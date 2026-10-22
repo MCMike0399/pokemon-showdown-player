@@ -169,7 +169,8 @@ class SearchAgent:
                  screen_log: float = 0.0, depth2: dict | None = None, opp_model: dict | None = None,
                  leaf: dict | None = None, speed_infer: bool = False, speed_tries: int = 24,
                  protect_d2: dict | None = None, eval_terms: dict | None = None, endgame_d2: dict | None = None,
-                 mega_avoid: list | None = None, bench_prior: str | None = None, scout: dict | None = None):
+                 mega_avoid: list | None = None, bench_prior: str | None = None, scout: dict | None = None,
+                 preview_guard: dict | None = None):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -178,6 +179,10 @@ class SearchAgent:
         self.opp_tau = opp_tau
         self.max_opp = max_opp
         self.preview = preview
+        self.preview_guard = None
+        if preview_guard:
+            from search.preview_guard import PreviewGuard
+            self.preview_guard = PreviewGuard(preview_guard)
         self.rng = random.Random(seed)
         self.cutoff = usage_cutoff
         self.opp_no_switch = opp_no_switch
@@ -479,6 +484,10 @@ class SearchAgent:
         if len(choices) == 1:
             return choices[0]
         if request.get('teamPreview'):
+            if self.preview_guard is not None:
+                guarded = self.preview_guard.choose(ctx)
+                if guarded is not None:
+                    return guarded
             if self.preview_mode == 'value':
                 try:
                     return await self._value_preview(ctx)

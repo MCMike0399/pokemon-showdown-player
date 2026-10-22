@@ -158,6 +158,20 @@ def prepare(gates: Path, options: dict, label: str) -> Path:
     wt = checkout(gates, gates / '.promote-wt')
     cfg = wt / 'search' / 'config.py'
     cfg.write_text(apply_options(cfg.read_text(), options, f'{label}, promoted {datetime.now().date()}'))
+    # An immutable screening artifact is runtime input, not source. Stage just
+    # that JSON for clean-checkout tests instead of linking mutable live data.
+    learned = (options.get('screen') or {}).get('learned') or {}
+    if learned.get('path'):
+        import shutil
+        relative = Path(learned['path'])
+        if relative.is_absolute() or '..' in relative.parts or relative.parts[:2] != ('data', 'ml'):
+            raise ValueError('screening artifact must be a relative data/ml JSON path')
+        source = ROOT / relative
+        from search.screen_data import weights_sha
+        weights_sha(source)  # verify the expected model schema before staging
+        destination = wt / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
     check_config(options, wt)
     fails = failed_tests(gates, wt)
     if fails:
