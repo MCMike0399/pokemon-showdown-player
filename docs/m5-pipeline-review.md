@@ -161,9 +161,11 @@ Use the new pooled rule for a future protocol once its opponent population is
 chosen, and reserve live A/B for evidence that transfers to the ladder.
 
 Do not infer that data collection continuously improves the deployed player.
-The pilot is complete; no recurring training service or new campaign was
-started, and no model or gate is authorized to promote automatically by this
-document. Source changes are local; the pinned player remains unchanged.
+The pilot itself ended without a promotion. The subsequent
+[persistent c10 campaign](c10-m5-campaign.md), requested later on October 22,
+now runs from pinned source with MPS training, pooled offline gates and a fresh
+live A/B after c9. Only that live confirmation may authorize its automatic
+promotion; the pilot's screening result alone cannot.
 
 Artifacts are retained in `data/ml/value/pipeline-pilot-20261022/`:
 `PROTOCOL.md`, `screen-files.json`, `pilot.py`, `benchmark.json`, `result.json`,

@@ -122,3 +122,26 @@ and finish. Do not edit the pinned worktree while it is running.
 Success is a positive live SPRT followed by a stronger Elo performance segment.
 There is no promise that either candidate wins. If both fail, the campaign
 records that result and idles instead of retraining on the same evidence forever.
+
+## Launch receipt
+
+Started on 2026-10-22 from public commit `8483c85`. The immutable protocol copy
+in the campaign directory predates this receipt. The source and datasets were
+pinned before training, and the live c9 specification was preserved.
+
+- Actual snapshot:1,500 baseline games /1,186,801 action rows.
+- MPS training and evaluation completed in8.1seconds. The new model
+  `screen-cb953dbe557ca613` passed the fixed chronological holdout checks:
+  99.11% final-choice retention and15.12% estimated simulation saving.
+- Promotion preflight passed on a clean checkout with the proposed options:
+  465tests passed,8skipped, secret scan and push authentication passed.
+- Local source suite:473passed. GitHub Actions passed for8483c85.
+- Both offline gates launched, four games each. A real supervisor restart
+  adopted both existing workers without changing their PIDs or retry counts.
+- Live code was updated gracefully to8483c85, with c9's playing configuration
+  unchanged. A room unassigned during the matchmaking/restart boundary was
+  resumed as baseline and excluded from c9; the next new game resumed c9
+  assignments normally.
+
+These are startup checks, not gate results. Use the status command for current
+counts and outcomes.
