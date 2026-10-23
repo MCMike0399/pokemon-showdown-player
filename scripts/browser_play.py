@@ -120,7 +120,7 @@ async def run(args):
                         player.log('team', name=args.team, format=args.format, team_id=team_id(args.format, team['sets']))
                     agent = None
                     if args.search and not args.inspect:
-                        from search.agent import SearchAgent
+                        from search.agent import RECONSTRUCTION_VERSION, SearchAgent
                         from search.config import agent_kwargs
                         brain = player.brain
 
@@ -170,7 +170,7 @@ async def run(args):
                                 return await agent.decide(ctx)
                         player.decider = search_decider
                         player.decider_trace = lambda: agent.last_trace
-                        player.log('search_agent', **{k: v for k, v in search_kwargs.items()})
+                        player.log('search_agent', reconstruction_version=RECONSTRUCTION_VERSION, **search_kwargs)
                     if args.inspect:
                         # Read-only transport smoke: no login, matchmaking or moves.
                         print(json.dumps(await page.evaluate("() => ({client:!!app.rooms, named:!!app.user.get('named'), title:document.title})")))

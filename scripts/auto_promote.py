@@ -158,17 +158,24 @@ def prepare(gates: Path, options: dict, label: str) -> Path:
     wt = checkout(gates, gates / '.promote-wt')
     cfg = wt / 'search' / 'config.py'
     cfg.write_text(apply_options(cfg.read_text(), options, f'{label}, promoted {datetime.now().date()}'))
-    # An immutable screening artifact is runtime input, not source. Stage just
-    # that JSON for clean-checkout tests instead of linking mutable live data.
+    # Immutable model artifacts are runtime inputs, not source. Stage just
+    # those JSONs for clean-checkout tests instead of linking mutable live data.
     learned = (options.get('screen') or {}).get('learned') or {}
-    if learned.get('path'):
+    residual = options.get('preview_residual') or {}
+    for kind, artifact in (('screening', learned), ('preview residual', residual)):
+        if not artifact.get('path'):
+            continue
         import shutil
-        relative = Path(learned['path'])
+        relative = Path(artifact['path'])
         if relative.is_absolute() or '..' in relative.parts or relative.parts[:2] != ('data', 'ml'):
-            raise ValueError('screening artifact must be a relative data/ml JSON path')
+            raise ValueError(f'{kind} artifact must be a relative data/ml JSON path')
         source = ROOT / relative
-        from search.screen_data import weights_sha
-        weights_sha(source)  # verify the expected model schema before staging
+        if kind == 'screening':
+            from search.screen_data import weights_sha
+            weights_sha(source)
+        else:
+            from search.preview_residual import PreviewResidual
+            PreviewResidual(artifact)  # schema, feature dimension and baseline checksum
         destination = wt / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)

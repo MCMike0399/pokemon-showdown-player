@@ -6,6 +6,7 @@ filled by `search.priors` determinization.
 """
 from __future__ import annotations
 
+import copy
 import re
 
 from battle_state import to_id
@@ -85,6 +86,10 @@ class Tracker:
         self.side_conditions = {'p1': {}, 'p2': {}}
         self.mega_used = {'p1': False, 'p2': False}
         self.winner = None
+        # An Illusion switch-in temporarily attributes observations to the disguise.
+        # Retain its prior facts so a reveal can restore them without phantom KOs.
+        self._switch_before = {}
+        self._switch_moves = {}
 
     # ---------------------------------------------------------------- parsing
     def _mon(self, ident: str, details: str | None = None) -> Mon | None:
@@ -128,16 +133,15 @@ class Tracker:
         elif kind == 'showteam' and arg in self.sheets:
             from battle_state import unpack_team
             self.sheets[arg] = unpack_team(line.split('|', 3)[3])
-        elif kind in ('switch', 'drag', 'replace') and len(p) > 4:
+        elif kind == 'replace' and len(p) > 3:
+            self._replace(arg, p[3], p[4] if len(p) > 4 and p[4] else None)
+        elif kind in ('switch', 'drag') and len(p) > 4:
             slot = arg.split(':')[0].strip()
             mon = self._mon(arg, p[3])
-            if kind == 'replace':
-                # Illusion broke: the slot holds a different Pokemon than shown.
-                old = self.slots.get(slot)
-                if old is not None and old is not mon:
-                    old.active_slot = None
+            self._switch_before[mon] = copy.deepcopy(mon.as_dict())
+            self._switch_moves[mon] = []
             prev = self.slots.get(slot)
-            if prev is not None and prev is not mon and kind != 'replace':
+            if prev is not None and prev is not mon:
                 prev.active_slot = None
                 prev.boosts = {}
                 prev.volatiles = {}
@@ -147,17 +151,17 @@ class Tracker:
                 mon.mega = True
             frac, status, cur, mx = _hp(p[4])
             mon.hp = frac
+            mon.fainted = frac == 0
             mon.hp_exact = cur if mx and mx != 100 else None
             if mx and mx != 100:
                 mon.maxhp = mx
             mon.status = status
             mon.active_slot = slot
-            if kind != 'replace':
-                mon.switch_turn = self.turn
-                mon.actions = 0
-                mon.boosts = {}
-                mon.volatiles = {}
-                mon.locked_move = None
+            mon.switch_turn = self.turn
+            mon.actions = 0
+            mon.boosts = {}
+            mon.volatiles = {}
+            mon.locked_move = None
             mon.revealed = True
             self.slots[slot] = mon
         elif kind == 'swap' and len(p) > 3 and p[3].isdigit():
@@ -313,6 +317,10 @@ class Tracker:
                         pass
         elif kind == '-singleturn' or kind == '-singlemove':
             pass
+        elif kind == '-mustrecharge':
+            mon = self._slot_mon(arg)
+            if mon:
+                mon.volatiles['mustrecharge'] = {'turn': self.turn}
         elif kind == '-weather':
             if arg == 'none':
                 self.weather = None
@@ -360,6 +368,8 @@ class Tracker:
                 if not called or 'lockedmove' in rest:
                     if move not in mon.moves and move != 'struggle' and '[from]' not in rest:
                         mon.moves.append(move)
+                    if move != 'struggle' and '[from]' not in rest:
+                        self._switch_moves.setdefault(mon, []).append(move)
                     mon.actions += 1
                     mon.last_move = move
                     mon.last_move_turn = self.turn
@@ -379,6 +389,8 @@ class Tracker:
             if mon:
                 if p[3] == 'slp':
                     mon.sleep_turns += 1
+                if p[3] == 'recharge':
+                    mon.volatiles.pop('mustrecharge', None)
                 mon.last_move = None
                 mon.last_move_turn = self.turn
         elif kind == '-mega' and len(p) > 3:
@@ -392,6 +404,45 @@ class Tracker:
             self.winner = arg
         elif kind == '-transform':
             pass
+
+    def _replace(self, ident: str, details: str, condition: str | None) -> None:
+        """Reveal Illusion, including the protocol form without a condition field."""
+        slot = ident.split(':')[0].strip()
+        old = self.slots.get(slot)
+        mon = self._mon(ident, details)
+        if mon is None:
+            return
+        if old is not None and old is not mon:
+            before = self._switch_before.get(old, {})
+            for key in ('hp', 'hp_exact', 'maxhp', 'fainted', 'status', 'status_turn',
+                        'sleep_turns', 'toxic_turns', 'boosts', 'volatiles', 'switch_turn',
+                        'actions', 'last_move', 'last_move_turn', 'locked_move', 'protect_failed'):
+                setattr(mon, key, copy.deepcopy(getattr(old, key)))
+            mon.moves = list(dict.fromkeys(mon.moves + self._switch_moves.get(old, [])))
+            # Only new observations belong to the disguised visitor; don't transfer
+            # an item/ability learned on an earlier visit by the real disguise.
+            for key in ('item', 'item_known', 'item_gone', 'ability'):
+                if not before.get('revealed') or getattr(old, key) != before.get(key):
+                    setattr(mon, key, getattr(old, key))
+            if before.get('revealed'):
+                for key, value in before.items():
+                    setattr(old, key, value)
+                old.active_slot = None
+            else:
+                self.mons.pop((old.side, old.name), None)
+                old.active_slot = None
+            self._switch_before.pop(old, None)
+            self._switch_moves.pop(old, None)
+        mon.species = details.split(',')[0].strip()
+        mon.base_species = re.sub(r'-Mega(-[XYZ])?$', '', mon.species)
+        mon.mega = '-Mega' in mon.species
+        mon.active_slot, mon.revealed = slot, True
+        if condition:
+            mon.hp, mon.status, cur, mx = _hp(condition)
+            mon.fainted = mon.hp == 0
+            if mx and mx != 100:
+                mon.hp_exact, mon.maxhp = cur, mx
+        self.slots[slot] = mon
 
     def _item(self, mon: Mon, name: str, consumed: bool = False) -> None:
         mon.item = to_id(name)

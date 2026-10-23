@@ -132,6 +132,7 @@ function applyMon(battle, pokemon, st) {
   if (vol.dragoncheer) add('dragoncheer');
   if (vol.saltcure) add('saltcure');
   if (vol.charge) add('charge');
+  if (vol.mustrecharge) add('mustrecharge', {duration: 1});
   if (vol.healblock) add('healblock', {duration: 2});
   if (vol.leechseed) add('leechseed', {sourceSlot: pokemon.side.foe.active[0] ? pokemon.side.foe.active[0].getSlot() : 'p2a'});
   if (vol.stockpile) add('stockpile', {layers: vol.stockpile.layers || 1});

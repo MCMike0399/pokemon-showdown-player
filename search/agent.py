@@ -21,6 +21,8 @@ from search.speed import observations as speed_observations, violations
 from search.tracker import PROTECT_MOVES, Tracker, _hp
 
 ENGINE = Path(__file__).resolve().parent / 'engine.cjs'
+# Log this separately from tuning options so correctness deploys get a new Elo segment.
+RECONSTRUCTION_VERSION = 2
 # Single-target status moves meant for the partner (mirrors engine.cjs ALLY_STATUS_OK).
 ALLY_STATUS_OK = {'healpulse', 'floralhealing', 'decorate', 'skillswap', 'entrainment', 'afteryou', 'instruct',
                   'purify', 'acupressure', 'swagger', 'flatter', 'lifedew', 'pollenpuff', 'quash', 'helpinghand',
@@ -170,7 +172,7 @@ class SearchAgent:
                  leaf: dict | None = None, speed_infer: bool = False, speed_tries: int = 24,
                  protect_d2: dict | None = None, eval_terms: dict | None = None, endgame_d2: dict | None = None,
                  mega_avoid: list | None = None, bench_prior: str | None = None, scout: dict | None = None,
-                 preview_guard: dict | None = None):
+                 preview_guard: dict | None = None, preview_residual: dict | None = None):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -180,6 +182,12 @@ class SearchAgent:
         self.max_opp = max_opp
         self.preview = preview
         self.preview_guard = None
+        self.preview_residual = None
+        if preview_residual:
+            if preview_guard:
+                raise ValueError('preview residual and guard require separate experiments')
+            from search.preview_residual import PreviewResidual
+            self.preview_residual = PreviewResidual(preview_residual)
         if preview_guard:
             from search.preview_guard import PreviewGuard
             self.preview_guard = PreviewGuard(preview_guard)
@@ -316,6 +324,10 @@ class SearchAgent:
                     # A Struggle request lists no real move: empty them in the rebuilt
                     # battle, or `move struggle` is rejected there and every world fails.
                     pp = {to_id(m): 0 for m in set_.get('moves', [])}
+                if [to_id(m.get('id') or m.get('move')) for m in req_moves] == ['recharge']:
+                    st['volatiles']['mustrecharge'] = {'turn': tracker.turn}
+                else:
+                    st['volatiles'].pop('mustrecharge', None)
                 st['pp'] = pp
             out.append({'set': set_, 'state': st})
         return out[:4]
@@ -484,6 +496,10 @@ class SearchAgent:
         if len(choices) == 1:
             return choices[0]
         if request.get('teamPreview'):
+            if self.preview_residual is not None:
+                corrected = self.preview_residual.choose(ctx)
+                if corrected is not None:
+                    return corrected
             if self.preview_guard is not None:
                 guarded = self.preview_guard.choose(ctx)
                 if guarded is not None:
@@ -719,6 +735,11 @@ class SearchAgent:
                 j = int(words[1]) - 1
                 if 0 <= j < len(moves):
                     mid = to_id(moves[j].get('id') or moves[j].get('move'))
+                    if mid == 'recharge':
+                        # A pseudo-move with no target metadata. Showdown accepts
+                        # its request index; naming it supplies a spurious normal target.
+                        parts.append('move 1')
+                        continue
                     rest = words[2:]
                     has_target = any(w.lstrip('-').isdigit() for w in rest)
                     if not has_target and move_info(mid).get('target') in ('normal', 'any', 'adjacentFoe'):
