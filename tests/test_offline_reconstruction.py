@@ -56,6 +56,8 @@ def test_illusion_world_search_does_not_fall_back_to_pass_pass(monkeypatch):
     import search.agent as module
     monkeypatch.setattr(module, 'sample_set', lambda rng, species, *a, **kw:
                         mon(species, ['tackle'])['set'])
+    monkeypatch.setattr(module, 'sample_bench', lambda rng, preview, revealed, n, *a, **kw:
+                        [species for species in preview if species not in revealed][:n])
     agent = SearchAgent(worlds=1, seed=1)
     world = {'p1': [mon('Politoed', ['tackle']), mon('Archaludon', ['tackle'])],
              'p2': agent._their_side(Tracker('p1').feed(ILLUSION), random.Random(1))}
