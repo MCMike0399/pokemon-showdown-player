@@ -116,11 +116,16 @@ class ResourcePolicy:
         if disk_free < 2:
             workers = 0
             healthy = False
+        from ml.cluster import background_budget
+        cluster_workers = background_budget()
+        if cluster_workers is not None:
+            workers = min(workers, cluster_workers)
+            healthy = healthy and cluster_workers > 0
         return {"cpu_cores": cores, "system_cpu_percent": cpu, "available_gb": round(free, 2),
                 "disk_free_gb": round(disk_free, 2), "allowed_workers": workers,
                 "memory_pressure": pressure, 'swap_used_gb': round(swap.used / 2**30, 2),
                 'swapout_mb_per_second': round(swapout_rate, 2), 'training_allowed': healthy,
-                "deferred": workers == 0, "policy": asdict(self)}
+                "deferred": workers == 0, "cluster_workers": cluster_workers, "policy": asdict(self)}
 
     def apply_background(self, enable_mps: bool = True):
         # Changes affect this worker process and its children, never other services.

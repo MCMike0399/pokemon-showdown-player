@@ -11,6 +11,37 @@ remains available for bounded standalone runs.
 
 ## Resource policy
 
+### Sharing the host with a private compute cluster
+
+`BURBUJA_BACKGROUND_BUDGET=/absolute/path/background.json` optionally caps new
+background work with the Burbuja monitor's `at`/`maxWorkers` budget. Missing,
+malformed or older-than-90-second data defers opted-in work; without the variable
+the established resource policy is unchanged. Critical pressure, live resource
+reserves and the model/evaluation gates still apply.
+
+Existing frozen campaigns can use `scripts/cluster_priority.py` without editing
+their pinned worktrees or changing seeds, source hashes, models, ledgers or slot
+counts. The controller observes local realtime activity and the authenticated
+private file worker. While higher-priority work runs, it applies macOS background
+QoS with `/usr/sbin/taskpolicy -b` only to registered offline campaign workers and
+their children. It restores normal QoS with `-B` afterwards. PID creation times
+guard against reuse. This controller never sends SIGSTOP/SIGCONT, leaving the
+live player's existing turn-priority protocol in control. It never targets the
+live player, browser or other applications. The receipt records owned identities
+for recovery across controller restart; vanished workers need no restoration.
+
+Configure its `--root`, `--state` and `--receipt` using private paths. The worker
+token lives beside the state file as `worker.token`; it is read only to query the
+loopback worker's status. Polling does not grant model or experiment authority.
+This is cooperative priority, not a guaranteed CPU reservation or a promise of
+zero latency impact. Long training/collection stays on the designated always-on
+host; the monitor client does not become an always-on compute node.
+
+Verified 2026-10-24: full suite 504 passed/6 skipped, focused admission/ownership
+checks passed, and a real synthetic transcription observed offline workers
+yielding and returning to normal QoS. Frozen campaigns and the live model were
+unchanged.
+
 Defaults reserve three CPU cores and at least 2 GB of available host memory,
 cap simulator concurrency at four workers, cap measured host CPU use at 75%,
 and defer when disk headroom falls below 2 GB. Available concurrency is recalculated
