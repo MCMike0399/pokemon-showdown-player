@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import math
 import random
 import re
 import time
@@ -172,7 +173,8 @@ class SearchAgent:
                  leaf: dict | None = None, speed_infer: bool = False, speed_tries: int = 24,
                  protect_d2: dict | None = None, eval_terms: dict | None = None, endgame_d2: dict | None = None,
                  mega_avoid: list | None = None, bench_prior: str | None = None, scout: dict | None = None,
-                 preview_guard: dict | None = None, preview_residual: dict | None = None):
+                 preview_guard: dict | None = None, preview_residual: dict | None = None,
+                 root_policy: dict | None = None):
         self.fmt = fmt
         self.n_worlds = worlds
         self.engines = [Engine() for _ in range(max(1, engines))]
@@ -192,6 +194,24 @@ class SearchAgent:
             from search.preview_guard import PreviewGuard
             self.preview_guard = PreviewGuard(preview_guard)
         self.rng = random.Random(seed)
+        self.policy_rng = random.Random(seed + 104729)
+        self.root_policy = dict(root_policy) if root_policy else None
+        if self.root_policy:
+            if not crn:
+                raise ValueError('belief root policy requires crn=True')
+            allowed = {'keep', 'risk', 'iterations', 'tolerance'}
+            if set(self.root_policy) - allowed:
+                raise ValueError('unknown root_policy option')
+            keep = self.root_policy.get('keep', 24)
+            if not isinstance(keep, int) or not 1 <= keep <= 128:
+                raise ValueError('root_policy.keep must be an integer in 1..128')
+            for key in ('risk', 'tolerance'):
+                value = self.root_policy.get(key, .1 if key == 'risk' else .01)
+                if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+                    raise ValueError(f'root_policy.{key} must be finite and nonnegative')
+            iterations = self.root_policy.get('iterations', 4000)
+            if not isinstance(iterations, int) or not 1 <= iterations <= 100000:
+                raise ValueError('root_policy.iterations must be an integer in 1..100000')
         self.cutoff = usage_cutoff
         self.opp_no_switch = opp_no_switch
         self.keep_nonmega = keep_nonmega
@@ -244,6 +264,8 @@ class SearchAgent:
         self.log_rng = random.Random(seed + 7919)
         self.screen_records: list[dict] = []
         self.stats = {'decisions': 0, 'ms': 0.0, 'fallbacks': 0, 'errors': [], 'sims': 0}
+        if self.root_policy:
+            self.stats['root_fallbacks'] = 0
         self.last_trace = None
 
     def set_value(self, path=None, beta=0.0, scale=8.0):
@@ -271,6 +293,7 @@ class SearchAgent:
     def reseed(self, seed):
         """Deterministic world sampling per game, so paired arms see the same worlds."""
         self.rng = random.Random(seed)
+        self.policy_rng = random.Random(seed + 104729)
         self.log_rng = random.Random(seed + 7919)
 
     async def close(self):
@@ -636,15 +659,24 @@ class SearchAgent:
             base['endgame_d2'] = self.endgame_d2
         if self.opp_model:
             base['opp_model'] = self.opp_model
+        if self.root_policy:
+            base['matrix_detail'] = True
         n = len(self.engines)
         chunks = [worlds[i::n] for i in range(n)]
         calls = []
+        messages = []
         for k, (engine, chunk) in enumerate(zip(self.engines, chunks)):
             if chunk:
-                calls.append(engine.call({**base, 'worlds': chunk, 'world_offset': k * 1000 + rng.randrange(1000),
-                                          'screen_log': log if k == log_engine else 0},
-                                         timeout=self.engine_timeout))
+                msg = {**base, 'worlds': chunk, 'world_offset': k * 1000 + rng.randrange(1000),
+                       'screen_log': log if k == log_engine else 0, 'engine_index': k}
+                messages.append(msg)
+                calls.append(engine.call(msg, timeout=self.engine_timeout))
         outs = await asyncio.gather(*calls)
+        if self.root_policy:
+            for msg, out in zip(messages, outs):
+                for j, (world, result) in enumerate(zip(msg['worlds'], out['results'])):
+                    result['_belief_source'] = {**base, 'world': world, 'world_offset': msg['world_offset'] + j,
+                                                'engine_index': msg['engine_index']}
         results = [r for out in outs for r in out['results']]
         for r in results:
             record = r.pop('screen_record', None)
@@ -652,6 +684,44 @@ class SearchAgent:
                 self.screen_records.append({'turn': tracker.turn, 'record': record})
             self.stats['sims'] += r.get('sims') or 0
         return results
+
+    async def _belief_choice(self, results, sim_map, scored, deadline):
+        """Commit to one distribution before observing the opponent's hidden type.
+
+        Root candidates are nominated by the incumbent ranking, then evaluated in
+        every successfully reconstructed world. Never average survivor-only cells.
+        The security certificate concerns this restricted approximate game only.
+        """
+        good = [r for r in results if 'error' not in r]
+        reverse = {c: sim for sim, c in sim_map.items()}
+        wanted = [reverse[c] for c in sorted(scored, key=scored.get, reverse=True)
+                  if c in reverse][:self.root_policy.get('keep', 24)]
+        jobs = [{'source': r['_belief_source'], 'matrix': r['matrix'], 'wanted': wanted} for r in good]
+        grouped = [[j for j in jobs if j['source']['engine_index'] == i] for i in range(len(self.engines))]
+        remaining = lambda: max(.001, deadline - time.perf_counter())
+        calls = [engine.call({'type': 'complete_matrix', 'jobs': chunk}, timeout=remaining())
+                 for engine, chunk in zip(self.engines, grouped) if chunk]
+        completed = [r for out in await asyncio.gather(*calls) for r in out['results']]
+        extra_sims = sum(r['sims'] for r in completed)
+        self.stats['sims'] += extra_sims
+        common = set(wanted).intersection(*(set(r['matrix']['ours']) for r in completed))
+        if not common:
+            raise RuntimeError('no actions valid across completed belief worlds')
+        actions = [a for a in wanted if a in common]
+        matrices = []
+        for r in completed:
+            m = r['matrix']
+            matrices.append({**m, 'ours': actions,
+                             'payoff': [m['payoff'][m['ours'].index(a)] for a in actions]})
+        out = await self.engines[0].call({'type': 'belief', 'matrices': matrices,
+                                         'options': {k: v for k, v in self.root_policy.items() if k != 'keep'}},
+                                        timeout=remaining())
+        policy = {sim_map[a]: p for a, p in out['policy'].items()}
+        choice = self.policy_rng.choices(list(policy), weights=list(policy.values()))[0]
+        detail = {k: v for k, v in out.items() if k not in ('id', 'policy', 'model_rows')}
+        detail.update(policy=policy, chosen=choice, probability=policy[choice], completion_sims=extra_sims,
+                      invalid_actions=len(wanted) - len(actions), incumbent=max(scored, key=scored.get))
+        return choice, detail
 
     async def _move(self, ctx: dict) -> str:
         side = ctx['request']['side']['id']
@@ -699,6 +769,16 @@ class SearchAgent:
                 scored, good = score(results)
         errors = [r['error'] for r in results if 'error' in r]
         best = max(scored, key=scored.get)
+        belief = None
+        if self.root_policy:
+            try:
+                best, belief = await self._belief_choice(results, sim_map, scored, started + self.engine_timeout)
+            except (RuntimeError, ValueError, KeyError, TimeoutError) as exc:
+                # The existing search still supplied a valid ranked choice. An
+                # incomplete new solver must not replace it with a random move.
+                belief = {'error': str(exc)[:300], 'fallback': 'incumbent', 'chosen': best}
+                self.stats['root_fallbacks'] = self.stats.get('root_fallbacks', 0) + 1
+                self.stats['errors'].append('belief root: ' + str(exc)[:300])
         ranked = sorted(scored.items(), key=lambda kv: -kv[1])
         roots = [r['root'] for r in results if 'root' in r]
         self.last_trace = {
@@ -717,6 +797,9 @@ class SearchAgent:
             'leaf': bool(self.leaf), 'speed_infer': self.speed_infer,
             'screen': (self.screen_model or {}).get('sha256'),
             'opp_model': (self.opp_model or {}).get('sha256')}
+        if belief is not None:
+            self.last_trace['root_policy'] = belief
+            self.last_trace['sims'] += belief.get('completion_sims', 0)
         if self.log is not None:
             top = sorted(scored.items(), key=lambda kv: -kv[1])[:5]
             self.log.append({'turn': tracker.turn, 'top': top, 'errors': errors[:2],

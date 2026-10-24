@@ -77,6 +77,19 @@ def test_small_panel_completes_both_arms(tmp_path, monkeypatch):
         (i, arm) for i in range(6) for arm in ('cand', 'inc')}
 
 
+def test_new_protocol_can_balance_each_opponent_on_both_sides(tmp_path, monkeypatch):
+    from search.human import imitation
+    fake_arena(monkeypatch)
+    monkeypatch.setattr(imitation, 'ImitationAgent', agent.SearchAgent)
+    path = tmp_path / 'gate.jsonl'
+    asyncio.run(value_gate.run_gate({}, {}, path, 4, 1, 123, [], [[]], 1, .05,
+                                    log=lambda _: None, opponent=['search', 'imitation:not-used'],
+                                    opponent_block_sides=True))
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    assert {r['side'] for r in rows} == {'p1', 'p2'}
+    assert all(r['opponent'] == ('search' if r['pair'] < 2 else 'imitation:not-used') for r in rows)
+
+
 def test_late_results_cannot_reverse_a_futility_decision_on_resume(tmp_path, monkeypatch):
     started, _ = fake_arena(monkeypatch)
     path = tmp_path / 'gate.jsonl'

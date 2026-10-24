@@ -117,6 +117,40 @@ def verify_inputs(out):
             raise ValueError('training input changed: ' + row['path'])
 
 
+def initialize_belief(out, main):
+    """Freeze c12 separately; c10 keeps its original source, spec and decisions."""
+    from search.belief_audit import OPTIONS
+    if (out / 'spec.json').exists():
+        raise ValueError('campaign already exists; resume its evidence')
+    out.mkdir(parents=True, exist_ok=True)
+    imitation = ('imitation:data/ml/human/models-v4/human-449e6bd0e8869deb.json:{}:'
+                 'data/ml/human/models-preview/preview-1455f4a55d18112a.json')
+    spec = {'id': 'c12', 'active': True, 'created': time.time(), 'main': str(main.resolve()),
+            'after': 'c10', 'predecessors': ['c9', 'c10'],
+            'wait_for_campaigns': [str(main / 'data/ml/value/campaign-c10')],
+            'training_required': False, 'team': TEAM, 'slots': 6, 'pairs': 800,
+            'alpha': .05, 'seed': 202610250, 'poll_seconds': 20,
+            'preview': 'pvalue:' + DEFAULT_MODEL,
+            'opponents': ['search', imitation.format('argmax'), imitation.format('1.0')],
+            'opponent_block_sides': True,
+            'candidates': {'belief': {'root_policy': dict(OPTIONS)}},
+            'live': {'elo0': 0., 'elo1': 40., 'alpha': .05, 'beta': .1, 'min_games': 300, 'max_games': 3000}}
+    atomic_json(out / 'inputs.json', [])
+    spec['inputs_sha256'] = digest(out / 'inputs.json')
+    (out / 'PROTOCOL.md').write_text((main / 'docs/c12-belief-game.md').read_text())
+    spec['protocol_document_sha256'] = digest(out / 'PROTOCOL.md')
+    paths = [DEFAULT_MODEL, 'data/ml/human/models-v4/human-449e6bd0e8869deb.json',
+             'data/ml/human/models-preview/preview-1455f4a55d18112a.json',
+             'data/ml/value/pool-build/pool-teams-new.json', 'teams.json']
+    paths += [p.relative_to(main).as_posix() for p in (main / 'cache/usage').glob('*regmc*') if p.is_file()]
+    spec['assets'] = {p: digest(main / p) for p in paths}
+    spec['source_commit'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=main, text=True).strip()
+    spec['protocol_hash'] = protocol_hash(spec)
+    atomic_json(out / 'spec.json', spec)
+    atomic_json(out / 'state.json', {'phase': 'preflight', 'jobs': {}, 'created': time.time()})
+    return spec
+
+
 def options_for(name, spec, train):
     options = dict(spec['candidates'][name])
     if name == 'endgame':
@@ -155,7 +189,7 @@ def worker(out, name):
             options.update(options_for(candidate, spec, read(out / 'train-result.json')) or {})
         directory = out / 'preflight'
         directory.mkdir(exist_ok=True)
-        result = preflight(directory, options, 'campaign c10')
+        result = preflight(directory, options, 'campaign ' + spec['id'])
     else:
         from search.team_data import load_teams
         from search.value_gate import run_gate
@@ -170,7 +204,8 @@ def worker(out, name):
             result = asyncio.run(run_gate(candidate, incumbent, out / f'{name}.jsonl', spec['pairs'],
                                           spec['slots'] // 2, spec['seed'] + (name == 'endgame'),
                                           load_teams()[spec['team']]['sets'], pool, 1, spec['alpha'],
-                                          rule='pooled', opponent=spec['opponents']))
+                                          rule='pooled', opponent=spec['opponents'],
+                                          opponent_block_sides=spec.get('opponent_block_sides', False)))
             result['options'] = opts
     atomic_json(out / f'{name}-result.json', result)
 
@@ -198,7 +233,7 @@ def publish_workers(out, state):
         previous = read(path, [])
         alive = [p for p in previous if 'search/' in command(p)]
         for name, job in state['jobs'].items():
-            if name in ('preview', 'endgame') and job_alive(job, out):
+            if name in ('preview', 'endgame', 'belief') and job_alive(job, out):
                 alive.append(job['pid'])
         atomic_json(path, sorted(set(alive)))
 
@@ -216,7 +251,7 @@ def start_job(name, out, spec, state):
     py = str(Path(spec['main']) / '.venv/bin/python')
     if name == 'watch':
         args = [py, '-u', str(Path(spec['main']) / 'scripts/ab_watch.py'), '--dir', str(out / 'live'),
-                '--label', 'campaign c10', '--poll', '300']
+                '--label', 'campaign ' + spec['id'], '--poll', '300']
         cwd = spec['main']
     else:
         args = [py, '-u', str(ROOT / 'search/campaign.py'), 'worker', '--dir', str(out), '--job', name]
@@ -234,8 +269,11 @@ def handoff(out, spec, state, live_spec):
         if state.get('live_options') and current.get('factors') != {'upgrade': state['live_options']}:
             raise ValueError('live experiment options no longer match the campaign')
         return 'live' if current.get('active') else 'done'
-    if current.get('active') or current.get('id') not in (spec.get('after'), None):
+    if current.get('active') or current.get('id') not in [*spec.get('predecessors', [spec.get('after')]), None]:
         return 'waiting_for_previous_campaign'
+    for previous in spec.get('wait_for_campaigns', []):
+        if read(Path(previous) / 'state.json', {}).get('phase') not in ('done', 'done_no_winner'):
+            return 'waiting_for_previous_campaign'
     options = {}
     for name in spec['candidates']:
         result = read(out / f'{name}-result.json', {})
@@ -271,7 +309,7 @@ def tick(out, spec, state):
     if not spec.get('active'):
         state['phase'] = 'paused'
         return
-    if not (out / 'train-result.json').exists():
+    if spec.get('training_required', True) and not (out / 'train-result.json').exists():
         state['phase'] = 'training'
         start_job('train', out, spec, state)
         return
@@ -331,14 +369,16 @@ def supervise(out):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument('command', choices=['init', 'run', 'worker', 'status'])
+    ap.add_argument('command', choices=['init', 'init-belief', 'run', 'worker', 'status'])
     ap.add_argument('--dir', type=Path, default=DEFAULT_DIR)
     ap.add_argument('--main', type=Path, default=ROOT)
-    ap.add_argument('--job', choices=['train', 'preflight', 'preview', 'endgame'])
+    ap.add_argument('--job', choices=['train', 'preflight', 'preview', 'endgame', 'belief'])
     args = ap.parse_args()
     out = args.dir.resolve()
     if args.command == 'init':
         print(json.dumps(initialize(out, args.main), indent=1))
+    elif args.command == 'init-belief':
+        print(json.dumps(initialize_belief(out, args.main), indent=1))
     elif args.command == 'worker':
         worker(out, args.job)
     elif args.command == 'run':
@@ -346,7 +386,7 @@ def main():
     else:
         state = read(out / 'state.json', {})
         spec = read(out / 'spec.json', {})
-        for name in ('train', 'preview', 'endgame'):
+        for name in ('train', *spec.get('candidates', ('preview', 'endgame'))):
             result = read(out / f'{name}-result.json')
             if result:
                 state[name] = {k: result.get(k) for k in ('complete', 'passed', 'useful', 'device', 'path', 'reason',

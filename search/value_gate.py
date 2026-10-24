@@ -188,7 +188,7 @@ def make_preview(spec: str, fallback, seed: int):
 async def run_gate(candidate: dict, incumbent: dict, out: Path, pairs: int, concurrency: int, seed: int,
                    team: list[dict], pool: list[list[dict]], engines: int, alpha: float, log=print,
                    rule: str = 'superior', min_sim_saving: float = 0.0, screen_log_dir: Path | None = None,
-                   opponent: str | list[str] = 'search') -> dict:
+                   opponent: str | list[str] = 'search', opponent_block_sides: bool = False) -> dict:
     """`candidate`/`incumbent`: {'path', 'beta', 'screen', 'search'}; 'screen' is a learned
 screening model (search.screen_data) or None for probe screening, 'search' optional
 overrides of the deployed search configuration. The opponent always plays the
@@ -255,7 +255,10 @@ deployed configuration, the incumbent's screening and the hand evaluation."""
                                 **(value.get('search') or {})},
                              value_path=value.get('path'), value_beta=value.get('beta', 0.0),
                              screen_model=value.get('screen'))
-            opponent_spec = opponent[pair % len(opponent)] if isinstance(opponent, list) else opponent
+            # Opt-in for NEW protocols: each opponent gets both sides. The old
+            # parity assignment is retained for already-frozen campaigns.
+            opponent_index = pair // 2 if opponent_block_sides else pair
+            opponent_spec = opponents[opponent_index % len(opponents)]
             if opponent_spec.startswith('imitation:'):
                 # A ladder-human imitation (search/human/imitation.py) piloting the real team:
                 # the deployment distribution, not search against search.
@@ -291,13 +294,18 @@ deployed configuration, the incumbent's screening and the hand evaluation."""
                        'fallbacks': us.stats['fallbacks'], 'decisions': us.stats['decisions'],
                        'sims': us.stats['sims'],
                        'ms': round(us.stats['ms'] / max(1, us.stats['decisions']), 1)}
+                if opponent_block_sides:
+                    rec['opponent'] = opponent_spec
+                if us.stats.get('root_fallbacks'):
+                    rec['root_fallbacks'] = us.stats['root_fallbacks']
                 if screen_log_dir is not None:
                     # Probe results are free labels for the screening ranker.
                     for who, agent in (('us', us), ('them', them)):
                         write_records(agent.take_screen_records(),
                                       Path(screen_log_dir) / f'gate-{out.stem}-{pair}-{arm}-{who}.npz',
                                       f'gate-{out.stem}-{pair}-{arm}-{who}')
-                if us.stats['fallbacks'] or them.stats['fallbacks']:
+                if (us.stats['fallbacks'] or them.stats['fallbacks'] or
+                        us.stats.get('root_fallbacks') or them.stats.get('root_fallbacks')):
                     # A fallback move is an infrastructure failure, not the policy under
                     # test: retry this pair's seed (void after MAX_ATTEMPTS).
                     rec = {**rec, 'win': None, 'score': None,
@@ -354,6 +362,8 @@ def main():
     ap.add_argument('--inc-preview', help="incumbent arm's team preview (same syntax); default the frozen actor's")
     ap.add_argument('--opponent', default='search', help="'search' (deployed search, hand evaluation) or 'imitation:PATH[:temp[:PREVIEW_PATH]]'")
     ap.add_argument('--opponent-pool', type=json.loads, help='JSON list of opponent specs, deterministically balanced by pair')
+    ap.add_argument('--opponent-block-sides', action='store_true',
+                    help='new protocols only: give each opponent both p1 and p2 before rotating')
     args = ap.parse_args()
     team = json.loads((ROOT / 'teams.json').read_text())[args.team]['sets']
     pool = [t['sets'] if isinstance(t, dict) else t for t in json.loads(args.pool.read_text())]
@@ -365,7 +375,8 @@ def main():
            'screen': model_from_file(args.inc_screen), 'preview': args.inc_preview, 'search': args.inc_search}
     result = asyncio.run(run_gate(cand, inc, args.out, args.pairs, args.concurrency, args.seed, team, pool,
                                   args.engines, args.alpha, rule=args.rule, min_sim_saving=args.min_sim_saving,
-                                  screen_log_dir=args.screen_log_dir, opponent=args.opponent_pool or args.opponent))
+                                  screen_log_dir=args.screen_log_dir, opponent=args.opponent_pool or args.opponent,
+                                  opponent_block_sides=args.opponent_block_sides))
     print(json.dumps({'candidate': cand, 'incumbent': inc, **result}))
 
 

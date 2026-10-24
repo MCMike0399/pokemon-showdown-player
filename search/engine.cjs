@@ -14,9 +14,14 @@ const PS = path.resolve(__dirname, '..', 'node_modules', 'pokemon-showdown');
 const {Battle, Teams, Dex} = require(PS);
 const {State} = require(path.join(PS, 'dist', 'sim', 'state'));
 const {PRNG} = require(path.join(PS, 'dist', 'sim', 'prng'));
+const {solveBelief} = require('./belief.cjs');
 
 const toID = s => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
 const emit = v => process.stdout.write(JSON.stringify(v) + '\n');
+// Bounded, process-local roots survive the adaptive second batch. Completion
+// must reuse the original state: sleep/confusion durations are sampled on build.
+const ROOT_STATES = new Map();
+let ROOT_STATE_ID = 0;
 
 // ------------------------------------------------------------------ building
 function buildBattle(format, world, field, seed) {
@@ -637,6 +642,7 @@ function searchWorld(msg, world, wi, opts) {
   const cols = theirs.map((c, j) => j).filter(j => validTheirs[j]);
   if (!rows.length || !cols.length) return {error: 'no valid actions ' + JSON.stringify([firstErr, screenErr, ours.length, theirs.length]).slice(0, 400), ours: ours.slice(0, 4), theirs: theirs.length};
   const sub = rows.map(i => cols.map(j => M[i][j]));
+  const decisionMatrix = msg.matrix_detail ? sub.map(row => row.slice()) : null;
   const {x, y} = solveZeroSum(sub, msg.iters || 2000);
   // Opponent model: blend of equilibrium play and a softmax "greedy" prior that
   // assumes they pick actions that are good for them against our uniform play.
@@ -715,6 +721,7 @@ function searchWorld(msg, world, wi, opts) {
         extraSims += res.sims;
         deep++;
         delta += q[c] * (res.v - sub[r][c]);
+        if (decisionMatrix) decisionMatrix[r][c] = res.v;
       }
       if (qs > 0) {
         corr[ours[i]] = delta / qs;
@@ -750,6 +757,15 @@ function searchWorld(msg, world, wi, opts) {
                screen_sims: screenSims, screened, n_ours: rows.length, n_theirs: cols.length, top_opp: topOpp, root,
                opp_model: oppModel ? (oppModel.sha256 || oppModel.path) : null};
   if (depth2) out.depth2 = depth2;
+  // Explicit opt-in for offline audits and belief-state root solving. This is
+  // the actual one-turn payoff table, not the per-world best-response scores.
+  if (msg.matrix_detail) {
+    const stateKey = `${process.pid}:${++ROOT_STATE_ID}`;
+    ROOT_STATES.set(stateKey, baseStr);
+    while (ROOT_STATES.size > 64) ROOT_STATES.delete(ROOT_STATES.keys().next().value);
+    out.matrix = {ours: rows.map(i => ours[i]), theirs: cols.map(j => theirs[j]),
+                  payoff: decisionMatrix, prior: Array.from(q), column_indices: cols, state_key: stateKey};
+  }
   if (oppDetail) out.opp_detail = oppDetail;
   if (record && (record.ours || record.theirs)) {
     // Probe results of every candidate, for the learned screening ranker. `best`
@@ -764,6 +780,37 @@ function searchWorld(msg, world, wi, opts) {
     out.screen_record = record;
   }
   return out;
+}
+
+// Finish only missing rows against the EXACT retained replies and chance streams.
+// Re-screening replies here would make cached and new rows incomparable.
+function completeMatrix(job) {
+  const {source: msg, matrix, wanted} = job;
+  if (!msg.crn) throw new Error('belief completion requires common random numbers');
+  const wi = msg.world_offset;
+  const base = ROOT_STATES.get(matrix.state_key);
+  if (!base) throw new Error('belief root state expired or belongs to another engine');
+  const ours = [], payoff = [];
+  let sims = 0;
+  for (const a of wanted) {
+    const old = matrix.ours.indexOf(a);
+    if (old >= 0) { ours.push(a); payoff.push(matrix.payoff[old]); continue; }
+    const row = [];
+    let valid = true;
+    for (let c = 0; c < matrix.theirs.length && valid; c++) {
+      let total = 0;
+      for (let k = 0; k < (msg.seeds || 1); k++) {
+        const b = State.deserializeBattle(base);
+        b.prng = new PRNG([wi * 131 + k * 17 + 1, 3, matrix.column_indices[c] + 5, 11]);
+        if (!b.choose('p1', a)) { valid = false; break; }
+        if (!b.choose('p2', matrix.theirs[c])) throw new Error('retained opponent action became invalid');
+        total += leafEval(b); sims++;
+      }
+      row.push(total / (msg.seeds || 1));
+    }
+    if (valid) { ours.push(a); payoff.push(row); }
+  }
+  return {matrix: {...matrix, ours, payoff}, sims};
 }
 
 function combos(n, k) {
@@ -825,6 +872,15 @@ function previewPlans(msg) {
 function handle(msg) {
   // Per message, so a later features/preview call never inherits a search's terms.
   setTerms(msg.eval_terms);
+  if (msg.type === 'belief') return {id: msg.id, ...solveBelief(msg.matrices, msg.options)};
+  if (msg.type === 'complete_matrix') {
+    return {id: msg.id, results: msg.jobs.map(job => {
+      setTerms(job.source.eval_terms);
+      setValue(job.source.value_path, job.source.value_beta, job.source.value_scale);
+      setLeaf(job.source.leaf);
+      return completeMatrix(job);
+    })};
+  }
   if (msg.type === 'search') {
     setValue(msg.value_path, msg.value_beta, msg.value_scale);
     setLeaf(msg.leaf);

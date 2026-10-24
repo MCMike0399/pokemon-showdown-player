@@ -61,6 +61,37 @@ def test_handoff_is_idempotent_after_a_restart(tmp_path):
     assert campaign.handoff(tmp_path, {'id': 'c10'}, {}, p) == 'done'
 
 
+def test_belief_handoff_waits_for_c10_even_when_ladder_spec_is_inactive(tmp_path):
+    p = tmp_path / 'current.json'
+    p.write_text(json.dumps({'id': 'c9', 'active': False}))
+    previous = tmp_path / 'c10'
+    previous.mkdir()
+    (previous / 'state.json').write_text(json.dumps({'phase': 'offline_gates'}))
+    spec = {'id': 'c12', 'predecessors': ['c9', 'c10'], 'wait_for_campaigns': [str(previous)],
+            'candidates': {}}
+    before = p.read_bytes()
+    assert campaign.handoff(tmp_path, spec, {}, p) == 'waiting_for_previous_campaign'
+    assert p.read_bytes() == before
+    (previous / 'state.json').write_text(json.dumps({'phase': 'done_no_winner'}))
+    assert campaign.handoff(tmp_path, spec, {}, p) == 'done_no_winner'
+    # Once C12 owns the live spec, C10's old supervisor status cannot block it.
+    p.write_text(json.dumps({'id': 'c12', 'active': True}))
+    (previous / 'state.json').write_text(json.dumps({'phase': 'waiting_for_previous_campaign'}))
+    assert campaign.handoff(tmp_path, spec, {}, p) == 'live'
+
+
+def test_nontraining_campaign_starts_preflight_without_fake_training_receipt(tmp_path, monkeypatch):
+    jobs = []
+    monkeypatch.setattr(campaign, 'verify_protocol', lambda *a: None)
+    monkeypatch.setattr(campaign, 'start_job', lambda name, *a: jobs.append(name))
+    state = {}
+    campaign.tick(tmp_path, {'active': True, 'training_required': False}, state)
+    assert state['phase'] == 'preflight' and jobs == ['preflight']
+    jobs.clear()
+    campaign.tick(tmp_path, {'active': True}, state)
+    assert state['phase'] == 'training' and jobs == ['train']
+
+
 def test_no_offline_winner_does_not_start_a_ladder_test(tmp_path):
     p = tmp_path / 'current.json'
     p.write_text(json.dumps({'id': 'c9', 'active': False}))
