@@ -57,6 +57,12 @@ authority. Stop for unresolved infrastructure errors or a catastrophic pilot
 deficit of at least four discordant losses beyond gains. Do not tune the
 candidate on the pilot and reuse it as confirmation.
 
+The C12 supervisor resumes that engineering pilot's original ledger and seeds
+before preflight or strength games. Its source hashes must match the frozen
+pilot candidate. A restart retains completed games and retries interrupted
+games with their original seeds. Engineering eligibility is separate from the
+pilot's nominal p-value and cannot itself authorize a live experiment.
+
 ## Frozen strength panel
 
 One 800-pair pooled panel, alpha .05; seed 202610250. Each pair compares the

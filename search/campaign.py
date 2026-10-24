@@ -125,6 +125,13 @@ def initialize_belief(out, main):
     out.mkdir(parents=True, exist_ok=True)
     imitation = ('imitation:data/ml/human/models-v4/human-449e6bd0e8869deb.json:{}:'
                  'data/ml/human/models-preview/preview-1455f4a55d18112a.json')
+    pilot_dir = main / 'data/ml/value/review-20261024/pilot-fixed'
+    pilot = read(pilot_dir / 'protocol.json')
+    if not pilot:
+        raise ValueError('the frozen engineering pilot must exist before initializing c12')
+    for path in ('search/agent.py', 'search/engine.cjs', 'search/belief.cjs', 'search/config.py', 'search/value_gate.py'):
+        if digest(main / path) != pilot['hashes'].get(path):
+            raise ValueError('engineering pilot tested different candidate code: ' + path)
     spec = {'id': 'c12', 'active': True, 'created': time.time(), 'main': str(main.resolve()),
             'after': 'c10', 'predecessors': ['c9', 'c10'],
             'wait_for_campaigns': [str(main / 'data/ml/value/campaign-c10')],
@@ -133,6 +140,8 @@ def initialize_belief(out, main):
             'preview': 'pvalue:' + DEFAULT_MODEL,
             'opponents': ['search', imitation.format('argmax'), imitation.format('1.0')],
             'opponent_block_sides': True,
+            'engineering': {'ledger': str(pilot_dir / 'games.jsonl'), 'pairs': 8, 'seed': 202610241,
+                            'opponents': ['search', imitation.format('1.0')]},
             'candidates': {'belief': {'root_policy': dict(OPTIONS)}},
             'live': {'elo0': 0., 'elo1': 40., 'alpha': .05, 'beta': .1, 'min_games': 300, 'max_games': 3000}}
     atomic_json(out / 'inputs.json', [])
@@ -142,6 +151,7 @@ def initialize_belief(out, main):
     paths = [DEFAULT_MODEL, 'data/ml/human/models-v4/human-449e6bd0e8869deb.json',
              'data/ml/human/models-preview/preview-1455f4a55d18112a.json',
              'data/ml/value/pool-build/pool-teams-new.json', 'teams.json']
+    paths.append((pilot_dir / 'protocol.json').relative_to(main).as_posix())
     paths += [p.relative_to(main).as_posix() for p in (main / 'cache/usage').glob('*regmc*') if p.is_file()]
     spec['assets'] = {p: digest(main / p) for p in paths}
     spec['source_commit'] = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=main, text=True).strip()
@@ -190,6 +200,19 @@ def worker(out, name):
         directory = out / 'preflight'
         directory.mkdir(exist_ok=True)
         result = preflight(directory, options, 'campaign ' + spec['id'])
+    elif name == 'engineering':
+        from search.team_data import load_teams
+        from search.value_gate import run_gate
+        stage = spec['engineering']
+        pool = read(ROOT / 'data/ml/value/pool-build/pool-teams-new.json')
+        pool = [t['sets'] if isinstance(t, dict) else t for t in pool]
+        result = asyncio.run(run_gate({'search': spec['candidates']['belief'], 'preview': spec['preview']},
+                                      {'preview': spec['preview']}, Path(stage['ledger']), stage['pairs'],
+                                      2, stage['seed'], load_teams()[spec['team']]['sets'], pool, 1, spec['alpha'],
+                                      opponent=stage['opponents'], opponent_block_sides=True))
+        result['eligible'] = (result['complete'] and result['pairs_void'] == 0 and result['errors'] == 0
+                              and result['losses'] - result['gains'] < 4)
+        result['note'] = 'Engineering eligibility only; pilot significance never permits promotion.'
     else:
         from search.team_data import load_teams
         from search.value_gate import run_gate
@@ -233,7 +256,7 @@ def publish_workers(out, state):
         previous = read(path, [])
         alive = [p for p in previous if 'search/' in command(p)]
         for name, job in state['jobs'].items():
-            if name in ('preview', 'endgame', 'belief') and job_alive(job, out):
+            if name in ('preview', 'endgame', 'belief', 'engineering') and job_alive(job, out):
                 alive.append(job['pid'])
         atomic_json(path, sorted(set(alive)))
 
@@ -309,6 +332,15 @@ def tick(out, spec, state):
     if not spec.get('active'):
         state['phase'] = 'paused'
         return
+    if spec.get('engineering'):
+        engineering = read(out / 'engineering-result.json')
+        if engineering is None:
+            state['phase'] = 'engineering_pilot'
+            start_job('engineering', out, spec, state)
+            return
+        if not engineering.get('eligible'):
+            state.update(phase='done_no_winner', reason='engineering pilot rejected')
+            return
     if spec.get('training_required', True) and not (out / 'train-result.json').exists():
         state['phase'] = 'training'
         start_job('train', out, spec, state)
@@ -372,7 +404,7 @@ def main():
     ap.add_argument('command', choices=['init', 'init-belief', 'run', 'worker', 'status'])
     ap.add_argument('--dir', type=Path, default=DEFAULT_DIR)
     ap.add_argument('--main', type=Path, default=ROOT)
-    ap.add_argument('--job', choices=['train', 'preflight', 'preview', 'endgame', 'belief'])
+    ap.add_argument('--job', choices=['train', 'preflight', 'preview', 'endgame', 'belief', 'engineering'])
     args = ap.parse_args()
     out = args.dir.resolve()
     if args.command == 'init':
@@ -386,6 +418,18 @@ def main():
     else:
         state = read(out / 'state.json', {})
         spec = read(out / 'spec.json', {})
+        if spec.get('engineering'):
+            stage = spec['engineering']
+            path = Path(stage['ledger'])
+            if path.exists():
+                from search.value_gate import summarize
+                rows = []
+                for line in path.read_text().splitlines():
+                    try:
+                        rows.append(json.loads(line))
+                    except ValueError:
+                        pass
+                state['engineering'] = read(out / 'engineering-result.json') or summarize(rows, stage['pairs'], spec['alpha'])
         for name in ('train', *spec.get('candidates', ('preview', 'endgame'))):
             result = read(out / f'{name}-result.json')
             if result:

@@ -92,6 +92,23 @@ def test_nontraining_campaign_starts_preflight_without_fake_training_receipt(tmp
     assert state['phase'] == 'training' and jobs == ['train']
 
 
+def test_engineering_pilot_must_finish_without_a_veto_before_spending_gate_compute(tmp_path, monkeypatch):
+    jobs = []
+    monkeypatch.setattr(campaign, 'verify_protocol', lambda *a: None)
+    monkeypatch.setattr(campaign, 'start_job', lambda name, *a: jobs.append(name))
+    spec = {'active': True, 'training_required': False, 'engineering': {'pairs': 8}}
+    state = {}
+    campaign.tick(tmp_path, spec, state)
+    assert jobs == ['engineering'] and state['phase'] == 'engineering_pilot'
+    jobs.clear()
+    (tmp_path / 'engineering-result.json').write_text(json.dumps({'eligible': False}))
+    campaign.tick(tmp_path, spec, state)
+    assert not jobs and state['phase'] == 'done_no_winner'
+    (tmp_path / 'engineering-result.json').write_text(json.dumps({'eligible': True}))
+    campaign.tick(tmp_path, spec, state)
+    assert jobs == ['preflight'] and state['phase'] == 'preflight'
+
+
 def test_no_offline_winner_does_not_start_a_ladder_test(tmp_path):
     p = tmp_path / 'current.json'
     p.write_text(json.dumps({'id': 'c9', 'active': False}))
