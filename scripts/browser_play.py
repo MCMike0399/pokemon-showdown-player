@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import fcntl
 import json
 import itertools
 import os
 import signal
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -59,6 +61,36 @@ def arm_team(arm, spec, default):
     (a resumed room the experiment does not know), else the runner's --team."""
     over = (arm or {}).get('overrides') or {}
     return over.get('team') or ((spec or {}).get('base') or {}).get('team') or default
+
+
+def page_watchdog(loop, page, log, every=60.0, limit=300.0, exit=os._exit):
+    """Exit non-zero when the page stops answering, so launchd restarts the runner and it
+    resumes the active room. A frozen page blocks an await that no stall check inside the
+    event loop can see (2026-10-26: no reply for 1 h 40 min mid-game). The probe runs from a
+    thread; set the returned event to stop watching before the browser closes."""
+    done = threading.Event()
+
+    def watch():
+        while not done.is_set():
+            try:
+                future = asyncio.run_coroutine_threadsafe(page.evaluate('() => 1'), loop)
+            except RuntimeError:  # the loop closed: the run is over
+                return
+            try:
+                future.result(timeout=limit)
+            except concurrent.futures.TimeoutError:
+                if done.is_set():
+                    return
+                log('page_watchdog', seconds=limit)
+                print(json.dumps({'page_watchdog': f'no page reply for {limit:.0f} s; exiting for a restart'}), flush=True)
+                exit(75)
+                return
+            except Exception:  # an answer that is an error (navigation, closing) is still an answer
+                pass
+            done.wait(every)
+
+    threading.Thread(target=watch, name='page-watchdog', daemon=True).start()
+    return done
 
 
 def prepare_matchmaking(brain, fmt):
@@ -112,6 +144,7 @@ async def run(args):
                     str(args.profile), headless=not args.headed,
                     viewport={'width': 1440, 'height': 900},
                     **({'channel': 'chrome'} if args.chrome else {}))
+                watchdog = None
                 try:
                     page = browser.pages[0] if browser.pages else await browser.new_page()
                     await page.goto('https://play.pokemonshowdown.com/', wait_until='domcontentloaded')
@@ -123,6 +156,8 @@ async def run(args):
                         fallback = McpPlayer()
                     player = BrowserPlayer(page, None if args.inspect else Brain(Store(args.root)),
                                            log_path=output / 'events.jsonl', fallback=fallback)
+                    if not args.inspect:
+                        watchdog = page_watchdog(loop, page, player.log)
                     if team:
                         # Every run and every result names its team: data is organised per
                         # team (search/team_data.py), so other teams never mix into Rain's.
@@ -289,6 +324,8 @@ async def run(args):
                             await player.close()
                     raise
                 finally:
+                    if watchdog:
+                        watchdog.set()
                     await browser.close()
         finally:
             for sig in (signal.SIGTERM, signal.SIGINT):

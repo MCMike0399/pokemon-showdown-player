@@ -623,3 +623,27 @@ def test_alternating_teams_import_each_once_per_session():
     for team in (team_a, team_b, team_a, team_b):
         asyncio.run(player.select_team(FMT, team))
     assert sum('newTop' in c for c in clicks) == 2
+
+
+def test_page_watchdog_exits_only_when_the_page_stops_answering():
+    import browser_play
+
+    class Page:
+        def __init__(self, hang):
+            self.hang = hang
+
+        async def evaluate(self, script):
+            if self.hang:
+                await asyncio.Event().wait()
+            return 1
+
+    async def scenario(hang):
+        exited, logged = [], []
+        done = browser_play.page_watchdog(asyncio.get_running_loop(), Page(hang), lambda kind, **d: logged.append(kind),
+                                          every=.01, limit=.2, exit=exited.append)
+        await asyncio.sleep(.6)
+        done.set()
+        return exited, logged
+
+    assert asyncio.run(scenario(False)) == ([], [])
+    assert asyncio.run(scenario(True)) == ([75], ['page_watchdog'])
