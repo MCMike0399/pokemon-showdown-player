@@ -30,6 +30,11 @@ The runner appends one line per game to `<spec dir>/<id>-arms.jsonl` (room, cell
 randomised factors), so a resumed room keeps its arm. This module is pure apart from
 those two files.
 
+An optional `base` dict of overrides applies to every cell; a factor that is on replaces
+the base keys it sets. Besides `search/config.py` keys, an override may name `team` (a
+`teams.json` entry): the runner then plays that team for the game (campaign c13,
+docs/c13-team-ladder.md), so a base team against a challenger team is one factor.
+
     .venv/bin/python -m search.ab_test status [--json]
 """
 from __future__ import annotations
@@ -69,6 +74,11 @@ def validate(spec: dict) -> dict:
             if key in seen:
                 raise ValueError(f'factors {seen[key]!r} and {name!r} both set {key!r}')
             seen[key] = name
+    if not isinstance(spec.get('base', {}), dict):
+        raise ValueError('base must be a dict of overrides')
+    for name, options in [('base', spec.get('base') or {})] + list(factors.items()):
+        if 'team' in options and not (isinstance(options['team'], str) and options['team']):
+            raise ValueError(f'{name}: team must be a teams.json name')
     frozen = spec.get('frozen') or {}
     if any(f not in factors or v not in (True, False) for f, v in frozen.items()):
         raise ValueError('frozen maps factor names to true/false')
@@ -138,7 +148,7 @@ def cell_at(spec: dict, n: int) -> dict:
 
 
 def overrides(spec: dict, cell: dict) -> dict:
-    out = {}
+    out = dict(spec.get('base') or {})
     for factor, on in cell.items():
         if on:
             out.update(spec['factors'][factor])

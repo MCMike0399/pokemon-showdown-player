@@ -47,6 +47,20 @@ def save_screen_records(agent, team, room):
         print(json.dumps({'screen_records_error': repr(error)[:300]}), flush=True)
 
 
+def load_team(teams_file, name, fmt):
+    team = json.loads(Path(teams_file).read_text())[name]
+    if team['format'] != fmt:
+        raise ValueError('team format mismatch')
+    return {**team, 'name': name}
+
+
+def arm_team(arm, spec, default):
+    """The team a game plays: the arm's `team` override, else the A/B spec's base team
+    (a resumed room the experiment does not know), else the runner's --team."""
+    over = (arm or {}).get('overrides') or {}
+    return over.get('team') or ((spec or {}).get('base') or {}).get('team') or default
+
+
 def prepare_matchmaking(brain, fmt):
     """Adopt an evaluated candidate only before starting a new game."""
     from ml.promotion import promote_ready
@@ -82,10 +96,7 @@ async def run(args):
             raise ValueError('no selected local checkpoint for this format')
         team = None
         if args.team:
-            team = json.loads(args.teams_file.read_text())[args.team]
-            if team['format'] != args.format:
-                raise ValueError('team format mismatch')
-            team = {**team, 'name': args.team}
+            team = load_team(args.teams_file, args.team, args.format)
         if not args.inspect and not team and 'random' not in args.format:
             raise ValueError('team is required for matchmaking in this format')
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')
@@ -151,10 +162,21 @@ async def run(args):
                         agent = make_agent({})
                         arm_over = {}
 
-                        async def use_arm(arm):
-                            # Rebuilt only between games, when the arm's overrides change.
-                            nonlocal agent, arm_over
-                            want = (arm or {}).get('overrides') or {}
+                        async def use_arm(arm, spec=None):
+                            # Rebuilt only between games, when the arm's overrides change. A `team`
+                            # override (campaign c13) switches the team instead of the search.
+                            nonlocal agent, arm_over, team
+                            want = {k: v for k, v in ((arm or {}).get('overrides') or {}).items() if k != 'team'}
+                            name = arm_team(arm, spec, args.team)
+                            if team is not None and name != team['name']:
+                                try:
+                                    team = load_team(args.teams_file, name, args.format)
+                                except (KeyError, ValueError, OSError) as error:  # an unknown team plays --team, loudly
+                                    player.log('ab_error', error=f'team {name!r}: {error!r}'[:300])
+                                    team = load_team(args.teams_file, args.team, args.format)
+                                from ml.teams import team_id
+                                player.team_name = team['name']
+                                player.log('arm_team', name=team['name'], team_id=team_id(args.format, team['sets']))
                             if want != arm_over:
                                 old = agent
                                 agent = make_agent(want)
@@ -205,7 +227,7 @@ async def run(args):
                             if ab_spec:
                                 # A resumed room keeps the arm it started with; an unknown one plays LIVE.
                                 arm = ab_test.arm_for_room(ab_spec, room) if room else ab_test.next_arm(ab_spec)
-                            await use_arm(arm)
+                            await use_arm(arm, ab_spec)
                         if room:
                             if arm:
                                 player.log('ab_arm', room=room, resumed=True,
@@ -223,20 +245,20 @@ async def run(args):
                             if agent is not None:
                                 # A gated search value is adopted only between games.
                                 from search.value_store import current_value, team_pointer
-                                value = current_value(team_pointer(args.team))
+                                value = current_value(team_pointer(team['name'] if team else None))
                                 if value.get('sha256') != agent.value.get('sha256'):
                                     agent.set_value(value.get('path'), value.get('beta', 0.0))
                                     agent.value['sha256'] = value.get('sha256')
                                     player.log('value_checkpoint', **value)
                                 # A gated screening ranker, likewise only between games.
                                 from search.screen_data import current_screen, screen_pointer
-                                screen = current_screen(screen_pointer(args.team))
+                                screen = current_screen(screen_pointer(team['name'] if team else None))
                                 if screen.get('sha256') != (agent.screen_model or {}).get('sha256'):
                                     agent.set_screen(screen)
                                     player.log('screen_checkpoint', **screen)
                                 # A gated human opponent policy, likewise only between games.
                                 from search.human.store import current_opp, opp_pointer
-                                opp = current_opp(opp_pointer(args.team))
+                                opp = current_opp(opp_pointer(team['name'] if team else None))
                                 if opp.get('sha256') != (agent.opp_model or {}).get('sha256'):
                                     agent.set_opp_model(opp)
                                     player.log('opp_checkpoint', **opp)
@@ -251,7 +273,7 @@ async def run(args):
                         outcome = await player.play(room, args.format, sets=team['sets'] if team else None,
                                                     timeout=args.stall_timeout, record=not args.no_record)
                         if agent is not None:
-                            save_screen_records(agent, args.team, room)
+                            save_screen_records(agent, team['name'] if team else None, room)
                         print(json.dumps({'game': game + 1, 'result': outcome}), flush=True)
                     if agent is not None:
                         player.log('search_stats', **{k: v for k, v in agent.stats.items() if k != 'errors'},

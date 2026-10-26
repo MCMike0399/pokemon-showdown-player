@@ -152,3 +152,69 @@ def test_watch_without_a_winner_only_deactivates(tmp_path, monkeypatch):
     called = []
     assert ab_watch.step(p, out, 'campaign cx', promote=lambda *a, **k: called.append(a)) == 'finished'
     assert not called and json.loads(p.read_text())['active'] is False
+
+
+# ------------------------------------------------------------- campaign c13: team arms
+
+import team_ladder  # noqa: E402
+
+
+def test_base_overrides_apply_to_every_cell_and_a_factor_replaces_them():
+    s = ab.validate({'id': 'cx', 'factors': {'team': {'team': 'B'}}, 'base': {'team': 'A', 'alpha': 0.3}})
+    assert ab.overrides(s, {'team': False}) == {'team': 'A', 'alpha': 0.3}
+    assert ab.overrides(s, {'team': True}) == {'team': 'B', 'alpha': 0.3}
+    with pytest.raises(ValueError):
+        ab.validate({'id': 'cx', 'factors': {'team': {'team': ''}}})
+    with pytest.raises(ValueError):
+        ab.validate({'id': 'cx', 'factors': {'team': {'team': 'B'}}, 'base': ['A']})
+
+
+def test_runner_team_comes_from_the_arm_then_the_spec_base_then_the_flag():
+    import browser_play
+    s = ab.validate({'id': 'cx', 'factors': {'team': {'team': 'B'}}, 'base': {'team': 'A'}})
+    assert browser_play.arm_team({'overrides': ab.overrides(s, {'team': True})}, s, 'R') == 'B'
+    assert browser_play.arm_team({'overrides': ab.overrides(s, {'team': False})}, s, 'R') == 'A'
+    assert browser_play.arm_team(None, s, 'R') == 'A'  # a resumed room the experiment does not know
+    assert browser_play.arm_team(None, None, 'R') == 'R'
+
+
+def _ladder(tmp_path, monkeypatch, challengers=('B', 'C')):
+    out, p = tmp_path / 'c13', tmp_path / 'current.json'
+    team_ladder.init(out, p, 'A', list(challengers), {'A': {}, 'B': {}, 'C': {}}, 7, 'docs/x.md')
+    decisions = []
+
+    def fake_status(spec_path, runs_dir=None):
+        d = decisions.pop(0) if decisions else None
+        return {'factors': {'team': {'decision': d, 'games': 400, 'elo': 50.0, 'llr': 3.0,
+                                     'score_on': 0.55, 'score_off': 0.48}}}
+    monkeypatch.setattr(ab, 'status', fake_status)
+    return out, p, decisions
+
+
+def test_team_ladder_promotes_a_winning_challenger_and_it_defends(tmp_path, monkeypatch):
+    out, p, decisions = _ladder(tmp_path, monkeypatch)
+    spec = json.loads(p.read_text())
+    assert spec['id'] == 'c13r1' and spec['base'] == {'team': 'A'} and spec['factors'] == {'team': {'team': 'B'}}
+    assert team_ladder.step(out, p) == 'running'
+    decisions[:] = ['H1']
+    assert team_ladder.step(out, p) == 'next'
+    spec = json.loads(p.read_text())
+    assert spec['id'] == 'c13r2' and spec['base'] == {'team': 'B'} and spec['factors'] == {'team': {'team': 'C'}}
+    decisions[:] = ['H0']
+    assert team_ladder.step(out, p) == 'done'
+    spec = ab.validate(json.loads(p.read_text()))
+    assert spec['id'] == 'c13final' and not ab.randomised(spec)
+    assert ab.next_arm(spec, p)['overrides'] == {'team': 'B'}
+    state = json.loads((out / 'state.json').read_text())
+    assert state['champion'] == 'B' and [h['decision'] for h in state['history']] == ['H1', 'H0']
+
+
+def test_team_ladder_without_a_winner_deactivates_and_never_touches_other_specs(tmp_path, monkeypatch):
+    out, p, decisions = _ladder(tmp_path, monkeypatch, challengers=('B',))
+    decisions[:] = ['cap']
+    assert team_ladder.step(out, p) == 'done'
+    assert json.loads(p.read_text())['active'] is False
+    other = tmp_path / 'other.json'
+    other.write_text(json.dumps({'id': 'c9', 'active': True, 'factors': FACTORS}))
+    with pytest.raises(ValueError):
+        team_ladder.init(tmp_path / 'x', other, 'A', ['B'], {'A': {}, 'B': {}}, 1, 'd')
