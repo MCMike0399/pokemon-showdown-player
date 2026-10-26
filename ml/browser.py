@@ -215,6 +215,11 @@ sends that same choice."""
         self.last_submission = 0.0
         self.answered = set()
         self.imported_team = None
+        # Every team imported or found this session (digest -> saved name): a live A/B that
+        # alternates teams (campaign c13) must not re-import one. A freshly imported team is
+        # not yet found by the saved-team lookup, and a second import from the teambuilder's
+        # edit view times out.
+        self.imported_teams = {}
         self.log_path = Path(log_path) if log_path else None
         if self.log_path:
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -291,6 +296,8 @@ sends that same choice."""
         if team:
             # Import via the actual teambuilder UI, then select that exact team.
             digest = fingerprint(team)
+            if digest in self.imported_teams:
+                self.imported_team = (digest, self.imported_teams[digest])
             if not self.imported_team or self.imported_team[0] != digest:
                 await self.page.wait_for_function(
                     '() => !!window.Storage?.whenTeamsLoaded?.isLoaded', timeout=15000)
@@ -318,6 +325,7 @@ sends that same choice."""
                 await builder.locator('button[name="saveImport"].savebutton').click()
                 await self.page.locator('a[href="/"]:visible').first.click()
                 self.imported_team = (digest, name)
+            self.imported_teams[digest] = self.imported_team[1]
             await home.locator('button[name="team"]').click()
             # The popup exposes unformatted teams as well as format-specific ones.
             selected = self.page.locator('button[name="selectTeam"]').filter(has_text=self.imported_team[1])

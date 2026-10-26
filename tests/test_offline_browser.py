@@ -586,3 +586,40 @@ def test_lost_choice_drill_drops_one_preview_choice_and_recovery_resends_it(tmp_
         assert [room['msg'] for script, room in calls if 'r.send(a.msg)' in script] == [f'/choose {decided[0]}|4']
     finally:
         store.close()
+
+
+def test_alternating_teams_import_each_once_per_session():
+    """Campaign c13 alternates teams between games; a team seen this session is never re-imported."""
+    team_a = {'format': FMT, 'sets': [{'species': 'Politoed', 'moves': ['Protect']}]}
+    team_b = {'format': FMT, 'sets': [{'species': 'Gengar', 'moves': ['Protect']}]}
+    clicks = []
+
+    class Loc:
+        def __init__(self, selector):
+            self.selector = selector
+        first = property(lambda self: self)
+        def locator(self, selector):
+            return Loc(selector)
+        def filter(self, **kwargs):
+            return self
+        async def count(self):
+            return 1
+        async def fill(self, value):
+            pass
+        async def press(self, value):
+            pass
+        async def click(self, **kwargs):
+            clicks.append(self.selector)
+
+    class Page:
+        def locator(self, selector):
+            return Loc(selector)
+        async def wait_for_function(self, *args, **kwargs):
+            return True
+        async def evaluate(self, *args, **kwargs):
+            return None  # a fresh import is never found by the saved-team lookup
+
+    player = BrowserPlayer(Page())
+    for team in (team_a, team_b, team_a, team_b):
+        asyncio.run(player.select_team(FMT, team))
+    assert sum('newTop' in c for c in clicks) == 2
