@@ -33,7 +33,9 @@ those two files.
 An optional `base` dict of overrides applies to every cell; a factor that is on replaces
 the base keys it sets. Besides `search/config.py` keys, an override may name `team` (a
 `teams.json` entry): the runner then plays that team for the game (campaign c13,
-docs/c13-team-ladder.md), so a base team against a challenger team is one factor.
+docs/c13-team-ladder.md), so a base team against a challenger team is one factor. It may
+also name `preview`, a team-preview policy spec as for the runner's `--preview`
+('pvalue:PATH' or 'human:PATH[:temp|argmax]'; campaign c14, docs/c14-preview.md).
 
     .venv/bin/python -m search.ab_test status [--json]
 """
@@ -79,6 +81,9 @@ def validate(spec: dict) -> dict:
     for name, options in [('base', spec.get('base') or {})] + list(factors.items()):
         if 'team' in options and not (isinstance(options['team'], str) and options['team']):
             raise ValueError(f'{name}: team must be a teams.json name')
+        if 'preview' in options and not (isinstance(options['preview'], str)
+                                         and options['preview'].split(':')[0] in ('pvalue', 'human')):
+            raise ValueError(f"{name}: preview must be 'pvalue:PATH' or 'human:PATH[:temp|argmax]'")
     frozen = spec.get('frozen') or {}
     if any(f not in factors or v not in (True, False) for f, v in frozen.items()):
         raise ValueError('frozen maps factor names to true/false')

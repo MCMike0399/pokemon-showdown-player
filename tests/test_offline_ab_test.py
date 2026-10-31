@@ -218,3 +218,37 @@ def test_team_ladder_without_a_winner_deactivates_and_never_touches_other_specs(
     other.write_text(json.dumps({'id': 'c9', 'active': True, 'factors': FACTORS}))
     with pytest.raises(ValueError):
         team_ladder.init(tmp_path / 'x', other, 'A', ['B'], {'A': {}, 'B': {}}, 1, 'd')
+
+
+# ------------------------------------------------------------- campaign c14: preview arms
+
+def test_preview_override_is_validated_and_resolved_like_the_team():
+    import browser_play
+    s = ab.validate({'id': 'cx', 'base': {'team': 'A'}, 'factors': {'preview': {'preview': 'human:m.json:argmax'}}})
+    on, off = ab.overrides(s, {'preview': True}), ab.overrides(s, {'preview': False})
+    assert browser_play.arm_option({'overrides': on}, s, 'preview', 'pvalue:p.json') == 'human:m.json:argmax'
+    assert browser_play.arm_option({'overrides': off}, s, 'preview', 'pvalue:p.json') == 'pvalue:p.json'
+    assert browser_play.arm_team({'overrides': on}, s, 'R') == 'A'
+    for bad in ('', 'random', 7):
+        with pytest.raises(ValueError):
+            ab.validate({'id': 'cx', 'factors': {'preview': {'preview': bad}}})
+
+
+def test_ladder_of_runner_options_merges_a_winning_challenger_into_the_champion(tmp_path, monkeypatch):
+    out, p = tmp_path / 'c14', tmp_path / 'current.json'
+    p.write_text(json.dumps({'id': 'c13final', 'active': True, 'factors': {'team': {'team': 'A'}}}))
+    with pytest.raises(ValueError):  # another campaign's active spec is never replaced
+        team_ladder.init(out, p, {'team': 'A'}, [{'preview': 'human:m.json:argmax'}], {'A': {}}, 7, 'd', 'c14', 'preview')
+    p.write_text(json.dumps({'id': 'c13final', 'active': False, 'factors': {'team': {'team': 'A'}}}))
+    with pytest.raises(ValueError):
+        team_ladder.init(out, p, {'team': 'Z'}, [{'preview': 'human:m.json'}], {'A': {}}, 7, 'd', 'c14', 'preview')
+    team_ladder.init(out, p, {'team': 'A'}, [{'preview': 'human:m.json:argmax'}], {'A': {}}, 7, 'd', 'c14', 'preview')
+    spec = json.loads(p.read_text())
+    assert spec['id'] == 'c14r1' and spec['base'] == {'team': 'A'}
+    assert spec['factors'] == {'preview': {'preview': 'human:m.json:argmax'}}
+    monkeypatch.setattr(ab, 'status', lambda spec_path, runs_dir=None: {'factors': {'preview': {
+        'decision': 'H1', 'games': 400, 'elo': 50.0, 'llr': 3.0, 'score_on': 0.55, 'score_off': 0.48}}})
+    assert team_ladder.step(out, p) == 'done'
+    spec = ab.validate(json.loads(p.read_text()))
+    assert spec['id'] == 'c14final' and not ab.randomised(spec)
+    assert ab.next_arm(spec, p)['overrides'] == {'team': 'A', 'preview': 'human:m.json:argmax'}

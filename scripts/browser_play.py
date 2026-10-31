@@ -56,11 +56,15 @@ def load_team(teams_file, name, fmt):
     return {**team, 'name': name}
 
 
-def arm_team(arm, spec, default):
-    """The team a game plays: the arm's `team` override, else the A/B spec's base team
-    (a resumed room the experiment does not know), else the runner's --team."""
+def arm_option(arm, spec, key, default):
+    """A per-game runner option (`team`, `preview`): the arm's override, else the A/B spec's
+    base (a resumed room the experiment does not know), else the runner's own flag."""
     over = (arm or {}).get('overrides') or {}
-    return over.get('team') or ((spec or {}).get('base') or {}).get('team') or default
+    return over.get(key) or ((spec or {}).get('base') or {}).get(key) or default
+
+
+def arm_team(arm, spec, default):
+    return arm_option(arm, spec, 'team', default)
 
 
 def page_watchdog(loop, page, log, every=60.0, limit=300.0, exit=os._exit):
@@ -170,13 +174,23 @@ async def run(args):
                         from search.config import agent_kwargs
                         brain = player.brain
 
-                        async def preview(ctx):
+                        async def actor_preview(ctx):
                             return brain.decide(ctx, explore=False, record=False)['choice']
+                        previews = {}
+
+                        def preview_for(spec):
+                            # A gated opponent-aware team preview (docs/human-opponent.md, campaign c4) or an
+                            # A/B arm's (campaign c14), built once each; the actor's preview stays the
+                            # fallback when the opponent's six is unknown.
+                            if not spec:
+                                return actor_preview
+                            if spec not in previews:
+                                from search.value_gate import make_preview
+                                previews[spec] = make_preview(spec, actor_preview, int(time.time()))
+                            return previews[spec]
+                        preview_spec = args.preview
                         if args.preview:
-                            # A gated opponent-aware team preview (docs/human-opponent.md, campaign c4);
-                            # the actor's preview stays the fallback when the opponent's six is unknown.
-                            from search.value_gate import make_preview
-                            preview = make_preview(args.preview, preview, int(time.time()))
+                            preview_for(args.preview)
                             player.log('preview_policy', spec=args.preview)
                         def make_agent(over):
                             # One deployed configuration, shared with the value gate; a live A/B arm
@@ -184,7 +198,7 @@ async def run(args):
                             sized = {k: v for k, v in (('worlds', args.search_worlds), ('engines', args.search_engines))
                                      if v is not None}
                             kwargs = agent_kwargs(**{**over, **sized})
-                            made = SearchAgent(fmt=args.format, preview=preview, seed=int(time.time()), **kwargs)
+                            made = SearchAgent(fmt=args.format, preview=preview_for(preview_spec), seed=int(time.time()), **kwargs)
                             if kwargs.get('scout'):
                                 # Opponents' earlier public games (search/scout.py); gates never look online.
                                 from search.scout import OnlineScout
@@ -199,9 +213,21 @@ async def run(args):
 
                         async def use_arm(arm, spec=None):
                             # Rebuilt only between games, when the arm's overrides change. A `team`
-                            # override (campaign c13) switches the team instead of the search.
-                            nonlocal agent, arm_over, team
-                            want = {k: v for k, v in ((arm or {}).get('overrides') or {}).items() if k != 'team'}
+                            # override (campaign c13) switches the team instead of the search, a
+                            # `preview` override (campaign c14) only the team-preview policy.
+                            nonlocal agent, arm_over, team, preview_spec
+                            want = {k: v for k, v in ((arm or {}).get('overrides') or {}).items()
+                                    if k not in ('team', 'preview')}
+                            spec_preview = arm_option(arm, spec, 'preview', args.preview)
+                            if spec_preview != preview_spec:
+                                try:
+                                    agent.preview = preview_for(spec_preview)
+                                    preview_spec = spec_preview
+                                except Exception as error:  # an unusable preview plays --preview, loudly
+                                    player.log('ab_error', error=f'preview {spec_preview!r}: {error!r}'[:300])
+                                    agent.preview = preview_for(args.preview)
+                                    preview_spec = args.preview
+                                player.log('arm_preview', spec=preview_spec)
                             name = arm_team(arm, spec, args.team)
                             if team is not None and name != team['name']:
                                 try:

@@ -92,3 +92,13 @@ The sets are in `data/ml/value/campaign-c13/candidate-teams.json` and `teams.jso
 
 Controller LaunchAgent: `dev.pokemon-showdown.campaign-c13`, running from the pinned
 worktree `<checkout>.c13`.
+
+## Result (2026-10-30)
+
+- Round 1: `Rain-Gengar-Helm-Baltimore` H0 after 302 games, −75 Elo (score 0.437 vs 0.543).
+- Round 2: `SunRain-Mev-Brisbane` H1 after 897 games, +62 Elo (score 0.556 vs 0.468),
+  LLR 3.05. This is the first live gain since c5. Opponent ratings were balanced between
+  the arms. The edge comes from opponents rated 1200 or more, plus more opponent forfeits.
+- From 2026-10-30 every game played the Mev team (spec `c13final`): 1344 ± 33 over 452
+  games (Elo monitor segment 16). The runner's `--team` became `SunRain-Mev-Brisbane`
+  on 2026-10-31, and campaign c14 (docs/c14-preview.md) followed.

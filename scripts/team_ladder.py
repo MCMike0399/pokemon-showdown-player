@@ -9,14 +9,18 @@ The next challenger then faces whoever is champion. After the last round a new c
 keeps playing through a final spec with nothing randomised; with no new champion the spec
 is set inactive and the runner plays its own --team again.
 
-The search configuration never changes here. Teams are `teams.json` names. The controller
-only writes the A/B spec and its own state; it refuses to replace an active spec that
-belongs to another experiment.
+The search configuration never changes here. Teams are `teams.json` names. A champion or
+challenger may instead be a JSON dict of per-game runner options (`team`, `preview`;
+campaign c14, docs/c14-preview.md); a winning challenger's options then join the
+champion's. The controller only writes the A/B spec and its own state; it refuses to
+replace an active spec that belongs to another experiment.
 
     .venv/bin/python scripts/team_ladder.py init --dir data/ml/value/campaign-c13 \\
         --champion Rain-Recife-special-stat-fix --challengers A B
     .venv/bin/python scripts/team_ladder.py run --dir data/ml/value/campaign-c13
     .venv/bin/python scripts/team_ladder.py status --dir data/ml/value/campaign-c13
+    .venv/bin/python scripts/team_ladder.py init --dir data/ml/value/campaign-c14 --prefix c14 \\
+        --factor preview --champion '{"team": "T"}' --challengers '{"preview": "human:PATH:argmax"}'
 """
 from __future__ import annotations
 
@@ -52,39 +56,54 @@ def log(out: Path, message: str) -> None:
         fh.write(f'{now()} {message}\n')
 
 
+def options(x) -> dict:
+    """A champion or challenger as runner options: a bare name is a team."""
+    return {'team': x} if isinstance(x, str) else dict(x)
+
+
+def prefix(state: dict) -> str:
+    return state.get('prefix', PREFIX)
+
+
+def factor(state: dict) -> str:
+    return state.get('factor', 'team')
+
+
 def round_spec(state: dict) -> dict:
     n = state['round']
-    return {'id': f'{PREFIX}r{n}', 'active': True, 'seed': state['seed'] + n, 'created': now(),
-            'protocol': state['protocol'], **SPRT, 'base': {'team': state['champion']},
-            'factors': {'team': {'team': state['challenger']}}, 'frozen': {}, 'history': []}
+    return {'id': f'{prefix(state)}r{n}', 'active': True, 'seed': state['seed'] + n, 'created': now(),
+            'protocol': state['protocol'], **SPRT, 'base': options(state['champion']),
+            'factors': {factor(state): options(state['challenger'])}, 'frozen': {}, 'history': []}
 
 
 def final_spec(state: dict) -> dict:
     # Nothing randomised: every game plays the champion (validate() needs one factor).
-    return {'id': f'{PREFIX}final', 'active': True, 'seed': state['seed'], 'created': now(),
-            'protocol': state['protocol'], **SPRT, 'base': {'team': state['champion']},
-            'factors': {'team': {'team': state['champion']}}, 'frozen': {'team': True}, 'history': []}
+    return {'id': f'{prefix(state)}final', 'active': True, 'seed': state['seed'], 'created': now(),
+            'protocol': state['protocol'], **SPRT, 'base': options(state['champion']),
+            'factors': {factor(state): options(state['champion'])}, 'frozen': {factor(state): True}, 'history': []}
 
 
-def ours(raw: dict | None) -> bool:
-    return bool(raw) and str(raw.get('id', '')).startswith(PREFIX)
+def ours(raw: dict | None, pre: str = PREFIX) -> bool:
+    return bool(raw) and str(raw.get('id', '')).startswith(pre)
 
 
-def init(out: Path, spec_path: Path, champion: str, challengers: list[str], teams: dict, seed: int,
-         protocol: str) -> dict:
-    for name in [champion, *challengers]:
-        if name not in teams:
+def init(out: Path, spec_path: Path, champion, challengers: list, teams: dict, seed: int,
+         protocol: str, pre: str = PREFIX, factor_name: str = 'team') -> dict:
+    for x in [champion, *challengers]:
+        name = options(x).get('team')
+        if name is not None and name not in teams:
             raise ValueError(f'unknown team {name!r} (teams.json)')
-    if len(set([champion, *challengers])) != len(challengers) + 1:
-        raise ValueError('teams must be distinct')
+    keys = [json.dumps(options(x), sort_keys=True) for x in [champion, *challengers]]
+    if len(set(keys)) != len(keys):
+        raise ValueError('champion and challengers must be distinct')
     try:
         current = json.loads(spec_path.read_text())
     except (OSError, ValueError):
         current = None
-    if current and current.get('active') and not ours(current):
+    if current and current.get('active') and not ours(current, pre):
         raise ValueError(f"spec {current.get('id')!r} is active; finish that experiment first")
     out.mkdir(parents=True, exist_ok=True)
-    state = {'phase': 'running', 'created': now(), 'seed': seed, 'protocol': protocol,
+    state = {'phase': 'running', 'created': now(), 'seed': seed, 'protocol': protocol, 'prefix': pre, 'factor': factor_name,
              'original': champion, 'champion': champion, 'challenger': challengers[0],
              'queue': list(challengers[1:]), 'round': 1, 'history': []}
     write_json(out / 'state.json', state)
@@ -101,7 +120,7 @@ def step(out: Path, spec_path: Path, runs_dir: Path | None = None) -> str:
     if state['phase'] != 'running':
         return 'done'
     raw = json.loads(spec_path.read_text())
-    want = f"{PREFIX}r{state['round']}"
+    want = f"{prefix(state)}r{state['round']}"
     if raw.get('id') != want:
         raise RuntimeError(f"spec is {raw.get('id')!r}, expected {want!r}; not touching it")
     if not raw.get('active'):
@@ -110,7 +129,7 @@ def step(out: Path, spec_path: Path, runs_dir: Path | None = None) -> str:
         write_json(out / 'state.json', state)
         return 'stopped'
     st = ab_test.status(spec_path, runs_dir)
-    s = st['factors']['team']
+    s = st['factors'][factor(state)]
     write_json(out / 'status.json', {'time': now(), 'round': state['round'], 'champion': state['champion'],
                                      'challenger': state['challenger'], 'queue': state['queue'], **s})
     if not s['decision']:
@@ -118,12 +137,13 @@ def step(out: Path, spec_path: Path, runs_dir: Path | None = None) -> str:
     won = s['decision'] == 'H1'
     state['history'].append({'round': state['round'], 'time': now(), 'champion': state['champion'],
                              'challenger': state['challenger'], 'decision': s['decision'], 'stats': s})
-    raw.update(active=False, frozen={'team': won}, finished=now())
+    raw.update(active=False, frozen={factor(state): won}, finished=now())
     ab_test.write_spec(raw, spec_path)
     log(out, f"{want}: {s['decision']} after {s['games']} games, {state['challenger']} vs {state['champion']}: "
              f"Elo {s['elo']} (score {s['score_on']} vs {s['score_off']}), LLR {s['llr']}")
     if won:
-        state['champion'] = state['challenger']
+        champion = {**options(state['champion']), **options(state['challenger'])}
+        state['champion'] = champion['team'] if list(champion) == ['team'] else champion
     if state['queue']:
         state.update(challenger=state['queue'].pop(0), round=state['round'] + 1)
         write_json(out / 'state.json', state)
@@ -134,7 +154,7 @@ def step(out: Path, spec_path: Path, runs_dir: Path | None = None) -> str:
     write_json(out / 'state.json', state)
     if state['champion'] != state['original']:
         ab_test.write_spec(final_spec(state), spec_path)
-        log(out, f"done: champion {state['champion']} plays every game (spec {PREFIX}final); "
+        log(out, f"done: champion {state['champion']} plays every game (spec {prefix(state)}final); "
                  f"make it the runner's --team to keep it without the spec")
     else:
         log(out, f"done: {state['original']} stays; spec inactive")
@@ -147,8 +167,10 @@ def main(argv=None) -> int:
     ap.add_argument('--dir', type=Path, required=True)
     ap.add_argument('--spec', type=Path, default=ab_test.SPEC)
     ap.add_argument('--teams-file', type=Path, default=ROOT / 'teams.json')
-    ap.add_argument('--champion')
-    ap.add_argument('--challengers', nargs='+')
+    ap.add_argument('--champion', help='teams.json name, or a JSON dict of runner options')
+    ap.add_argument('--challengers', nargs='+', help='teams.json names, or JSON dicts of runner options')
+    ap.add_argument('--prefix', default=PREFIX, help='experiment id prefix (spec ids <prefix>r<n>, <prefix>final)')
+    ap.add_argument('--factor', default='team', help='the A/B factor name of every round')
     ap.add_argument('--seed', type=int, default=20261300)
     ap.add_argument('--protocol', default='docs/c13-team-ladder.md')
     ap.add_argument('--poll', type=float, default=1800)
@@ -157,8 +179,9 @@ def main(argv=None) -> int:
     if args.command == 'init':
         if not args.champion or not args.challengers:
             ap.error('init needs --champion and --challengers')
-        init(out, args.spec, args.champion, args.challengers, json.loads(args.teams_file.read_text()),
-             args.seed, args.protocol)
+        parse = lambda x: json.loads(x) if x.lstrip().startswith('{') else x  # noqa: E731
+        init(out, args.spec, parse(args.champion), [parse(x) for x in args.challengers],
+             json.loads(args.teams_file.read_text()), args.seed, args.protocol, args.prefix, args.factor)
         return 0
     if args.command == 'status':
         state = json.loads((out / 'state.json').read_text())
