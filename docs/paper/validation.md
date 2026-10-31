@@ -1,5 +1,57 @@
 # Paper validation
 
+## Third edition — 31 October 2026
+
+Implementation inspected at public `bee08dc`; simulator pin `c046106`.
+Evidence cutoff: **2026-10-31 16:28:15 UTC**. This is a documentation and
+read-only evidence audit, not a new playing-strength experiment.
+
+- **Build:** `tectonic --keep-logs main.tex`; 65 pages, 19 included section
+  files, 40 bibliography entries, 14 TikZ/pgfplots figures. No undefined
+  references/citations or overfull boxes. Two underfull text-box warnings
+  remain in the historical recorder diagram; neither clips content.
+- **Visual inspection:** rendered all 65 pages into six contact sheets and
+  inspected them, with larger renders of the updated architecture, live
+  performance figure and C13 results table. No clipping or overlapping chart
+  labels were found. Temporary inspection images are not tracked.
+- **Formal content:** 32 propositions/theorems/lemmas with proofs and 8 worked
+  examples. The new shared-root certificate explicitly applies only to the
+  supplied finite matrices. Earlier actor/PPO sections have historical scope
+  notes; the defects appendix now distinguishes repairs from remaining limits.
+- **Frozen evidence:** `evidence-20261031.json`, collected by
+  `collect_evidence.py`, contains aggregate data from 7,734 completed rated
+  search games, room-deduplicated internally, without publishing player names,
+  room IDs, requests or logs. It includes manifest hashes and saved stopping
+  receipts; builds do not refresh it.
+- **Independent arithmetic:** `python3 collect_evidence.py --verify` recomputes
+  C10/C12 exact sign-test tails, both C13 round scores, Elo transforms,
+  normal-approximation LLRs and the post-C13 interval. Mev: 249/448 versus
+  210/449 at the 897-game decision, +61.9 Elo, LLR 3.054. The later champion
+  cohort joins both sides of a runner restart: 455 games, 226 wins,
+  performance 1343.7 ± 33.3. C14 has 9 completed games and no decision.
+- **Stopping integrity:** C9 uses each factor's saved first decision rather
+  than later terminal arrivals. All four are H0; boost stopped at 1,581 games,
+  while the eventual experiment ledger has 1,582. C13 excludes the one late
+  result in each round from its 302- and 897-game stopping cohorts. Assignment
+  ledgers identify actual team arms even when the run's default team differs.
+- **Source checks:** verified referenced repository paths and current C5
+  constants, preview models, CRN, root-solver behavior, terminal-only A/B join,
+  and the pinned simulator. Primary papers on restricted Nash responses and
+  imperfect-information depth limits were checked directly. Sequential-test
+  claims qualify the implemented normal approximation and multiplicity.
+- **Relevant regression suite:** 58 passed across A/B assignment, Elo monitor,
+  gate scheduling and belief solver tests. No production source was changed.
+- **Publication checks:** `git diff --check` and the repository publication
+  scanner on the article's publication files pass.
+
+No login, battle, training, service restart, model promotion or experiment
+mutation was performed for this update. This edition records C5's explicit
+post-results amendment and C13's randomized success without relabeling other
+campaigns as successful. The public aggregates support arithmetic reproduction;
+a full room-level integrity audit still requires the private original logs.
+
+## Second-edition validation receipt (historical)
+
 Second edition, validated on 2026-10-09 against public source `0c00ec2`. This
 checks the document's correspondence with the source; it is not a new
 battle-strength experiment.

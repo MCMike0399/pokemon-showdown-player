@@ -1,6 +1,8 @@
 \section{Promotion: a paired test and what it can certify}
 \label{sec:promotion}
 
+\historyscope
+
 \subsection{The paired design}
 For game $i$ the incumbent and the candidate face identical conditions: the
 same seed, side, opponent, opponent revision, learner team, opponent team,
@@ -137,14 +139,14 @@ prospectively specified final panel is the remedy, and the project's
 experiment runner (\code{scripts/train_opening.py}) uses one.
 
 \subsection{What the gate does not measure}
-Since 9 October the gate evaluates the \emph{sampled self-play actor} against
+At the 9 October baseline this gate evaluated the \emph{sampled self-play actor} against
 scripted opponents and a frozen copy of itself. Live turns, however, are
 decided by search, and the actor only chooses team previews, greedily. A
 candidate that passes therefore improves a decision system that is not the
 one deployed for turns. Its effect on live play runs through the preview, and
 through the data the next candidates are trained on.
-Section~\ref{sec:limits} lists this construct-validity gap as the most
-important open problem in the evaluation design.
+The later search gates and live A/B infrastructure explicitly address this
+construct-validity gap (Sections~\ref{sec:campaigns} and~\ref{sec:live-method}).
 
 \subsection{A distribution-free certificate (proposed, not implemented)}
 \label{sec:certificate}

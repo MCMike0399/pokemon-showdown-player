@@ -1,9 +1,9 @@
 \section{Decision-time search}
 \label{sec:search}
 
-The learned actor's prior looks one turn ahead against a handful of guessed
-opponent moves. The search agent replaces that guess with the official
-simulator. It samples complete hypothetical opposing teams, plays every
+The historical actor's prior looked one turn ahead against a handful of
+guessed opponent moves. The deployed search replaces that approximate
+resolver with the official simulator. It samples complete hypothetical opposing teams, plays every
 pairing of our and the opponent's joint actions for one turn, and solves the
 resulting matrix game. Figure~\ref{fig:search} shows the procedure.
 
@@ -27,9 +27,9 @@ resulting matrix game. Figure~\ref{fig:search} shows the procedure.
   \node[note,rotate=90] at (7.35,-1.6) {ours $a$};
   \node[font=\scriptsize,anchor=north] at (8.6,-2.75) {$M_w[a,b]$: value after one simulated turn};
   \node[warmbox,text width=29mm] (rm) at (13.3,-0.3) {Regret matching\\2000 iterations\\$\to(\bar x_w,\bar y_w)$};
-  \node[warmbox,text width=29mm] (bl) at (13.3,-2.3) {Opponent model\\$q_w=\tfrac12\bar y_w+\tfrac12g_w$};
+  \node[warmbox,text width=29mm] (bl) at (13.3,-2.3) {Opponent model\\$q_w=\tfrac14\bar y_w+\tfrac34g_w$};
   \node[box,text width=58mm] (avg) at (7.6,-4.3) {$\displaystyle a^*=\arg\max_a\frac1{|W_a|}\sum_{w\in W_a}M_w[a,\cdot]\,q_w$};
-  \node[box,text width=26mm] (out) at (13.3,-4.3) {click $a^*$\\median 2.3\,s};
+  \node[box,text width=26mm] (out) at (13.3,-4.3) {click $a^*$\\about 5--6\,s};
   \draw[arr] (trk) -- (smp); \draw[arr] (use) -- (smp);
   \draw[arr] (smp) -- (6.65,-1.1);
   \draw[arr] (10.9,-0.6) -- (rm.west);
@@ -40,7 +40,9 @@ resulting matrix game. Figure~\ref{fig:search} shows the procedure.
 \caption{The search agent. Each world fixes complete hypothetical opposing
 sets and copies all public state. Screening keeps at most 24 of our joint
 actions and 20 of the opponent's. The payoff matrix of a world therefore needs
-at most 480 one-turn simulations, plus up to $4|\B|+4|\A|$ for screening. Team preview is delegated to the learned actor.}
+at most 480 one-turn simulations, plus up to $4|\B|+4|\A|$ for screening. Six initial worlds may be extended by six on close decisions within the
+adaptive time budget. The C5 leaf and selective continuation modify the basic
+one-turn game. Team preview uses a separate learned model.}
 \label{fig:search}
 \end{figure}
 
@@ -119,7 +121,7 @@ teams. Public state is then written onto it:
   \item a whitelist of volatiles, such as Protect's stall counter, Substitute,
     Taunt, Encore, Disable and choice lock. The agent does not send last
     moves, so the engine's last-move restoration is unused, and the opponent's
-    PP is never set;
+    PP is never set. Recharge is now restored from public and private evidence;
   \item weather, terrain and side conditions with their estimated durations.
 \end{itemize}
 If a side has used its Mega, Mega Evolution is disabled for the whole side.
@@ -127,7 +129,7 @@ Our side uses exact sets, HP and PP from our request.
 
 \subsection{The one-turn game in each world}
 Our candidates are the Python-legal choices $\A(r)$, pruned in two ways.
-Damaging moves at our partner are removed, and when a Mega is available only
+Damaging and harmful single-target status moves at our partner are removed, and when a Mega is available only
 Mega-containing choices are kept. Each surviving choice is rewritten by move
 \emph{identifier}, because a locked request lists only one move and slot
 numbers differ in the rebuilt battle. The opponent's set $\B$ comes from the
@@ -140,16 +142,16 @@ It then keeps the 24 of our actions with the highest mean value against the
 first four kept replies.
 
 \paragraph{Payoffs.} For each remaining pair, the engine restores the world
-state, gives the cell its own seed, submits both choices, runs exactly one
-turn and evaluates the result:
+state, assigns a chance stream, submits both choices, runs one turn and
+evaluates the result (with selected second-turn corrections described below):
 \begin{equation}
-  M_w[a,b]=V\big(\mathrm{Turn}(B_w;a,b;\xi_{w,a,b})\big).
+  M_w[a,b]=V\big(\mathrm{Turn}(B_w;a,b;\xi_{w,b})\big).
 \end{equation}
 If the simulator rejects any cell, that cell's whole row (our action) or
 column (their action) is removed.
 
-\paragraph{Evaluation function.} A finished battle scores $\pm30$, or 0 for a
-tie. Otherwise
+\paragraph{Material evaluation and C5 leaf.} The underlying hand evaluator
+scores a finished battle $\pm30$, or 0 for a tie. Otherwise
 $V=S(\text{us})-S(\text{them})+\mathrm{TR}$, where
 \begin{equation}
   S=\sum_{\text{alive }p}\big[1+1.2h_p-\mathrm{pen}(p)+\mathbf 1_{\text{active}}\,\beta(p)\big]
@@ -162,6 +164,14 @@ defensive and speed boosts and a Substitute. It penalizes Perish counts,
 confusion, Taunt, Encore, Yawn and Leech Seed. TR is the Trick Room term: it
 adds $0.10\cdot\text{turns}\cdot2\clip((\bar v_{\text{them}}-\bar v_{\text{us}})/40,-1,1)$,
 where $\bar v$ is each side's mean Speed, so slower teams gain value under Trick Room.
+
+The deployed C5 leaf transforms this hand score with
+Equation~\eqref{eq:sigmoid-leaf}. Thus the matrix's $V$ denotes the transformed
+leaf at the current cutoff, rather than raw material. When the world's
+material score is below $-1$ and its preferred action Protects, the best
+Protect and non-Protect lines are selectively continued one more turn against
+the top three modeled replies. This is a targeted horizon correction, not
+full depth-two search. Speed-order constraints filter hidden-set draws.
 
 \subsection{Solving the matrix game}
 The engine runs simultaneous regret matching on the zero-sum game in which we
@@ -196,8 +206,10 @@ regret rates are the standard bounds for regret matching
 \end{proof}
 
 \intuition{With $|\A|=24$, $|\B|=20$ and $T=2000$, the worst-case gap is
-$\Delta(\sqrt{24}+\sqrt{20})/\sqrt{2000}\approx0.21\Delta$. When a terminal
-$\pm30$ is reachable, $\Delta$ can be 60, which makes the bound loose. In
+$\Delta(\sqrt{24}+\sqrt{20})/\sqrt{2000}\approx0.21\Delta$.
+The original material leaf could span 60 with terminal values; the C5
+transformed leaf lies in $(0,4/.801)$, making the units different while the
+relative bound remains loose. In
 practice regret matching usually converges much faster than its worst case.
 The bound justifies $\bar y$ only as an approximate equilibrium, and only of
 this one-turn surrogate game.}
@@ -210,7 +222,8 @@ two types:
   g_w(b)\propto\exp\!\big(-(c_b-\min_{b'}c_{b'})/\tau_o\big),\qquad
   c_b=\frac1{|\A|}\sum_aM_w[a,b],
 \end{equation}
-with $\alpha=\tfrac12$ and $\tau_o=1$. One type plays the equilibrium. The
+with $\alpha=\tfrac14$ and $\tau_o=1$ at the current cutoff
+($\alpha=\tfrac12$ at the second-edition baseline). One type plays the equilibrium. The
 other is a soft best response to our playing uniformly, a level-1 quantal
 response in the sense of \citet{mckelvey1995}. Each world then gives our action
 values $U_w(a)=(M_wq_w)_a$. Let $W_a$ be the worlds in which $a$ was valid, and
@@ -237,9 +250,9 @@ and each loses 1 to some reply.
 than the game's value. Against an opponent who anticipates it, a deterministic
 best response can be exploited, whereas $\bar x$ could not be. The design bets
 that ladder opponents neither compute this matrix nor exploit its argmax. The
-level-1 component also assumes they reason one step about our options. These
-are modelling choices, and the live evidence in Section~\ref{sec:evidence} is
-too small to test them separately.}
+level-1 component also assumes they reason one step about our options. These are modelling choices. Subsequent C3, C9 and C12 experiments tested
+specific alternatives without validating a stronger replacement
+(Section~\ref{sec:campaigns}).}
 
 \subsection{Determinization and strategy fusion}
 \label{sec:fusion}
@@ -277,10 +290,15 @@ even when sheets were not shared, so the opponent model is omniscient about
 us.}
 
 \subsection{Monte Carlo error}
-Each cell uses one stochastic sample of accuracy, damage rolls and critical
-hits. Each cell has its own seed, so two of our actions are not compared under
-common random numbers. With $K=6$ worlds, the averaged difference between two
-actions has world-sampling noise plus within-cell chance noise.
+Each cell ordinarily uses one stochastic sample of accuracy, damage rolls
+and critical hits. Common random numbers now seed each retained opposing
+reply identically across our rows, unlike the second-edition baseline.
+Different actions can consume the stream differently, so equal seeds do not
+mean identical realized events. With six initial worlds the difference still
+contains world-sampling and within-cell chance noise. If the leading margin
+is below .5 and the initial batch took less than half of the 9-second budget,
+six fresh worlds are added. The engine timeout is 40 seconds, with a legal
+fallback before the ordinary 55-second turn allowance.
 
 \begin{proposition}[Ranking two actions]
 \label{prop:mc}
@@ -294,21 +312,27 @@ This is Hoeffding's inequality applied to the event $\overline D\le0$ with
 deviation $\gamma$ \citep{hoeffding}.
 \end{proof}
 
-With $K=6$, the bound is useful only when the gap $\gamma$ is a large fraction
-of $\Delta$. Small value differences are effectively ranked at random. Common
-random numbers across rows, more seeds per cell, or adaptive allocation of
-worlds to close decisions would all reduce this noise.
+With $K=6$, the bound is useful only when $\gamma$ is a large fraction of
+$\Delta$; it does not establish reliable rankings for small gaps. CRN reduces
+variance when paired outcomes covary positively, which must be measured, not
+assumed universally. The implemented adaptive worlds reduce some observed
+ranking variation. C6's failed larger-budget candidates show that reduced
+noise need not translate into a detectable strength gain.
 
-\subsection{Preview, Mega and the learned value}
-Team preview is chosen by the actor, greedily. A value-based preview mode
-(score 90 plans by the position after preview, averaged over 6 worlds and 3
-sampled opposing bring-fours) exists but is untested. Mega Evolution is always
-taken when available, for us and for the opponent model, so the agent never
-considers saving it. A small value network can replace $V$: 14 features per
-Pok\'{e}mon plus field and matchup features, a $128\to128\to1$ ReLU MLP,
-trained by binary cross-entropy on omniscient self-play. It blends in as
-$(1-\beta)V+\beta\cdot8\tanh(z/2)$, but the deployment uses $\beta=0$, and the
-network is neither trained to completion nor gated.
+\subsection{Preview, Mega and the learned components}
+Team preview uses the C4 matchup-value model by default; C14 compares that
+with a human-imitation argmax on the Mev team. An older simulator-value
+preview mode remains optional. Mega remains forced when a legal activation
+is available under the baseline, although double-Mega enumeration is repaired.
+The C7 species-avoidance option is implemented but was not promoted.
+
+Value nets, learned action screening, learned opponent probabilities,
+public-history scouting and the shared root solver are separate opt-in paths.
+C1--C12 did not produce a further demonstrated live gain from these paths.
+The current configuration retains hand-based sigmoid leaves and probe
+screening; collecting their training labels does not imply that learned
+weights are in use. Section~\ref{sec:campaigns} reports the actual
+experiments, including C12's mixed root strategy, which remains disabled.
 
 \source{\code{search/agent.py} (worlds, pruning, move-id rewriting, decision
 rule, forced replacements), \code{search/engine.cjs} (rebuild, enumeration,

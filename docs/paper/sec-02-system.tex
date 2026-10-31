@@ -2,15 +2,17 @@
 \label{sec:system}
 
 \subsection{Components and responsibilities}
-Figure~\ref{fig:architecture} shows the deployed system. It has three
+Figure~\ref{fig:architecture} shows the current division of responsibilities. It has three
 columns. The \emph{play} column talks to Showdown. The \emph{decide} column
 chooses actions. The \emph{learn} column turns recorded games into candidate
 models and decides whether to deploy them. The arrows that cross columns are
 narrow on purpose. A decision procedure receives a context built from public
 information and the player's own request, and returns one complete choice
 string. A learner receives completed, validated records and returns a
-checkpoint file. Deployment is one atomic file replacement made at a
-matchmaking boundary.
+checkpoint or a fixed set of options. Model pointers and experiment settings
+change at matchmaking boundaries. Source deployment selects a tested, pinned
+worktree and gracefully restarts the runner. Offline gates use separately
+pinned source; current development edits do not alter running experiments.
 
 \begin{figure}[htbp]
 \centering
@@ -25,12 +27,12 @@ matchmaking boundary.
   \node[col] (player) at (0,-4) {Browser player\\rqid guards, clicks};
   \node[col] (viewer) at (0,-6.4) {Live viewer\\SSE deltas, tailnet};
   \node[col,dashed] (mcp) at (6.4,0) {OpenClaw + MCP server\\optional supervised path};
-  \node[col,fill=paleink] (actor) at (6.4,-2) {Actor--critic\\team preview (greedy)};
+  \node[col,fill=paleink] (actor) at (6.4,-2) {Preview model\\C4 pvalue / C14 imitation};
   \node[col,fill=warm,draw=seriesB!70!black] (search) at (6.4,-4) {Search agent\\tracker, usage worlds};
   \node[col,fill=warm,draw=seriesB!70!black] (engines) at (6.4,-6.4) {Node engine pool ($\times3$)\\official \code{Battle}};
-  \node[col] (store) at (12.8,0) {SQLite store (WAL)\\episodes, jobs, logs};
-  \node[col] (lanes) at (12.8,-2) {Supervisor; lanes:\\collector (CPU), learner (MPS),\\evaluator (CPU)};
-  \node[col] (ready) at (12.8,-4) {Ready slot\\paired gate passed};
+  \node[col] (store) at (12.8,0) {JSONL ledgers + SQLite\\search traces, outcomes, replays};
+  \node[col] (lanes) at (12.8,-2) {Pinned campaigns\\CPU games; MPS fits\\PPO service paused};
+  \node[col] (ready) at (12.8,-4) {Frozen candidate / spec\\offline filter + live A/B};
   \node[col] (sim) at (12.8,-6.4) {Local simulator\\\code{simulator.cjs}};
   \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (server) -- node[note,right]{WebSocket} (client);
   \draw[arr] ([xshift=6mm]client.south) -- node[note,right]{request, log} ([xshift=6mm]player.north);
@@ -39,21 +41,20 @@ matchmaking boundary.
   \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (player) -- node[note,above]{context / choice} (search);
   \draw[arr] (player.north east) -- node[note,above left,pos=.75]{preview} (actor.west);
   \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (search) -- node[note,left,pos=.2]{JSON lines} (engines);
-  \draw[arr] ([xshift=6mm]player.south) |- node[note,below,pos=.62]{public log at game end} (10.3,-5.3)
+  \draw[arr] ([xshift=6mm]player.south) |- node[note,below,pos=.62]{request, trace, terminal} (10.3,-5.3)
      -- (10.3,-0.2) -- ([yshift=-2mm]store.west);
   \draw[darr] (mcp.west) -- node[note,above]{PSClient} (server.east);
   \draw[darr] (mcp.east) -- node[note,above]{records} ([yshift=2mm]store.west);
   \draw[arr] (store) -- (lanes);
   \draw[arr] (lanes) -- (ready);
-  \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (lanes.east) -- ++(0.35,0) |- node[note,right,pos=.25]{self-play} (sim.east);
+  \draw[arr,{Latex[length=2mm]}-{Latex[length=2mm]}] (lanes.east) -- ++(0.35,0) |- node[note,right,pos=.25]{offline games} (sim.east);
   \draw[darr] (ready.west) -- node[note,left,pos=.5,align=center]{promote\\between games} (actor.east);
 \end{tikzpicture}}
-\caption{Deployed responsibilities on 9 October 2026. Orange boxes are the
-decision-time search. The learned actor chooses only the team preview live,
-but it generates all training data in self-play. The dashed promotion path
-replaces the actor between games, after a candidate has passed the paired gate
-and integrity checks. The dashed MCP path supports agent-supervised play and
-recording; it is not used by the browser runner.}
+\caption{Responsibilities at the 31 October cutoff. Orange boxes run
+simulator search. Preview is a separately chosen model, with C14's assignment
+fixed for the game. The learning column is campaign-driven; it does not imply
+continuous PPO updates or an active strength gate. The dashed deployment path
+adopts tested settings between games. MCP remains an optional supervised path.}
 \label{fig:architecture}
 \end{figure}
 
@@ -66,25 +67,23 @@ recording; it is not used by the browser runner.}
 Process & Device & Role and cadence \\
 \midrule
 Browser runner & CPU & One account lock. Plays ladder games through the
-official client, with a 30-second gap between games. Calls promotion before
+official client, with a 30-second gap between games. Adopts experiment settings before
 each matchmaking search. \\
 Search engines & CPU (3 Node) & Long-lived simulator processes. Each turn they
-receive 2 of the 6 sampled worlds; median decision 2.3\,s. \\
-Supervisor & CPU & launchd \code{KeepAlive}. Polls every 15\,s, samples host
-resources, and runs at most one child per lane. \\
-Collector lane & CPU & Self-play in spawned one-thread processes, each driving
-a Node simulator. Writes complete sampled episodes. \\
-Learner lane & MPS GPU & PPO on validated episodes; at most 12\% of recommended
-Metal memory; falls back to CPU on device errors. Then a scout update. \\
-Evaluator lane & CPU & Paired incumbent and candidate panels with frozen
-inputs; the exact sign-test gate; staging. \\
+receive 2 of the 6 initial worlds; close decisions may add 6. Later live medians are about 5--6\,s. \\
+Campaign controller & CPU & Pinned, restartable controller; balances arms,
+records first stopping decisions, and refuses to replace another active test. \\
+Offline workers & CPU & Protocol-specific simulator games, frozen assets,
+same-seed retries; registered groups pause during live search. \\
+Model fitting & MPS GPU & Value, screening, human-policy and preview models.
+Dedicated campaigns use chronological tests and fixed protocols; PPO is paused. \\
 Live viewer & CPU & Publishes filtered public frames every 0.2\,s over SSE. \\
 Cold archiver & CPU & Every 900\,s, gzip-archives completed inference inputs
 with SHA-256 verification. \\
 \bottomrule
 \end{tabularx}
 \caption{Long-running processes on the always-on Apple~M5 host (10 cores,
-16\,GB unified memory). The lanes are described in Section~\ref{sec:pipeline}.}
+16\,GB unified memory). The historical lanes are in Section~\ref{sec:pipeline}; later campaign operations are in Section~\ref{sec:engineering}.}
 \label{tab:processes}
 \end{table}
 
@@ -123,6 +122,33 @@ Section~\ref{sec:evidence}.}
 \label{fig:timeline}
 \end{figure}
 
+\subsection{The later research timeline}
+The original timeline above ends at the second edition. The next three
+weeks changed both the decision system and the standard of evidence:
+\begin{center}
+\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{.17\linewidth} X}
+\toprule
+Date (October 2026) & Development milestone \\
+\midrule
+9--13 & Value-learning loop, common random numbers, adaptive worlds,
+learned-screening data, C1--C3 failures. \\
+14--16 & C4 opponent-aware preview; C5 risk/horizon/speed bundle and room-cache
+repair; pinned live deployment. \\
+17--19 & Mechanics fixes; C6--C8 fail; C9 begins randomized live factorial
+experimentation instead of relying only on imitation gates. \\
+22--26 & Pooled gates and persistent C10; M5 measurements; Illusion/Recharge
+repairs; C11 residual rejected; C12 shared-root candidate then rejected. \\
+26--30 & C13 compares teams on the ladder; browser team-cache/watchdog fixes;
+Mev wins round two at 897 games. \\
+31 & Mev becomes the runner default; C14 begins a team-specific preview A/B. \\
+\bottomrule
+\end{tabularx}
+\end{center}
+The protocol and outcome for each campaign appear in
+Section~\ref{sec:campaigns}. Correctness fixes and service changes are
+recorded independently of claims about strategic improvement.
+
 \subsection{Two transports, one decision contract}
 The repository keeps two ways to reach Showdown. Both obey the same contract:
 a decision is one complete choice string for one actionable request, and it is
@@ -145,8 +171,9 @@ Section~\ref{sec:actions}.
 \end{itemize}
 The two paths have different recording rules. MCP play can record sampled PPO
 data. A browser game played with \code{--search} is never a PPO sample,
-because its actions do not come from the actor's distribution. It contributes
-only its public log to the scout corpus (Section~\ref{sec:scout}).
+because its actions do not come from the actor's distribution. It retains a
+private decision ledger, produces public-log labels, and can supply reconstructed
+value positions and screening targets (Section~\ref{sec:engineering}).
 
 \source{\code{ps_mcp_server.py}, \code{ps_client.py}, \code{harness.py},
 \code{ml/live.py}, \code{ml/browser.py}, \code{scripts/browser_play.py},

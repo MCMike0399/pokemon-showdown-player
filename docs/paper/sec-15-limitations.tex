@@ -1,53 +1,66 @@
 \section{Limitations and research directions}
 \label{sec:limits}
 
-The system is a working, auditable player with one strong offline result and
-a long list of honest failures. Its main open problems follow from the
-analysis above, in rough order of importance.
+The project now has a controlled live gain for a team change, in addition to
+its early offline search result. It does not have a proven process for
+continually improving turn decisions, competitive-level play, or an
+end-to-end optimal policy. The unsuccessful campaigns constrain the next
+questions more usefully than another list of promising offline metrics.
 
 \begin{enumerate}
-  \item \textbf{Evaluate the system that is deployed.} The promotion gate
-    measures the sampled self-play actor. Live turns are chosen by search.
-    A candidate actor should be evaluated as a \emph{preview} policy under
-    search turns. Search changes (worlds, opponent blend, evaluation) need a
-    gate of their own, with the opponent team as the unit
-    (Sections~\ref{sec:promotion} and~\ref{sec:evidence}).
-  \item \textbf{Control multiplicity.} The pipeline runs about a hundred gates
-    a day. A fixed $\alpha=0.05$ per gate admits several false promotions per
-    hundred null candidates. Options are an alpha-spending budget, a
-    Bonferroni or Holm level per day, or a mandatory independent final panel,
-    which the experiment runner already uses (Proposition~\ref{prop:multiplicity}).
-  \item \textbf{Measure strength on a fixed scale.} Live win rate depends on
-    the rating band (Proposition~\ref{prop:elo}). Rating trajectories over
-    pre-specified game counts, or GXE, should replace raw win rate as the live
-    target. A frozen pool of real opponent teams piloted by fixed policies
-    should replace synthetic teams as the offline target.
-  \item \textbf{Fix the search defects and reduce its noise.} The defects are
-    the both-Mega enumeration drop, Mega forcing, forme lookups and unseeded
-    durations. Noise can be cut with common random numbers across rows, more
-    than one seed per cell, and more worlds for close decisions
-    (Proposition~\ref{prop:mc}). The optimistic replacement scoring could be
-    replaced by a committed choice across worlds
-    (Proposition~\ref{prop:fusion}).
-  \item \textbf{Better beliefs.} The usage prior ignores correlations between
-    moves, items and spreads, as well as teammates. A joint set model, or a
-    posterior updated from damage observations (a revealed roll constrains
-    the stat spread), would sharpen the worlds. Information-set search would
-    remove fusion at the cost of compute \citep{cowling2012}.
-  \item \textbf{State sufficiency.} Fix the legacy HP parser in the deployed
-    profile, distinguish unknown from observed values, and test longer
-    histories or recurrence. An exact simulator does not help if the encoder
-    drops a mechanic.
-  \item \textbf{Make learning matter.} Inference-time changes (temperature,
-    prior, search) produced every confirmed gain, while gradient updates
-    produced almost none. A learned value function for search, trained on
-    self-play with the existing value-net pipeline and gated like any
-    candidate, is the clearest route by which learning could compound with
-    search, in the spirit of \citet{vgcbench}, \citet{metamon} and
-    \citet{pokechamp}.
+ \item \textbf{Transfer from a surrogate remains the main research gap.}
+ Better outcome log loss, reply accuracy, probe retention and sampled-game
+ security each failed to predict stronger play in specific campaigns. C12's
+ small duality gaps certify its finite matrices, not correct leaves, beliefs,
+ missing replies or information-consistent continuations. Future value work
+ should distinguish prediction from counterfactual action ranking and preserve
+ information constraints across hidden worlds \citep{brown2018depth}.
+ \item \textbf{C13 identifies a team--pilot interaction.}
+ Its +61.9-Elo estimate concerns two exact teams under C5 search and C4
+ preview on this ladder. It is not an estimate of human tournament team
+ quality, an improvement in learned turn weights, or a decomposition into
+ individual species effects. Optional stopping and selecting challengers can
+ inflate the winning estimate. The subsequent $1344\pm33$ cohort is useful
+ follow-up evidence but not another randomized comparison.
+ \item \textbf{C14 remains an experiment.}
+ The bot rarely using Venusaur is a diagnostic, and human usage is an
+ observational lower bound on being brought. Making the bot resemble humans
+ does not guarantee more wins: C9 already changed Protect frequencies without
+ demonstrating an advantage. Retain the fixed stopping rule instead of
+ promoting from appealing plans or a short rating streak.
+ \item \textbf{Sequential uncertainty needs stronger calibration.}
+ The normal-approximation live test has nominal .05/.10 parameters but is
+ not an exact sequential likelihood-ratio test. Repeated opponents, rating
+ feedback, factorial interactions, variance estimation and several successive
+ campaigns complicate error rates. Ordinary performance intervals do not
+ account for repeated looks. A future protocol could preregister block-aware
+ inference or anytime-valid confidence sequences and a family-wise error
+ budget; those methods are not implemented or retrospectively credited here.
+ \item \textbf{Missingness and treatment delivery need continued auditing.}
+ Unfinished rooms are excluded until a terminal arrives, while forfeit wins
+ count. Outages could still differ by arm. Compare assignment-to-terminal
+ rates, baseline fallbacks and actual team/preview delivery in addition to
+ completed outcomes. A source fix, browser repair or model change during a
+ segment should not silently become a strategic gain.
+ \item \textbf{Beliefs and state remain approximate.}
+ Usage marginals omit correlations among moves, items, spreads and teammates.
+ Speed constraints and public facts help but do not make a calibrated
+ posterior. Mega forcing, omitted opponent PP, incomplete history restoration,
+ unseeded duration draws and determinized continuation decisions remain
+ limitations. Correlated-set beliefs and information-consistent continuation
+ policies are research candidates requiring fresh tests, not established fixes.
+ \item \textbf{Compute is a means, not a result.}
+ The M5 accelerates fitting, but CPU simulator evaluation dominates campaign
+ time. C6 did not validate spending more compute on the same estimator, and
+ C10's screening efficiency did not make its combined endgame candidate win.
+ Further hardware optimization should preserve the evaluated policy and
+ report simulation cost, latency, legality and strength separately.
 \end{enumerate}
 
-The system has no theorem of equilibrium convergence, optimal team
-construction, belief recovery or monotone improvement. Its rigour lies in
-stating each implemented contract and each proof assumption explicitly, so
-that every new empirical claim can be tested against a defined system.
+The software's strongest achievement is an auditable loop from a recorded
+failure to a fixed candidate, frozen inputs, persistent evaluation and an
+explicit deployment decision. Its scientific achievement at this cutoff is
+narrower and concrete: a team change beat the prior team in a controlled live
+comparison after many plausible search changes did not. The remaining task is
+to turn more accurate models and better search objectives into similarly
+measured improvements, without rewriting negative results as successes.

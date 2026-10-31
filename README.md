@@ -12,9 +12,9 @@ recommendations. [Setup and OpenClaw workflow](docs/ml.md) ·
 See [validation and the initial learning experiment](docs/ml-validation.md).
 
 [Technical paper (PDF)](docs/paper/main.pdf) · [LaTeX source and build instructions](docs/paper/README.md):
-the system, the data recorded per match, CPU/MPS training, the paired promotion
-test, decision-time search and all recorded evidence, with proofs that state
-their assumptions.
+third edition (31 October 2026), covering model and software development through
+C1–C14, the controlled C13 team gain, CPU/MPS training, simulator search and
+experiment statistics, with proofs that state their assumptions.
 
 Always-on use: [OpenClaw decision/team workflow](docs/agent-workflow.md) ·
 [Resource-aware CPU/MPS training and daily feeds](docs/continuous-learning.md) ·

@@ -1,0 +1,196 @@
+\section{Software and compute: making experiments survive real play}
+\label{sec:engineering}
+
+The campaigns depended on software work that is distinct from strategic
+strength. A faithful reconstruction, a successful model fit and a reliable
+browser submitter each remove a failure mode; none alone demonstrates an
+Elo gain. This section records those changes and their measured scope.
+
+\subsection{Search traces, per-team data and live priority}
+The actor's SQLite episode is no longer the only data path. Search decisions
+retain the private request, choice, sampled-search trace, timing and
+configuration in append-only per-run JSONL. Completed games are reconstructed
+into labelled positions for value learning and grouped by exact team
+fingerprint. Per-team stores separate games, live positions, self-play,
+value candidates, screening labels, gate results and promoted pointers. This
+prevents a new team's examples from silently being treated as the previous
+team's distribution. Content checksums protect engine-readable model files;
+a missing or invalid pointer falls back to the hand evaluator or probe screen.
+
+The value service can ingest in a live-only role while producers, training
+and promotion remain idle. Repeated new games therefore grow a dataset
+without necessarily changing the deployed policy. The old PPO supervisor is
+paused during the search campaigns. There is no claim that the current
+player updates its strategy after every match.
+
+CPU contention was more consequential than GPU utilization. At ordinary
+background QoS, concurrent work raised median live inference from roughly
+2.3 to 10 seconds. macOS background QoS restored live responsiveness but
+starved the simulations. The implemented alternative registers offline
+process groups and pauses them around live search with SIGSTOP/SIGCONT,
+letting them use ordinary scheduling while the human opponent thinks. A
+stale pause marker is recovered after a crashed player. Later compute-priority
+coordination also accounts for shared workstation workloads; it does not
+control unrelated user applications. Campaign resource overrides permitting
+RAM and swap do not make CPU interference free.
+
+\source{\code{search/team_data.py}, \code{search/value_store.py},
+\code{search/value_service.py}, \code{ml/cluster.py};
+\code{docs/value-learning.md}, \code{docs/model-storage.md}.}
+
+\subsection{MPS is faster at fitting, not at JavaScript simulation}
+A learned screen scores joint actions before the expensive probe and matrix
+simulations. It uses the 146-position plus 70-action inputs and a two-hidden-
+layer 128-unit MLP, trained on within-world standardized probe scores. The
+objective imitates the existing ranking, so low fitting loss is primarily an
+efficiency opportunity. Both game-grouped validation and a newest-30\%
+chronological test constrain retained actions, final-choice survival and
+simulation savings. Test failures reject the fixed prefilter rather than
+retuning its size against the test.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{.43\linewidth} X}
+\toprule
+Workload / diagnostic & Measurement and limit \\
+\midrule
+M5 screening optimizer, batch 4096 & CPU 1.230 ms/step, MPS .565 ms/step;
+2.18$\times$ fitting throughput. Synchronized timing; not a whole-player speedup. \\
+1,000-game screening pilot & 777,435 action examples; 1.42 s, 7 epochs.
+Chronological final-choice retention 98.78\%; estimated saving 15.10\%. \\
+Twelve matched held-out positions & 78.15 to 60.29 s total search time
+($-22.9\%$); 67,174 to 54,890 simulations ($-18.3\%$); 9/12 identical
+choices, no fallback. Small shared-host sample. \\
+C10 fixed learned-screen/endgame bundle & 1,186,801 action rows from 1,500
+games; fit in 8.1 s; predictive checks passed but strength gate did not. \\
+C11 six versus eight engines & Pause-adjusted .642 versus .653
+positions/s: six within 1.7\%, with 25\% fewer workers. Not an isolated
+silicon maximum or full-game throughput comparison. \\
+\bottomrule
+\end{tabularx}
+\caption{Hardware and screening measurements. Faster fitting or fewer
+simulations is not evidence of more wins. The pinned simulator remains CPU
+JavaScript; no GPU simulator was implemented.}
+\label{tab:modern-compute}
+\end{table}
+
+The original screening-only gate required point-estimate non-inferiority
+and at least 20\% measured simulation saving. It was not an error-controlled
+non-inferiority test with a declared margin. C10's combined screen/endgame
+protocol instead required superiority in wins for its fixed bundle, after
+at least 15\% predicted savings. This is a different preregistered question,
+not a retrospective claim that the earlier screening gate passed.
+Training takes seconds; evaluation takes hours or days. The GPU's idle time
+is therefore not evidence that more epochs would remove the strategy plateau.
+
+\source{\code{search/screenfeat.cjs}, \code{search/train_screen.py},
+\code{search/compute_bench.py}; \code{docs/learned-screening.md},
+\code{docs/m5-pipeline-review.md}, \code{docs/c10-m5-campaign.md},
+\code{docs/c11-reconstruction-and-preview.md}.}
+
+\subsection{Mechanics and reconstruction repairs}
+An official simulator is exact about the state supplied to it. It cannot
+repair a tracker that supplies a different game. The following repairs
+therefore belong to the software history, including failures first listed
+in the second edition's appendix.
+\begin{itemize}
+ \item \textbf{Enumeration and targeting.} Opposing double-Mega worlds now
+ enumerate Mega and non-Mega variants before applying the one-Mega limit.
+ Harmful ally-targeted status moves such as Parting Shot are pruned alongside
+ damaging ally moves. Struggle rebuilds an exhausted moveset rather than
+ feeding an impossible ordinary move into the simulator.
+ \item \textbf{Identity and slots.} Ally Switch swaps the tracked actives.
+ Illusion's \code{|replace|} is accepted without an HP field, transfers
+ observations to the revealed identity, and restores previously known facts
+ about the disguise. A switched-in healthy disguise no longer retains the
+ illusion user's faint flag. Regression positions reproduced an all-worlds
+ failure that formerly fell back to the first legal action.
+ \item \textbf{Counters and pseudo-moves.} Failed Protect resets the chain.
+ Public \code{-mustrecharge}, its consumption, and authoritative private
+ Recharge requests restore the volatile; the targetless pseudo-move retains
+ its request slot rather than undergoing ordinary name-based targeting.
+ \item \textbf{Species and beliefs.} Forme aliases repair Floette-Eternal's
+ Mega prior and own-set lookup. Equal-priority move order constrains sampled
+ Speed, subject to explicit ambiguity exclusions.
+ \item \textbf{Trace and chance integrity.} Preview/single-choice decisions
+ clear the preceding trace. CRN matches chance streams across our matrix
+ rows. C12 completion caches the original serialized world, including sampled
+ sleep/confusion counters; regenerating missing cells from a new root would
+ resample those counters and compare different games.
+\end{itemize}
+Sleep/confusion reconstruction still calls \code{Math.random} on the ordinary
+build path. C12 preserves the sampled counters inside its cached roots; this
+does not make all ordinary reconstructions reproducible from the exposed
+search seed. Opponent PP and some history-dependent state remain incomplete.
+Those residual limits are retained in Appendix~\ref{app:defects}.
+
+\source{\code{search/tracker.py}, \code{search/agent.py},
+\code{search/engine.cjs}, \code{search/priors.py}, \code{search/speed.py};
+commits \code{b12314c}, \code{4fb2e91}, \code{cc32075}, \code{58bc518}.}
+
+\subsection{Transport reliability changes the experiment actually played}
+The answered-request cache originally omitted the room. Identical preview
+or opening requests in a new game could look answered. The player stalled
+until its fallback submitted the third-ranked preview. This affected 231 of
+634 audited C4 games (36\%); they won 47.6\% versus 52.1\% for the others,
+a descriptive association rather than a randomized bug-effect estimate.
+Commit \code{4b2800f} scoped the key to the room. That fix shipped with C5,
+which is why the later segment cannot assign the whole observed rise to
+search alone.
+
+Team A/B added another transport state: which exact teams had already been
+imported into the browser session. Remembering every imported team avoids
+re-importing from an incompatible teambuilder view on the next arm switch.
+The per-game override is validated before use; unavailable teams or preview
+assets fall back to the baseline and emit an explicit \code{ab_error}.
+Such events must be audited as treatment-delivery failures rather than
+quietly presented as successful treatment games.
+
+A browser page then froze during C13. All page evaluations hung, so the
+180-second stall check in the same asynchronous loop never ran. The fix is
+an independent thread probing the page every 60 seconds; after 300 seconds
+without response it exits with code 75 and launchd restarts the player.
+An account lock and active-room resume prevent a second controller from
+starting another account session. This bounds a class of hung-page failures;
+it does not recover every server disconnect or guarantee no timer loss.
+
+The final team-setting handover also exposed a configuration-editing trap:
+array replacement in a plist inserted an extra argument, causing a brief
+startup failure. The corrected argument array was reloaded. Operational
+handover, browser caching and model selection are distinct layers; each can
+invalidate an otherwise correct strategic comparison if not logged.
+
+\source{\code{scripts/browser_play.py}, \code{ml/browser.py}; commits
+\code{4b2800f}, \code{a459c01}, \code{f22fa2c};
+\code{docs/c13-team-ladder.md}.}
+
+\subsection{Pinned deployment and durable stopping decisions}
+The player runs from a pinned live worktree, and each offline campaign uses
+its own pinned source with frozen assets. Editing the development checkout
+therefore does not mutate a game in progress or a running gate. Deployment
+tests the proposed source, scans its public contents, selects the pinned
+revision and requests a graceful restart at a game boundary. Model and
+experiment changes are likewise adopted between games. Changing a launchd
+plist requires unloading and bootstrapping it; merely restarting a loaded
+job does not reload its configuration.
+
+Persistent supervisors hash inputs, take locks, adopt existing worker PIDs
+or resume original ledgers, and retry interrupted games on their original
+seeds. Three exhausted attempts stop scheduling for inspection. An active
+experiment cannot be overwritten by another campaign. A live H1 permits only
+the exact options tested; merging multiple offline winners requires its own
+combined live arm rather than assuming their effects add.
+
+The gate scheduler once checked futility before acquiring a concurrency
+slot. Every queued coroutine passed before any results arrived, so a
+100-pair panel could decide at 40 yet run all 200 games. Checking again after
+slot acquisition cut the serial reproduction to 80 games; concurrency four
+can finish at most three additional games. The first stopping decision is
+latched. Later rows are kept as \code{post_decision} and excluded from the
+result, including after resume. This saves compute while preserving the
+original scientific decision.
+
+\source{\code{scripts/live_deploy.py}, \code{scripts/auto_promote.py},
+\code{scripts/campaign_service.py}, \code{search/campaign.py},
+\code{search/value_gate.py}, \code{scripts/ab_watch.py},
+\code{scripts/team_ladder.py}; \code{docs/m5-pipeline-review.md}.}

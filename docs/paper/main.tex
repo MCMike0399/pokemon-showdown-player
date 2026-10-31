@@ -55,6 +55,12 @@
 \newcommand{\KL}{D_{\mathrm{KL}}}
 \newcommand{\Bin}{\operatorname{Bin}}
 \newcommand{\code}[1]{\texttt{\detokenize{#1}}}
+\newcommand{\historyscope}{\par\smallskip\noindent
+\textcolor{accent}{\textbf{Historical baseline (7--9 October).}}
+This section preserves the implemented actor-era design and its dated
+measurements. The PPO service is paused in the current search player;
+Sections~\ref{sec:campaigns}--\ref{sec:engineering} describe the later
+models, experiments and deployment.\par\smallskip}
 \newcommand{\intuition}[1]{\par\smallskip\noindent\textcolor{accent}{\textbf{Interpretation.}} #1\par\smallskip}
 \newcommand{\source}[1]{\par\smallskip\begingroup\small\raggedright
   \noindent\textcolor{ink}{\textbf{Implementation:}} #1\par\endgroup\smallskip}
@@ -75,37 +81,42 @@
 
 \title{\textcolor{ink}{Learning, Search and Evidence in a\\
   Pok\'{e}mon Showdown VGC Agent}\\[0.6em]
-  \large Architecture, Data, Training on CPU and Apple~MPS, Decision-Time Search,\\
-  and the Mathematics Behind Each Claim}
+  \large From Policy Learning to Simulator Search and Live Ladder Experiments:\\
+  Fourteen Campaigns, Software Reliability, and a Measured Team Breakthrough}
 \author{\texttt{pokemon-showdown-player}\\\small Technical report grounded in the repository implementation}
-\date{9 October 2026 (second edition; first edition 7 October 2026)\\
-  \small Public source snapshot: \texttt{0c00ec2}; simulator pin \texttt{c046106}; feature schema 1}
+\date{31 October 2026 (third edition)\\
+  \small Implementation snapshot: \texttt{bee08dc}; simulator pin \texttt{c046106}\\
+  Evidence cutoff: 31 October 2026, 16:28 UTC}
 
 \begin{document}
 \maketitle
 \begin{abstract}
-This report describes a complete system for playing the Champions VGC 2026
-Regulation~M-C doubles format on Pok\'{e}mon Showdown, and it audits the
-mathematics behind each component. Turn decisions are made by a
-\emph{determinized simultaneous-move search} run in the official simulator,
-over opponent sets sampled from ladder usage statistics. A compact
-action-conditioned actor--critic chooses team previews and generates all
-training data. A Playwright browser transport clicks the decisions into the
-real client. A supervisor schedules three bounded lanes on one Apple~M5
-laptop: CPU self-play collection, PPO learning on the Metal (MPS) GPU, and
-paired CPU evaluation. A candidate is promoted only after an exact paired sign
-test and a set of integrity checks.
+This report follows a complete autonomous player for the Champions VGC 2026
+Regulation~M-C doubles ladder from an action-conditioned PPO actor to
+determinized simultaneous-move search in the official simulator. A local
+Apple~M5 runs the search, MPS model fitting, campaign evaluation, recording and
+a Playwright transport; no language model chooses live turns. Learned
+opponent and preview models use public replays, while private requests and
+search traces support reproducible diagnosis. We retain the actor--critic,
+GAE/PPO derivations and earlier evidence as an explicitly dated development
+history, then extend the account through campaigns C1--C14.
 
-We give the exact network, the strategic prior and its temperature, the
-per-decision record kept for every match, the PPO loss and its KL stop, the
-resource and promotion rules, and the search algorithm. Thirty-one
-propositions, theorems and lemmas state their assumptions and are proved.
-Eight worked examples recompute the implemented numbers. A new evidence chapter reports the paired
-offline result (search 30/45 against the learned policy's 19/45, McNemar
-$p=0.0064$), the live record before and after search, and a negative-results
-ledger of more than thirty rejected candidates. This edition also corrects the
-first: it records stale claims, a circular proposition and an unstated
-temperature, and it documents implementation defects found during review.
+The central result is the difference between better predictions, better
+surrogate-game solutions and stronger ladder play. Sixty-one value candidates,
+additional search compute, improved opponent predictions, scouting, a live
+factorial experiment and a shared Bayesian root solver did not establish a
+further live gain. C13 instead changed the team while holding the search and
+preview fixed. Its randomized ladder comparison accepted the challenger after
+897 games: 249/448 wins versus 210/449, an estimated +61.9 Elo on the
+implemented score-difference scale, with a normal-approximation sequential
+log-likelihood ratio of 3.054 above the 2.890 boundary. The subsequent
+455-game champion cohort has performance rating $1344\pm33$ (descriptive
+approximate 95\% interval), compared with the earlier rain plateau near
+1200--1300. This is evidence for the team--pilot combination, not a learned
+turn-policy breakthrough. C14 tests a different preview on that team and is
+unresolved at the cutoff. The report specifies stopping rules, a documented
+C5 promotion amendment, reconstruction and transport repairs, hardware
+measurements, and the remaining statistical and information-set limitations.
 \end{abstract}
 
 \vspace{0.5em}
@@ -132,6 +143,9 @@ regret matching, PPO, action masking, Apple MPS, paired sign test, Elo.
 \input{sec-12-transport}
 \input{sec-13-scout-teams}
 \input{sec-14-evidence}
+\input{sec-16-campaigns}
+\input{sec-17-experiments}
+\input{sec-18-engineering}
 \input{sec-15-limitations}
 
 \appendix

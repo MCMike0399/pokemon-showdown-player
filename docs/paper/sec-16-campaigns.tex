@@ -1,0 +1,357 @@
+\section{Fourteen campaigns: from prediction to playing strength}
+\label{sec:campaigns}
+
+The campaign ledger extends the early evidence through 31 October. A campaign
+is a fixed research question and protocol, not necessarily a model training
+run. Some fit networks, some change simulator search, and some only compare
+fixed alternatives on the ladder. Table~\ref{tab:campaign-ledger} records the
+outcomes; the following subsections explain the mechanisms and the lessons.
+The notation $g/\ell$ denotes discordant gains and losses, never the candidate's
+ordinary win--loss record.
+
+\begin{small}
+\begin{longtable}{>{\raggedright\arraybackslash}p{.10\linewidth}
+  >{\raggedright\arraybackslash}p{.34\linewidth}
+  >{\raggedright\arraybackslash}p{.47\linewidth}}
+\caption{Campaign ledger. C11 names the reconstruction and preview-development
+work, not a successful strength gate. C14 is ongoing.}\label{tab:campaign-ledger}\\
+\toprule Campaign & Fixed question / candidate & Recorded outcome \\
+\midrule\endfirsthead
+\toprule Campaign & Fixed question / candidate & Recorded outcome \\
+\midrule\endhead
+C1 & Learned leaf values from live outcomes and self-play & No promotion.
+Six earlier development gates totalled $58/71$; final candidate improved
+held-out log loss but its interrupted gates were inconclusive. \\
+C2 & Selective depth two and sibling action rankings & Depth: $53/43$ over
+394 completed pairs, 6 void, $p=.1792$; no confirmation. No clear superiority
+among 61 stored value nets on sibling rankings. \\
+C3 & Learned human opponent inside search & Development $2/9$ at 70 pairs,
+futility; confirmation ledger $11/10$ at 73, stopped. Rejected. \\
+C4 & Human preview imitation; matchup-value preview & Imitation $86/61$ then
+$5/7$, rejected. Value $81/52$ then $87/62$, both significant; deployed. \\
+C5 & Sigmoid leaf, selective Protect continuation, speed inference & Full
+bundle $44/23$ dev, $52/38$ confirm, $29/17$ standard. Confirm missed;
+promoted by a documented post-results amendment, with a live rollback rule. \\
+C6 & Twelve worlds; wider 36-by-32 screen & $42/39$ and $37/38$ respectively;
+neither passed. Existing compute budget retained. \\
+C7 & Evaluation/depth/bench bundle; larger preview ensemble & PLAY $45/52$,
+PREVIEW $61/88$; neither promoted. \\
+C8 & Public-history scouting with simulated coverage & $17/14$, insufficient
+for promotion. \\
+C9 & Live $2^4$ factorial: Protect, boosts, bench, scouting & All four factors
+H0 under their normal-approximation sequential tests. Final boost decision
+at 1,581 randomized games, estimated +1.3 Elo. \\
+C10 & Bounded preview guard; learned screening plus endgame depth & Preview
+$8/10$, futility at 400 pairs. Combined search $108/106$ over 785 completed
+pairs, 15 void, $p=.47276$. Neither qualified for live confirmation. \\
+C11 & Illusion/Recharge repairs; MPS preview residual & Correctness repairs
+shipped; residual failed predictive holdout, so no strength gate. \\
+C12 & Shared belief-game root policy and bounded exploitation & $46/59$,
+400 pairs, $p=.91422$, futility. No live test. \\
+C13 & Two tournament-derived teams under the same pilot & Helm H0 at 302
+games; Mev H1 at 897, +61.9 Elo estimate. Mev becomes champion. \\
+C14 & Human-imitation preview versus pvalue on Mev & Active; 9 completed
+games at the frozen cutoff. No strength conclusion. \\
+\bottomrule
+\end{longtable}
+\end{small}
+
+\subsection{C1--C2: outcome prediction is not counterfactual ranking}
+The first search-learning loop finally trained a component used by turn
+search rather than a sampled actor used only in a separate self-play system.
+Completed live ledgers were reconstructed into positions and labelled with
+verified results; CPU self-play added omniscient examples. The MPS trainer
+split by game, calibrated on older live games and reserved the newest 40\%
+as a test. Five-seed ensembles reduced fitting variance and were distilled
+into an engine-readable network.
+
+The strongest reported C1 candidate improved live-test log loss from .538
+to .497 and AUC from .793 to .831. Yet its development $12/11$ and
+confirmation $9/5$ ledgers were stopped without a pass. Earlier gates
+aggregated $58/71$. The live policy therefore stayed on the hand evaluation
+through the 1,018-game review. Fitting who eventually won does not identify
+which alternative action would have caused a better outcome.
+
+Calibration put learned values on the hand evaluation's scale. If
+$\Prob(\mathrm{win}\mid h)=\sigma(ah+b)$ and the network emits logit $z$
+with live temperature $T$, the converted score was
+$u=(z/T-b)/a$, clipped to $[-20,20]$, and the blend was
+$(1-\beta)h+\beta u$. This avoids silently changing the units of opponent
+softmax temperatures or missing-world penalties. It does not remove the
+observational nature of the labels.
+
+C2 addressed ranking directly. Sibling groups held the reply and chance
+stream fixed while changing one side's action and playing out the remainder.
+Of 6,400 groups, 2,629 had unequal outcomes and informed the metric. Hand
+pair accuracy was .6498; the best of 61 nets reached .6553, difference .0055
+with a group-bootstrap interval $[-.0029,.0134]$, without adjustment for
+selecting that net. The metric agreed with only 8 of 15 historical gate
+orderings (Spearman $-.029$). It was not validated as a promotion shortcut.
+Selective second-turn search separately failed at $53/43$, despite 47.48\%
+more simulations per decision. Pseudo-move errors voided six pairs; even
+counting all six as gains would not have passed the fixed test.
+
+\source{\code{docs/value-learning.md}; \code{search/train_value.py},
+\code{search/sibling_metric.py}, \code{search/ledger_positions.py},
+\code{search/selfplay.cjs}, \code{search/value_gate.py}.}
+
+\subsection{C3--C4: learn what ladder opponents actually do}
+The original gate opponent was search piloting real teams. Real team sets
+did not make its decisions human. Public replays supported a separate
+imitation opponent and new preview models. About 150,000 replay games were
+collected; the first move and preview fits used about 10,600 and 12,600
+respectively. Later analyses used filtered, rated subsets rather than a
+single universal corpus count.
+
+For a legal joint-action set $\A$, the move model assigns logits
+$f_\psi(h,a)$. An executed public log can leave one slot's intended move
+unknown after a flinch or knockout. With consistent label set
+$C\subseteq\A$, the loss is
+\begin{equation}
+  -\log\sum_{a\in C}\frac{e^{f_\psi(h,a)}}{\sum_{u\in\A}e^{f_\psi(h,u)}}.
+  \label{eq:human-marginal}
+\end{equation}
+About 19\% of labels needed this marginalization. Inputs combine 146
+position features, 70 joint-action features and move/species embeddings.
+Whole games stay within one split. Reveals later in the replay can recover
+facts about the acting player's own sets for retrospective training; they
+are not facts available to our live opponent model at that earlier turn.
+
+The preview imitation is listwise over 90 plans:
+$\binom62\binom42=90$, treating both leads and bench as unordered pairs.
+The transport maps the selected plan back into a legal ordered preview.
+This differs from the actor's 180 ordered-lead classes in
+Proposition~\ref{prop:preview}. A separate matchup-value classifier learns
+$P(\mathrm{win}\mid\text{own six},\text{opposing six},\text{plan})$ from
+human outcomes; it is an observational predictor, not an identified causal
+value for all unplayed plans.
+
+On 957 identifiable live opponent actions, the deployed equilibrium/greedy
+model achieved top-1 .176 and NLL 3.70; the .8-human/.2-deployed mixture
+achieved .264 and 2.82. C3 nevertheless failed its gate. C4's imitation
+preview passed development and failed fresh confirmation. The value preview
+passed both ($81/52$, then $87/62$) and was deployed on 14 October. Its early
+live segment was $1236\pm28$ over 635 games versus the preceding
+$1206\pm19$ over 1,325. That chronological comparison suggests a modest
+improvement but is not randomized evidence for the preview alone.
+
+\source{\code{docs/human-opponent.md}; \code{search/human/extract.py},
+\code{search/human/train_policy.py}, \code{search/human/preview_model.py},
+\code{search/human/preview_value.py}, \code{search/human/imitation.py}.}
+
+\subsection{C5--C8: risk attitude, horizon and an imperfect gate}
+C5 diagnosed a horizon effect: Protect preserves material for a leaf even
+when the next turn remains lost. A live logistic calibration over 12,896
+positions gave $P(\mathrm{win})=\sigma(.801h-.430)$. The deployed leaf became
+\begin{equation}
+  L(h)=\frac4{.801}\,\sigma(.801h-.430).
+  \label{eq:sigmoid-leaf}
+\end{equation}
+Although monotone in $h$, the transformation changes decisions when values
+are averaged over stochastic outcomes. Its convex region below the sigmoid
+midpoint can favour an uncertain escape over certain slow defeat; its concave
+region above it can favour preserving a win. The empirical calibration is
+not a guarantee that every counterfactual leaf is a true win probability.
+A second turn re-evaluates the best Protect and non-Protect lines when the
+world's material value is below $-1$. Speed-order observations constrain
+usage draws, with exclusions for priority ambiguity and mid-turn Speed changes.
+The equilibrium weight was changed from .5 to .25 as part of the bundle.
+
+\paragraph{The amendment must remain visible.}
+Leaf-only failed ($36/32$). The full bundle passed development
+($44/23$, $p\approx.007$), missed confirmation ($52/38$, $p\approx.085$),
+and showed no significant harm against standard search ($29/17$).
+The original automatic promoter declined. After the stages finished,
+amendment~1 pooled confirmation with the different standard-opponent stage
+($81/55$, nominal $p\approx.016$) and promoted anyway. This was a deliberate
+post-results exception, not a pass of the original preregistered rule.
+A prospective live rule required at least 300 games and rollback below the
+C4 performance segment. C5 cleared it; the eventual segment was
+$1287\pm21$ over 1,169 games. A room-scoping browser repair shipped in the
+same deployment, so the segment cannot isolate the search bundle's effect.
+
+C6 enlarged worlds and screening separately; neither passed. This rejects
+those fixed candidates under their gate, not the general importance of
+sampling noise. C7 combined boost/Speed/evasion/weather valuation, broader
+Protect continuation, endgame depth, Mega avoidance and a corpus back-pair
+prior. PLAY failed $45/52$; the larger preview ensemble failed $61/88$.
+C8's public-history scouting achieved high item precision in diagnostics but
+only $17/14$ in its gate. None of those options became the default.
+
+The gate itself was then audited. Its argmax imitation Protected on 29\% of
+actions versus about 12\% for ladder humans, switched about 2.8\% versus
+8.4\%, and lost to our search roughly three quarters of the time. Requiring
+two significant stages with repeated early futility made modest gains hard
+to detect. Better predictions and changed move frequencies were useful
+candidate-development evidence, but inadequate substitutes for target-domain
+wins. C9 moved the experiment onto the ladder.
+
+\source{\code{docs/endgame-search.md}, \code{docs/thinking-budget.md},
+\code{docs/c7-live-review.md}, \code{docs/c9-live-ab.md};
+\code{search/speed.py}, \code{search/scout.py}, \code{search/config.py}.}
+
+\subsection{C9--C11: direct experimentation and focused candidates}
+C9 randomized four binary factors in balanced 16-game blocks. Wider Protect
+continuation, boost/Speed/evasion terms, a back-rate bench prior and online
+scouting each had a 0-versus-+40-Elo sequential comparison. Every factor
+stopped at H0 (Table~\ref{tab:c9-final}). The early boost estimate of +19 Elo
+at 1,223 games shrank to +1.3 at its 1,581-game stopping decision. H0 here
+chooses zero over the specified +40 alternative; it does not establish
+exactly zero effect, harmfulness or equivalence. The completed campaign
+ledger contains 1,582 games because a result arrived after the stopping
+snapshot. Decisions must use the saved first decision, not a later summary.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrr}
+\toprule
+C9 factor & Randomized games & Score on / off & Elo estimate & LLR \\
+\midrule
+Protect & 431 & .4769 / .5395 & $-43.8$ & $-2.252$ \\
+Boosts & 1,581 & .5006 / .4987 & $+1.3$ & $-2.423$ \\
+Bench & 397 & .4750 / .5533 & $-54.9$ & $-2.429$ \\
+Scouting & 752 & .4880 / .5199 & $-22.2$ & $-2.606$ \\
+\bottomrule
+\end{tabular}
+\caption{C9 immutable stopping receipts. All crossed the H0 boundary
+$-2.251$. Main effects use only the games while that factor was randomized;
+frozen later games do not enlarge its sample. Estimates are descriptive.}
+\label{tab:c9-final}
+\end{table}
+
+C10 froze two narrower candidates and used a pooled 800-pair offline rule,
+with only rejection looks at 400 and 600 and one final significance test.
+The preview guard penalized Intimidate leads in selected opposing matchups
+only among plans within .025 of the incumbent's top probability. It stopped
+at $8/10$ over 400 pairs. The combined screening/endgame candidate trained
+on 1,500 baseline games (1,186,801 action rows); MPS fitting took 8.1 seconds.
+Its held-out final-choice retention was 99.11\% and estimated simulation
+saving 15.12\%. Those engineering metrics qualified the fixed bundle for a
+strength test, which ended $108/106$, $p=.47276$, over 785 completed and
+15 void pairs. Neither candidate reached the required fresh live test.
+
+C11 repaired Illusion and Recharge reconstruction and explored a bounded
+preview-logit residual. Its 8,868 examples were split chronologically
+70/15/15 by whole game. A 32-unit residual, capped at $\pm.35$ logits,
+trained in 1.53 seconds on MPS. Validation improvement .001055 missed the
+required .002, and test log loss worsened from .647704 to .648898. The
+candidate remained disabled rather than tuning against the failed test set.
+Repairs and scheduling improvements are discussed in
+Section~\ref{sec:engineering}; they are not claimed as measured Elo gains.
+
+\source{\code{docs/c9-progress-review.md}, \code{docs/c10-m5-campaign.md},
+\code{docs/c11-reconstruction-and-preview.md}; \code{search/ab_test.py},
+\code{search/campaign.py}, \code{search/train_preview_residual.py}.}
+
+\subsection{C12: a shared Bayesian root strategy}
+\label{sec:belief-root}
+The baseline commits to one root action, but it solves hidden worlds
+separately and averages an action only across screens that retained it.
+This is selection-dependent coverage: an action worth 1 in its only retained
+world and 0 in five omitted worlds receives $1-.5=.5$, beating an action
+worth .4 everywhere, although its full-world mean is only $1/6$.
+Replacing this rule requires completing comparable rows, not filling missing
+payoffs with guessed constants.
+
+C12 nominated up to 24 actions, completed each against every retained reply
+in every successful world, and reused the original serialized states and
+chance streams. For posterior weights $p_w$ and complete matrices $M_w$,
+it solved the one-sided private-type game
+\begin{equation}
+  V^*=\max_{x\in\Delta(\A)}V(x),\qquad
+  V(x)=\sum_w p_w\min_{b\in\B_w}\sum_a x_a M_w[a,b].
+  \label{eq:belief-root}
+\end{equation}
+One $x$ commits our joint action across worlds; the opponent may respond to
+its own private type. Averaging matrices before taking the minimum would
+erase that information advantage. The implementation uses equal weights,
+nonnegative cumulative regrets, linearly weighted averages, and a recorded
+primal--dual gap
+\begin{equation}
+  G=\max_a\sum_w p_w(M_w\bar y_w)_a
+       -\sum_w p_w\min_b(\bar x^\top M_w)_b.
+\end{equation}
+
+\begin{proposition}[Scope of a shared-root certificate]
+For any complete finite matrices and probability vectors $\bar x,\bar y_w$,
+$V(\bar x)\le V^*\le U$, where
+$U=\max_a\sum_wp_w(M_w\bar y_w)_a$. Thus $G=U-V(\bar x)$ bounds the
+suboptimality of $\bar x$ in this sampled game.
+\end{proposition}
+\begin{proof}
+The first inequality follows by maximization over $x$. For any $x$, each
+minimum over replies is at most the expectation under $\bar y_w$, so
+$V(x)\le\sum_wp_wx^\top M_w\bar y_w\le U$. Maximize over $x$.
+\end{proof}
+
+Bounded exploitation moved along the line from $\bar x$ toward a pure best
+response to the existing opponent prior, choosing the largest movement with
+$V(x)\ge V(\bar x)-.1$. Concavity of $V$ makes the feasible portion of this
+line an interval, permitting bisection. This is a restricted line search,
+not the full constrained optimal-exploitation solution. The principle of
+trading model exploitation against worst-case robustness has antecedents in
+restricted Nash responses \citep{rnash2007}. A separate RNG sampled the
+entire joint action, retained across submission retries. Existing selective
+deeper estimates replaced their actual matrix cells before the shared solve;
+other cells remained one-turn leaves. This fixed bundle changed both coverage
+and the old scalar correction, so it was not an isolated test of randomization.
+
+On 48 frozen positions the diagnostic gaps were all below .01 (median
+.00798), and the extra simulations were 13.4\%. Twelve fresh adaptive
+contexts had legal choices and no root fallback; median latency rose from
+5.18 to 6.26 seconds. These were engineering checks. The frozen strength
+panel rotated incumbent search, argmax imitation and sampled imitation,
+using both sides. It stopped at 400 pairs with $46/59$, $p=.91422$,
+14.29\% more simulations per decision, and no live confirmation.
+
+The negative result does not contradict the certificate. The guarantee
+concerns sampled types, retained replies and approximate leaf payoffs.
+Opponent sets are imperfect, the opponent is effectively informed about
+our set, and deeper continuations can still depend on determinized hidden
+information. Depth-limited imperfect-information solving generally needs
+richer continuation constraints than one scalar full-state value
+\citep{brown2018depth}. C12 improved the definition and solution of the
+surrogate root game without establishing stronger play in the target game.
+
+\source{\code{docs/game-theory-research.md},
+\code{docs/competitive-review-20261024.md}, \code{docs/c12-belief-game.md};
+\code{search/belief.cjs}, \code{search/agent.py}, \code{search/engine.cjs}.}
+
+\subsection{C13--C14: change the team, then test its preview}
+C13 reconsidered the fixed team after search campaigns had not broken the
+plateau. Human corpus estimates were weighted equally by player to avoid
+letting prolific strong accounts dominate team rankings. The 111,564 rated
+games / 197,708 eligible sides showed wide team-effect intervals, not a
+proven universally superior six. Live matchup audits suggested weaknesses
+against Fairy attackers and Competitive/Defiant teams. Those exploratory
+patterns motivated candidates; their estimated deficits were not added up
+as a forecast of a team's improvement.
+
+The tournament-derived Helm rain candidate retained much of the Recife core,
+adding Gengar and Rillaboom; Mev combined Pelipper rain and Charizard-Y sun
+with Archaludon, Grimmsnarl, Venusaur and Garchomp. Imported moves, items,
+abilities and natures followed the attributed sheets; hidden stat points
+used modal usage spreads. This distinction matters: an attributed team
+archetype is not a claim to know the tournament player's exact hidden stats.
+Both candidates passed simulator validation. The randomized king-of-the-hill
+comparison is reported in Section~\ref{sec:live-method}.
+
+After Mev won, its preview still used Archaludon and Grimmsnarl in every
+recorded plan, Charizard in 95\%, Pelipper in 87\%, Garchomp in 16\% and
+Venusaur in 3\% of the 885-game diagnostic. The same four occurred in 83\%.
+In 1,046 public games from 298 players with the exact six, Venusaur was seen
+in 42\% and Garchomp in 53\%. Public appearance is a lower bound on being
+brought; it is not an exact counterpart of the bot's private preview record.
+Nevertheless, Venusaur's absence identifies a plausible unused sun mode.
+
+C14 fixes Mev and the turn search, comparing pvalue with
+\code{preview-1455f4a55d18112a:argmax}. On the same 885 opposing previews,
+that imitation would bring Venusaur in 63\% and lead Charizard--Venusaur in
+558 games. This is a counterfactual plan-frequency diagnostic, not a
+counterfactual win estimate. The experiment began on 31 October with the
+same 0/+40-Elo, 300--3,000-game rule. At the paper cutoff only nine games
+had finished: no decision is permitted, and no improvement is claimed.
+
+\source{\code{docs/c13-team-ladder.md}, \code{docs/c14-preview.md};
+\code{search/human/team_effects.py}, \code{scripts/team_ladder.py},
+\code{evidence-20261031.json}.}

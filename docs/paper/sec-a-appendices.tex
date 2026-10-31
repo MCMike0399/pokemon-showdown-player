@@ -7,7 +7,7 @@ $s_t$, $h_t$ & Latent simulator state; information available before decision $t$
 $r$, $\A(r)$ & A Showdown request and its request-visible candidate choices. \\
 $x_t$, $z_a$ & State vector in $\R^{384}$; action vector in $\R^{192}$. \\
 $q_0$, $f_\theta$, $\ell_\theta$ & Prior (last action coordinate), learned residual, full logit. \\
-$\tau$ & Policy temperature; 0.25 for turns and previews in the deployed checkpoint. \\
+$\tau$ & Policy temperature; 0.25 in the historical actor checkpoint; current preview models are separate. \\
 $\pi_\theta$, $V_\theta$ & Tempered masked policy; critic. \\
 $s(a)$, $\kappa$, $g$ & Strategic turn score, pessimism weight, squash $4s/(4+|s|)$. \\
 $Y$, $T$, $G_t$ & Terminal outcome, recorded decision count, discounted return. \\
@@ -19,7 +19,7 @@ $W$, $d$ & Admitted simulator workers; GPU duty fraction. \\
 $g$, $\ell$, $d$, $p$ & Paired gains, losses, discordant total, exact sign-test p-value
 (Section~\ref{sec:promotion}; $d$ also denotes duty in Section~\ref{sec:pipeline}). \\
 $n$, $m$ & Games per policy and promotion margin. \\
-$w$, $K$, $M_w$ & Sampled world, world count (6 live), per-world payoff matrix. \\
+$w$, $K$, $M_w$ & Sampled world, initial world count (6 live, up to 12 adaptively), per-world payoff matrix. \\
 $\bar x_w$, $\bar y_w$, $q_w$ & Regret-matching averages; blended opponent model. \\
 $U_w(a)$, $a^*$ & Value of our action in world $w$; chosen action. \\
 $E$, $K_w$, $K_\ell$ & Elo expected score; winner and loser $K$ factors. \\
@@ -33,10 +33,10 @@ $v$, $\alpha_v$, $\beta_v$, $\mu_v$, $\sigma_v$ & Team version and its Beta post
 \label{app:errata}
 \small
 \begin{longtable}{>{\raggedright\arraybackslash}p{0.31\linewidth}>{\raggedright\arraybackslash}p{0.62\linewidth}}
-\toprule First edition & This edition \\
+\toprule First edition & Second-edition correction (9 October) \\
 \midrule\endhead
 Snapshot \code{151393d} & A private-history hash absent from the public
-repository. This edition cites public \code{0c00ec2}. \\
+repository. The second edition cited public \code{0c00ec2}; the third uses \code{bee08dc}. \\
 The actor chooses every live decision & Search chooses turns; the actor
 chooses previews greedily (Section~\ref{sec:search}). \\
 Policy $\softmax(\ell)$; example $(0.594,0.343,0.063)$ & The policy is
@@ -83,41 +83,71 @@ gates, the search evaluation and the live record. \\
 \end{longtable}
 \normalsize
 
-\section{Implementation defects found during this review}
+\section{Status of second-edition defects and subsequent repairs}
 \label{app:defects}
-These are reported for transparency. None was changed by this documentation
-update.
-\begin{enumerate}
-  \item \textbf{Both-Mega enumeration drop} (\code{search/engine.cjs},
-    \code{sideChoices}). When both actives on a side can Mega Evolve, every move
-    option carries \code{ mega}. Each move-and-move pair then has two Mega
-    events and is filtered out. Pairs that include a switch survive, so the
-    list is not empty and the repair branch never runs; \code{megaFix} is a
-    no-op. The side is left with only switch-containing actions. This affects
-    opponent worlds in which both sampled actives hold stones, and our own
-    forced-replacement look-ahead before our Mega is spent. The fix is to emit
-    each move with and without \code{ mega} when \code{canMegaEvo}, and let the
-    one-Mega filter choose.
-  \item \textbf{Mega always forced.} Delaying Mega Evolution is never
-    considered, for us or for the opponent model.
-  \item \textbf{Forme lookup.} \code{_our_set} fails for formes whose Mega base
-    name differs (for example Floette-Eternal and Floette-Mega). An arena
-    opponent fell back 12 times for this reason.
-  \item \textbf{Unseeded durations and independent cell seeds.} Rebuilt sleep
-    and confusion durations use \code{Math.random}, and each matrix cell has
-    its own seed, so rows are not compared under common random numbers.
-  \item \textbf{Legacy HP parsing} in the deployed state encoder
-    (Section~\ref{sec:game}).
-  \item \textbf{Floating-point margin.} $\lceil nm\rceil$ can exceed the exact
-    ceiling for some $(n,m)$ (Section~\ref{sec:promotion}).
-  \item \textbf{Dead constant.} The burn penalty in the evaluation table is
-    overridden by the attack-based rule.
-  \item \textbf{Incomplete world state.} Last moves are never sent to the engine,
-    so its last-move restoration (and anything that depends on it, such as
-    Encore targets) is unused. The opponent's PP is never set.
-  \item \textbf{Coarse invalidation.} One rejected matrix cell removes a whole
-    row or column of the world's game.
-\end{enumerate}
+The 9 October review exposed several defects without fixing runtime code.
+Later development repaired some and left others as known limits. This
+article update itself changes documentation and evidence tooling only.
+
+\begin{small}
+\begin{longtable}{>{\raggedright\arraybackslash}p{.31\linewidth}
+ >{\raggedright\arraybackslash}p{.61\linewidth}}
+\toprule Finding & Status at the 31 October implementation cutoff \\
+\midrule\endhead
+Both-Mega enumeration discarded double attacks & Repaired in
+\code{b12314c}: enumerate plain and Mega variants, then require a legal
+single activation under the default policy. The old \code{megaFix} helper
+is still a no-op; the repair is in \code{sideChoices}. \\
+Mega always forced & Still a baseline policy restriction. C7's opt-in
+species avoidance was not promoted. This is distinct from legal enumeration. \\
+Own-set forme lookup & Mega/base aliases and regional sheet spellings are
+handled by \code{_our_set}; Floette-Eternal also gets the correct Mega prior.
+This is not a claim that every possible identity case is solved. \\
+Unseeded durations and independent cell seeds & CRN now matches matrix
+streams across our rows. Ordinary reconstruction still samples some
+sleep/confusion counters with \code{Math.random}. C12 completion reuses
+cached serialized roots instead of resampling them. \\
+Legacy actor HP parsing & The historical \code{strategic-v1} state encoder
+retains its legacy parser. Current search uses its own tracker and private
+request reconstruction; the actor defect is not evidence of incorrect HP in
+every search world. \\
+Floating-point promotion margin & The historical PPO gate's
+$\lceil nm\rceil$ edge case remains an implementation limit, not the
+criterion used by the current live sequential experiments. \\
+Dead burn constant & Still overridden by the attack-based penalty. \\
+Incomplete world history & General last-move restoration and opponent PP
+remain incomplete. Choice-lock and some other effects use tracked last moves,
+so ``no history is used'' would overstate the defect. Recharge and Illusion
+have explicit later repairs. \\
+Whole-row/column invalidation & The ordinary matrix path still removes a
+row/column after rejected simulator choices. C12 additionally demands complete
+comparable rows, but is disabled after its failed strength gate. \\
+Cross-room answered-request collision & Repaired in \code{4b2800f}; a
+major confound in attributing the C5 deployment segment to search alone. \\
+Illusion, Recharge, failed Protect and Ally Switch & Explicit tracker and
+engine repairs, covered by recorded-position and simulator regressions.
+See Section~\ref{sec:engineering}; no isolated Elo effect is claimed. \\
+Hung browser page bypassed its own stall check & Independent watchdog
+thread added in \code{f22fa2c}; exit/restart recovery after a nonresponsive
+page, with the current room resumed. \\
+Futility did not stop queued games & Recheck after simulator-slot
+acquisition, immutable first decision, and explicit post-decision rows.
+Resume preserves the same decision. \\
+\bottomrule
+\end{longtable}
+\end{small}
+
+\section{Changes from the second edition}
+The third edition supersedes four potentially misleading readings of the
+9 October snapshot. The actor is retained as historical machinery rather
+than the current baseline preview. Several defects listed as open are now
+repaired, but residual determinization and state limitations remain. The
+41-game rating climb is preserved as a preliminary observation rather than
+used to claim continuing progress through the plateau. Finally, candidate
+promotion is no longer described as universally requiring the old paired
+PPO test: later protocols include a documented C5 exception, pooled offline
+filters and direct live A/B decisions. C13 is the controlled positive result;
+C14 is not yet a result.
 
 \section{Source-to-claim map}
 \label{app:map}
@@ -155,6 +185,18 @@ Browser turn; guards; recovery; viewer. \\
 \code{simulator.cjs}, \code{ml/simulator.py} & Official simulation and
 validation; player streams; local opponents. \\
 \code{experiments/}, \code{notebooks/} & Offline PPO matrix and analysis. \\
+\code{search/human/} & Public-replay extraction; imitation, preview and
+team-effect models. \\
+\code{search/config.py}, \code{search/speed.py}, \code{search/belief.cjs} &
+C5 baseline, speed constraints, opt-in C12 sampled-game solver. \\
+\code{search/ab_test.py}, \code{search/elo_monitor.py} & Balanced factorial
+assignment, terminal joins, approximate sequential test, performance rating. \\
+\code{search/campaign.py}, \code{scripts/team_ladder.py} & Persistent frozen
+offline panels and king-of-the-hill live comparisons. \\
+\code{scripts/live_deploy.py}, \code{scripts/auto_promote.py} & Tested pinned
+source deployment and graceful restart. \\
+\code{collect_evidence.py}, \code{evidence-20261031.json} & Read-only public
+aggregate audit and numerical verification for this edition. \\
 \bottomrule
 \end{longtable}
 \normalsize
@@ -180,3 +222,25 @@ learning state. The offline test suite checks the implemented contracts
 (enumeration, masking, collection modes, likelihoods, terminal recording,
 reloads, scout non-anticipation, promotion predicates). Passing it is not a
 measurement of playing strength.
+
+\subsection{Reproducing the third-edition audit}
+The tracked aggregate snapshot is fixed; a document build never refreshes it.
+Run \code{python3 collect_evidence.py --verify} in \code{docs/paper/} to
+recompute offline exact tails, both C13 round scores, Elo transforms and
+normal-approximation LLRs without private inputs. The snapshot records the
+source commit, UTC cutoff, manifest checksums, first-stopping campaign
+receipts, performance cohorts and C14's unresolved status.
+
+With the private ledgers available, \code{--collect --output PATH} creates a
+\emph{new} snapshot by calling the repository's read-only ledger parsers.
+It filters completed events at the collection cutoff, deduplicates rooms,
+joins assignments, and truncates C13 rounds at their saved stopping counts.
+It publishes aggregates only. It performs no login, battle, fit, service
+change or promotion. Exact historical recollection also requires the
+underlying append-only logs and campaign receipts; the public aggregate alone
+cannot re-audit every original room or missing assignment.
+
+New empirical claims are traced to public campaign documents and the frozen
+aggregate audit. The original bibliography remains for historical results;
+new game-theoretic context is verified against primary papers on robust
+responses and imperfect-information depth limits \citep{rnash2007,brown2018depth}.

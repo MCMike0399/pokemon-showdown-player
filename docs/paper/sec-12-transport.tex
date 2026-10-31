@@ -23,7 +23,7 @@ opens no protocol socket of its own.
   \node[font=\scriptsize,align=left,anchor=west,fill=white] at (6.3,-2.45) {3 \code{legal_choices}, \code{observe}};
   \msg{6.2}{9.3}{-3.2}{4 context}{}
   \node[font=\scriptsize,align=left,anchor=west,fill=white,text width=30mm] at (9.4,-4.05) {5 tracker $\to$ 6 worlds\\$\to$ matrices $\to$ RM\\$\to$ blend $\to$ $a^*$};
-  \msg{9.3}{6.2}{-5.0}{6 choice $a^*$ (median 2.3\,s)}{}
+  \msg{9.3}{6.2}{-5.0}{6 choice $a^*$ (typically 5--6\,s)}{}
   \msg{6.2}{12.4}{-5.6}{7 decision event}{}
   \msg{6.2}{3.1}{-6.4}{8 re-snapshot: same rqid? not waiting? still legal?}{draw=seriesB}
   \msg{6.2}{3.1}{-7.2}{9 install click guard; click controls}{}
@@ -34,8 +34,8 @@ opens no protocol socket of its own.
 \end{tikzpicture}
 \caption{One live turn under search. Step 8 is the freshness check after the
 decision. Step 9 installs a capture-phase guard that cancels any click once
-the server's rqid has changed. Preview turns replace steps 4--6 with a greedy
-actor decision. In recorded mode, steps 4--6 are \code{Brain.decide}.}
+the server's rqid has changed. Preview turns replace steps 4--6 with the selected pvalue or imitation
+preview model (originally the greedy actor). In recorded mode, steps 4--6 are \code{Brain.decide}.}
 \label{fig:liveturn}
 \end{figure}
 
@@ -57,7 +57,7 @@ decision from being clicked:
 
 \begin{proposition}[Clicks act only on the decided request]
 \label{prop:fresh}
-Assume that the server assigns a fresh rqid to each request, and that the page
+Assume that the server assigns a fresh rqid within each battle room, and that the page
 runs JavaScript on a single-threaded event loop. Then every click that
 reaches the client's own handler does so while the displayed request has the
 rqid the decision was computed for, and while the client is not waiting.
@@ -84,7 +84,7 @@ Two recovery paths exist:
 \begin{itemize}
   \item \textbf{Recorded browser runs.} A run that restarts mid-game resubmits
     a saved, unsubmitted proposal only if its stored request equals the
-    current one. If the saved proposal was already submitted, the runner stops
+    current one. If the saved proposal was already submitted, recorded mode stops
     rather than guessing, because the server's acknowledgement is ambiguous.
   \item \textbf{MCP path.} \code{Brain.resume} restores one compatible pending
     episode after a transport failure, with the same identity, steps and

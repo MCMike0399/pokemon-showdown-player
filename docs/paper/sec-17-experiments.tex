@@ -1,0 +1,202 @@
+\section{Live experimentation and the measured breakthrough}
+\label{sec:live-method}
+
+\subsection{Three scales that must not be conflated}
+The account's latest Elo is a stateful matchmaking variable. A deployment's
+performance rating estimates a constant strength against the opponents
+actually faced. A randomized arm contrast estimates the effect of changing a
+component while the account, time period and surrounding software are shared.
+They answer different questions. Figure~\ref{fig:modern-performance} displays
+performance segments; Table~\ref{tab:c13-arms} gives the controlled contrast.
+
+For outcomes $s_i\in\{0,\tfrac12,1\}$ and known pre-game opponent ratings
+$O_i$, \code{search/elo_monitor.py} solves
+\begin{equation}
+  \sum_i \frac{1}{1+10^{(O_i-\widehat R)/400}}=\sum_i s_i.
+  \label{eq:performance-rating}
+\end{equation}
+Under independent Bernoulli outcomes and a fixed Elo logistic model, let
+$c=\log(10)/400$ and $p_i=1/(1+10^{(O_i-\widehat R)/400})$. The log-likelihood
+score is $c\sum_i(s_i-p_i)$ and the information is
+$c^2\sum_ip_i(1-p_i)$. The implementation's approximate interval half-width
+is therefore
+\begin{equation}
+  1.96\,\frac{400/\log(10)}{\sqrt{\sum_i p_i(1-p_i)}}.
+  \label{eq:performance-interval}
+\end{equation}
+Tie scores use the same estimating equation rather than a separately fitted
+draw model. All-wins/all-losses samples clamp to the supported range and have
+no finite ordinary interval. Opponent skill drift, repeated opponents and
+serial dependence make these intervals descriptive. They are neither
+sequential confidence sequences nor independent replications of a prior gate.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}
+\begin{axis}[
+ width=.70\linewidth,height=7.0cm,
+ y dir=reverse,ytick={1,2,3,4,5},ymin=.4,ymax=5.6,
+ yticklabels={{Early search (1325)},{C4 preview (635)},
+ {C5 plus browser repair (1169)},{Reconstruction v2 / rain (992)},
+ {Mev after C13 (455)}},
+ yticklabel style={font=\scriptsize,text=ink},
+ xmin=1170,xmax=1400,xtick={1200,1250,1300,1350,1400},
+ xlabel={\small performance Elo with descriptive approximate 95\% interval},
+ ticklabel style={font=\scriptsize,text=muted},
+ xmajorgrids,grid style={draw=gridgray},axis line style={draw=muted},clip=false]
+ \addplot[only marks,mark=*,mark size=2.6pt,color=seriesA,
+ error bars/.cd,x dir=both,x explicit] coordinates {
+ (1205.94,1) +- (19.44,0)
+ (1236.27,2) +- (28.23,0)
+ (1287.48,3) +- (20.63,0)
+ (1235.55,4) +- (22.51,0)};
+ \addplot[only marks,mark=diamond*,mark size=3.3pt,color=seriesB,
+ error bars/.cd,x dir=both,x explicit] coordinates {
+ (1343.72,5) +- (33.33,0)};
+\end{axis}
+\end{tikzpicture}
+\caption{Chronological performance cohorts, with sample size in parentheses.
+The Mev cohort joins all completed C13final assignments across the permanent
+team-setting restart. The earlier rows are contiguous non-A/B policy segments
+6, 7, 8 and 13 in the frozen monitor snapshot. Time, opponents, repairs and
+policy differ across rows: this chart is not a causal decomposition.}
+\label{fig:modern-performance}
+\end{figure}
+
+\subsection{Balanced live assignment and the sequential rule}
+C9--C14 use the same interleaved A/B infrastructure. A frozen JSON spec names
+base settings and binary factor overrides. With $k$ unfrozen factors, a
+seeded permutation of all $2^k$ combinations fills each balanced block.
+Assignment is stored by room before play; a resumed room reuses its arm.
+A one-factor comparison alternates the two treatments in seeded two-game
+blocks. Both arms share one account and matchmaking history. This makes
+contemporaneous opponent populations comparable in expectation, without
+claiming that each arm faced identical human opponents or that time and
+rating feedback disappear entirely.
+
+Let $\bar s_1,\bar s_0$ be on/off scores, $d=\bar s_1-\bar s_0$, and
+$S^2$ the pooled sample variance across all on/off game scores. The code uses
+$V=S^2(1/n_1+1/n_0)$ and the transform
+\begin{equation}
+  d_j=\frac{1}{1+10^{-E_j/400}}-\frac12,\qquad
+  \Lambda=\frac{d_1-d_0}{V}
+    \left(d-\frac{d_0+d_1}{2}\right),
+  \quad (E_0,E_1)=(0,40).
+  \label{eq:live-llr}
+\end{equation}
+The nominal Wald boundaries \citep{wald1945} are
+\begin{equation}
+  \log\frac{\beta}{1-\alpha}=-2.2513,\qquad
+  \log\frac{1-\beta}{\alpha}=2.8904,
+  \quad\alpha=.05,\ \beta=.10.
+\end{equation}
+No decision is allowed below 300 completed games. An upper crossing accepts
+H1, a lower crossing H0; a 3,000-game cap is inconclusive and keeps the
+incumbent. The implemented test is a normal approximation with estimated
+variance, minimum sample and cap. It does not inherit exact anytime error
+control merely by using Wald's boundaries. Dependence, factorial interactions,
+multiple factors and sequential candidate selection further qualify the
+nominal error interpretation. Four C9 factors at nominal .05 each were not
+a family-wise .05 experiment; neither were C13's two successive team tests.
+
+The displayed Elo effect is
+\begin{equation}
+  \widehat E=400\log_{10}\frac{.5+d}{.5-d}.
+  \label{eq:effect-transform}
+\end{equation}
+It maps a score difference to an Elo advantage against an equal baseline.
+It is not exactly the difference between two independently fitted performance
+ratings, although they are close for C13. A fixed-sample interval obtained
+by transforming $d\pm1.96\sqrt V$ is descriptive after optional stopping.
+No such interval replaces the actual stopping rule.
+
+\paragraph{Outcome and missingness policy.}
+Forfeits and opponent timer losses are genuine terminal wins and count.
+Excluding them would condition on a consequence of good positions as well as
+on opponent behaviour. An assigned room without a terminal record is
+excluded until it finishes; it is not scored as a tie. An outdated module
+docstring says unfinished games count .5, but the actual \code{join} consumes
+only completed terminal games. The frozen article audit follows that code.
+A future audit should continue reporting missing assignments by arm, because
+terminal-only analysis can still be biased by treatment-dependent outages.
+Real ties count .5; none occurred in the frozen 7,734-game live dataset.
+
+\subsection{C13: the team comparison that passed}
+The incumbent was \code{Rain-Recife-special-stat-fix}: Garchomp, Politoed,
+Incineroar, Archaludon, Farigiraf and Golisopod. Round one tried
+\code{Rain-Gengar-Helm-Baltimore}; round two tried
+\code{SunRain-Mev-Brisbane} against the surviving rain champion. Both arms
+used the same C5 search and C4 pvalue preview. Only the exact six sets changed.
+
+\begin{table}[htbp]
+\centering\small
+\begin{tabular}{lrrrrr}
+\toprule
+C13 arm & Games & Wins & Score & Performance & Mean opponent \\
+\midrule
+R1 Helm & 151 & 66 & .4371 & $1132\pm57$ & 1178.9 \\
+R1 Recife & 151 & 82 & .5430 & $1204\pm57$ & 1172.6 \\
+\midrule
+R2 Mev & 448 & 249 & .5558 & $1286\pm34$ & 1243.5 \\
+R2 Recife & 449 & 210 & .4677 & $1225\pm34$ & 1249.6 \\
+\bottomrule
+\end{tabular}
+\caption{First-stopping C13 cohorts, recomputed by joining completed games to
+saved room assignments. Later arrivals remain in the audit ledger but do not
+change the 302- and 897-game decisions. Intervals are approximate descriptive
+95\% performance intervals, not sequential arm-effect intervals.}
+\label{tab:c13-arms}
+\end{table}
+
+Helm stopped H0 at 302 games: $d=-.10596$, estimated $-74.8$ Elo,
+$\Lambda=-2.323$. Mev stopped H1 at 897 games:
+\begin{align*}
+ d&=249/448-210/449=.0880976,\\
+ \sqrt V&\approx.0334,\qquad \widehat E=61.9,\qquad \Lambda=3.054>2.890.
+\end{align*}
+The independent performance-rating difference is 61.5, close to the
+score-transform estimate. Mean opposing ratings differed by only 6.1 points,
+with the challenger facing slightly lower opposition. The direct randomized
+contrast is stronger evidence than comparing two peaks or entire deployment
+periods. It supports the Mev team under this fixed preview and turn pilot;
+it does not establish universal team quality or isolate any one species.
+The effect estimate was selected at a successful stopping time and may
+regress; further independent ladder evidence remains valuable.
+
+After the decision on 30 October, \code{c13final} played Mev every game.
+The frozen cohort contains 455 completed games, 226 wins and 229 losses,
+performance $1343.7\pm33.3$, against mean opposition 1346.9. Its descriptive
+lower interval endpoint is 1310.4. The 49.7\% win rate is compatible with
+improvement because matchmaking supplied stronger opponents. This cohort
+corroborates sustained play above the old plateau, but is a subsequent
+observational cohort rather than another randomized treatment comparison.
+C14 games are excluded from it.
+
+The runner's default team changed permanently on 31 October. Before that,
+run-level metadata still named the rain default while the per-game spec
+selected Mev. Accordingly, the article identifies the champion cohort from
+\emph{assignment ledgers}, not by filtering the default team name. Two
+monitor segments across that restart are combined. This corrects a subtle
+measurement trap without changing any campaign result.
+
+\subsection{How the evidence changed the research process}
+The early gate measured sampled actor play; search deployment made that
+objective mismatched. The next gate used search opponents; imitation brought
+some human behaviours closer, but retained serious action-distribution and
+strength differences. C9 made target-domain interventions directly testable.
+C10 and C12 subsequently required an offline pass merely to qualify for a
+fresh live experiment, never as sufficient evidence for automatic live gain.
+C13's team-only contrast finally passed that direct ladder test.
+
+The pooled offline rule also addressed statistical power and wasted compute.
+At 20\% discordance, a 20,000-campaign simulation found a +4-point gain
+passed the intended old two-stage rule about 9.5\% of the time versus 78.7\%
+for the pooled 800-pair rule; null pass rates were .06\% and 4.30\%.
+These are assumptions-based power simulations, not observed policy gains.
+A better rule cannot fix a poor surrogate opponent, as C12's subsequent
+rejection and C13's direct test illustrate.
+
+\source{\code{search/ab_test.py} (assignment, terminal join, score transform,
+normal-approximation SPRT); \code{search/elo_monitor.py};
+\code{scripts/team_ladder.py}; \code{docs/m5-pipeline-review.md};
+\code{evidence-20261031.json}, \code{collect_evidence.py}.}

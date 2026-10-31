@@ -1,6 +1,8 @@
 \section{Opponent-move scouting and team selection}
 \label{sec:scout}
 
+\historyscope
+
 \subsection{The public-move scout}
 Public logs contain executed events, not private requests or a collecting
 policy's probabilities. The repository therefore uses them to train a
@@ -134,8 +136,10 @@ The estimate describes success \emph{as piloted by the policy of the time,
 against the opponents of the time}. It is not intrinsic team quality, and the
 posterior is not conditioned on the actor revision. In production the team
 was pinned (one candidate, exploration off). Thompson selection was therefore
-inactive in the later campaigns, and every live result in
-Section~\ref{sec:evidence} uses a single rain team. Variants replace one
+inactive in the early campaigns, and every historical live result in
+Section~\ref{sec:evidence} uses a single rain team. C13 later compared fixed
+teams through balanced live A/B rather than this Thompson sampler; its
+successful champion is evaluated in Section~\ref{sec:live-method}. Variants replace one
 member with an attributed same-species set and are validated in the
 simulator. Missing stat spreads are generated, labelled as such, and follow
 the move categories. A generated Garchomp spread that once boosted the wrong

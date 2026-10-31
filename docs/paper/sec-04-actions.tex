@@ -110,13 +110,14 @@ $\A(r)$:
 \begin{itemize}
   \item Damaging moves aimed at the partner are removed.
   \item Targets in empty foe slots are removed while the other foe is alive.
-  \item Every move of a Mega-capable Pok\'{e}mon carries the \code{mega} flag,
-    so delaying Mega Evolution is never considered.
+  \item Mega is forced when available under the default policy. When both
+    actives can Mega, plain variants are also enumerated so valid combinations
+    can activate exactly one, rather than dropping every double attack.
 \end{itemize}
 Our own live choices still start from $\A(r)$ and are pruned in Python. The
 engine enumeration is used for the opponent and for our forced-replacement
-look-ahead. Appendix~\ref{app:defects} records a defect in it: when both
-actives on one side can Mega Evolve, every move-and-move pair is discarded.
+look-ahead. The both-Mega enumeration defect recorded by the second edition
+was repaired in \code{b12314c}; Appendix~\ref{app:defects} tracks its status.
 
 \source{\code{legal_choices} in \code{battle_state.py}; bench canonicalization
 in \code{Features.action} (\code{ml/features.py}); \code{_prune_ours} in

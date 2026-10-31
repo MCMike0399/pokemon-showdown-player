@@ -1,112 +1,101 @@
 \section{Introduction and scope}
 \label{sec:scope}
 
-The practical question behind this repository is simple to state. Can one
-laptop, with no human in the turn loop, play a current VGC format on the
-public Showdown ladder, improve from its own experience, and prove each
-improvement before relying on it? Answering it takes several kinds of
-component, each with its own evidence and failure modes. A transport has to
-deliver legal choices on time. A decision procedure has to choose them. A data
-recorder has to preserve exactly what was known when each choice was made. A
-learner has to turn those records into candidate models. A statistical gate
-has to decide which candidates are better. This report explains each
-component, gives the mathematics it relies on, and states what has been
-measured.
+Can one laptop play a current VGC format without a human choosing its turns,
+learn from the resulting experience, and measure whether a proposed change
+actually helps? The repository implements the full chain: connection and
+legal choices, an actor--critic and its training records, official-simulator
+search, public-replay models, a browser transport, and persistent experiments
+on both local opponents and the live ladder. Its research history is also a
+history of changing what counted as evidence.
 
-\subsection{What changed since the first edition}
-The first edition (7 October 2026) described a persistent MCP harness in
-which the OpenClaw agent called tools and a local actor--critic chose every
-battle decision. Thirty-three public commits later the deployed system is
-different in five ways that matter mathematically:
-\begin{enumerate}
-  \item \textbf{Turn decisions come from search.} A determinized one-turn
-    simultaneous-move search over the official simulator chooses live turn
-    actions (Section~\ref{sec:search}). The neural actor now chooses only team
-    previews, and it does so greedily.
-  \item \textbf{The neural policy has a temperature and a strategic prior.}
-    Logits are divided by $\tau=0.25$. The additive prior is no longer the
-    legacy power heuristic: it is a squashed one-turn scenario evaluation
-    (Sections~\ref{sec:features} and~\ref{sec:network}).
-  \item \textbf{Promotion is a hypothesis test.} Candidates must pass an exact
-    one-sided paired sign test at $p\le0.05$ as well as a win margin. The worker
-    only stages a candidate; promotion happens later at a matchmaking boundary
-    (Section~\ref{sec:promotion}).
-  \item \textbf{Training is a three-lane pipeline.} CPU collection, PPO on the
-    Apple~MPS GPU and CPU evaluation run as separate bounded processes. Each
-    trajectory is checked against its collecting likelihood, and PPO stops
-    early on a KL criterion (Sections~\ref{sec:learning} and~\ref{sec:pipeline}).
-  \item \textbf{Live play is browser-driven.} Playwright clicks the official
-    client, guarded by the request identifier. OpenClaw and MCP remain available
-    for agent-supervised play but are no longer in the turn loop
-    (Section~\ref{sec:transport}).
-\end{enumerate}
-Appendix~\ref{app:errata} lists every first-edition statement that this
-edition corrects, including one circular proposition and several claims made
-stale by later commits.
+The first edition (7 October) described MCP-supervised actor play. The second
+(9 October) documented the move to browser-driven search, its promising
+45-game paired comparison and its first 41 live games. The third edition
+extends the record through 31 October and fourteen numbered campaigns. It
+reports a long plateau, unsuccessful attempts to improve the search and
+learned models, and a successful live team comparison. Crossing 1200 once was
+already possible in the early trajectory; the new result is a controlled
+improvement over the established rain pilot and a sustained post-promotion
+performance estimate above that level. A transient peak and a repeatable gain
+are different claims.
 
-\subsection{Three kinds of statement}
-The report keeps three kinds of statement apart:
+\subsection{The system at the cutoff}
+Live turns use the C5 search configuration: six sampled hidden worlds, common
+random numbers, up to six additional worlds on close decisions, a
+win-probability-shaped leaf, selective Protect continuation and speed
+inference. The baseline preview is the opponent-aware C4 matchup-value model
+\code{pvalue-661448b6a320fce0}. C13 selected
+\code{SunRain-Mev-Brisbane} over the long-used Recife rain team. C14 now
+randomizes the preview between that baseline and a human-imitation argmax
+model, with team and turn search held fixed. The old PPO machinery remains
+implemented but its service is paused; it is not improving the live turn
+policy after every game.
+
+\subsection{Historical scope and kinds of evidence}
+The implementation baseline for this edition is public commit
+\code{bee08dc} (full hash in the evidence snapshot). The new live audit is frozen
+at 16:28:15 UTC on 31 October 2026. It contains 7,734 completed, rated search
+games, deduplicated by battle room, with 3,864 wins. This aggregate mixes
+policies and experiments and is not an estimate of the current champion's
+strength. Public aggregates, source hashes and numerical verification are
+provided in \code{evidence-20261031.json} and \code{collect_evidence.py}
+beside the paper. Raw requests, account identities and battle logs remain
+private. No battles, training, live deployments or campaign changes were
+performed for this article update.
+
+Three kinds of statement remain separate throughout:
 \begin{enumerate}
-  \item \textbf{Implemented behaviour}: facts traceable to source functions,
-    such as tensor dimensions, constants and gate predicates. These are
-    followed by an \emph{Implementation} line naming the files.
-  \item \textbf{Conditional mathematical results}: propositions proved under
-    explicit assumptions, followed by an \emph{Interpretation} or
-    \emph{Caveat} that says how far the result transfers to the running system.
-  \item \textbf{Measurements}: results of experiments run by the project,
-    cited to the repository's validation documents or, where marked, to the
-    local run ledger. This paper ran no new games, training or promotion, apart
-    from read-only recomputation of the statistics it reports.
+  \item \textbf{Implemented contracts}, traced to named source files.
+  \item \textbf{Conditional mathematics}, proved under explicit assumptions;
+    a certificate for a surrogate game is not a certificate for full VGC.
+  \item \textbf{Measurements}, with their date, population, stopping rule and
+    limits. Chronological deployment segments are descriptive; randomized
+    ladder arms supply the stronger treatment comparison.
 \end{enumerate}
+Sections~\ref{sec:features}--\ref{sec:promotion} preserve the actor-era
+architecture and proofs as the 7--9 October baseline, with scope notes rather
+than silently reinterpreting old measurements as current ones.
+Section~\ref{sec:evidence} likewise preserves the early evidence. New
+campaigns, evaluation methods and software advances are in
+Sections~\ref{sec:campaigns}--\ref{sec:engineering}. Appendix~\ref{app:defects}
+updates the status of defects identified by the second edition.
 
 \subsection{Format and pinned mechanics}
-The main target is \code{gen9championsvgc2026regmc}: doubles, bring six and
-pick four, open team sheets on request, one Mega Evolution per battle, no
+The target is \code{gen9championsvgc2026regmc}: doubles, bring six and pick
+four, open team sheets when exchanged, one Mega Evolution per battle, no
 Terastallization, Item and Species Clauses, and Champions stat points instead
-of EVs and IVs \citep{championsrules}. The local simulator dependency is
-pinned to official Showdown commit
-\code{c046106cbe075931b1ff8d8b800ff5be47a85f96} \citep{showdownsource}. A
-format identifier beginning with \code{gen9} does not determine these
-mechanics. Format, simulator revision, feature profile, team fingerprint and
-collecting checkpoint are part of every scientific statement in this report.
+of conventional EVs and IVs \citep{championsrules}. The simulator dependency
+remains pinned to official Showdown commit
+\code{c046106cbe075931b1ff8d8b800ff5be47a85f96} \citep{showdownsource}.
+The \code{gen9} prefix alone does not specify these mechanics. Format,
+simulator revision, exact team, model assets and effective configuration are
+part of a reproducible experiment.
 
-\subsection{Summary of measured results}
 \begin{table}[htbp]
 \centering\small
-\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.34\linewidth} X}
+\begin{tabularx}{\linewidth}{>{\raggedright\arraybackslash}p{0.29\linewidth} X}
 \toprule
-Question & Measured answer (details in Section~\ref{sec:evidence}) \\
+Research question & Evidence and qualification \\
 \midrule
-Does search beat the learned policy offline? & Same 45 seeds, sides and real
-opponent teams: search 30/45 vs.\ policy 19/45; 14 gains, 3 losses; exact
-McNemar $p=0.0064$. Clustering by opponent team: $p=0.0037$. \\
-Did the learned policy improve over campaigns? & Live record 348--499 (41.1\%)
-over 847 games across three actor generations. One strategic prior passed an
-independent 160-game final (125 vs.\ 106, $p=0.0072$). One PPO update passed
-the 60-game gate out of 129 attempts. \\
-What happened live after search? & Preliminary and observational: 41 games,
-27--14. Rating 1182 $\rightarrow$ 1464. Elo-expected 18.4 wins in 37 rated
-games; observed 23 (exact $p=0.086$). \\
-What failed? & More than thirty candidates: PPO variants, preview models, a
-matchup architecture that passed development and then tied its final, and an
-offline hyperparameter matrix with no significant arm after Holm correction. \\
+Search rather than actor turns? & Early paired comparison: search 30/45,
+actor 19/45; 14 gains, 3 losses, exact one-sided $p=0.0064$. \\
+Can learned predictions improve search? & Value, opponent and preview models
+often improved predictive metrics; the later campaigns did not establish a
+corresponding live turn-policy gain. \\
+Does more compute help? & C6's larger world and screening budgets failed
+their gates; the experiments do not prove that sampling noise is absent. \\
+Did game-theoretic root solving help? & C12: 46 gains, 59 losses at 400 pairs;
+futility rejection despite small sampled-game solver gaps. \\
+What broke the plateau? & C13 team change: 897 randomized games, +61.9 Elo
+estimate, sequential H1; subsequent champion performance $1344\pm33$ over
+455 completed games. \\
+What is still being tested? & C14 preview A/B: 9 completed games at the
+cutoff, below the 300-game minimum; no decision. \\
 \bottomrule
 \end{tabularx}
-\caption{Headline evidence. Ladder results depend on the opponent pool and on
-rating-based matchmaking; Section~\ref{sec:elo} explains why a raw win rate is
-not a stable strength measure.}
+\caption{Third-edition headline evidence. Offline gains/losses count
+discordant pairs, whereas live A/B counts individual ladder games.
+Performance intervals are descriptive, not sequential confidence sequences.}
 \label{tab:headline}
 \end{table}
-
-\subsection{How to read this report}
-Section~\ref{sec:system} gives the system map and project timeline.
-Sections~\ref{sec:game}--\ref{sec:network} formalize the game, the candidate
-actions, the features and the neural policy. Section~\ref{sec:data} describes
-the record kept for every match. Sections~\ref{sec:learning}--\ref{sec:promotion}
-cover learning, the CPU/MPS pipeline and promotion statistics.
-Section~\ref{sec:search} analyses the search agent and
-Section~\ref{sec:transport} the live turn. Section~\ref{sec:scout} covers
-opponent-move scouting and team selection. Section~\ref{sec:evidence} collects
-all evidence and Section~\ref{sec:limits} its limits. The appendices provide a
-glossary, the corrections to the first edition, defects found during review, a
-source map and reproduction notes.
